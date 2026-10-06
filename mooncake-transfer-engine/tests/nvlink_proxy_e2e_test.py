@@ -42,6 +42,7 @@ import socket
 import statistics
 import sys
 import time
+import zlib
 
 import numpy as np
 
@@ -274,6 +275,170 @@ def loop():
     return 0 if ok == iters else 1
 
 
+# --------------------------------------------------------------------------
+# Many-small-entry benchmark: NBLK separately allocated blocks per side (like
+# per-layer K/V tensors of a page-granular KV cache) and batches of NENT
+# entries of about SLOT bytes at random, mostly non-adjacent slots.
+NBLK = int(os.environ.get("NBLK", "72"))
+SLOTS = int(os.environ.get("SLOTS", "2048"))
+SLOT = int(os.environ.get("SLOT", "6144"))
+NENT = int(os.environ.get("NENT", "7660"))
+BLK = SLOTS * SLOT
+
+
+def mtarget():
+    ck(cudart.cudaSetDevice(int(os.environ.get("DEV", "0"))), "cudaSetDevice")
+    eng, session = make_engine()
+    blocks = [malloc(BLK) for _ in range(NBLK)]
+    for b in blocks:
+        memset0(b, BLK)
+    regs = [eng.register_memory(b, BLK) for b in blocks]
+    log(f"MTARGET session={session} blocks={NBLK}x{BLK} reg_ok={all(r == 0 for r in regs)}")
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", PORT))
+    srv.listen(8)
+    log("READY")
+    while True:
+        conn, _ = srv.accept()
+        with conn:
+            cmd = conn.makefile().readline().split()
+            if not cmd:
+                continue
+            if cmd[0] == "MINFO":
+                out = {"session": session, "blocks": blocks, "reg": regs}
+            elif cmd[0] == "MHASH":
+                out = {"sha": [sha(d2h(b, BLK)) for b in blocks]}
+            elif cmd[0] == "MRESET":
+                for b in blocks:
+                    memset0(b, BLK)
+                out = {"ok": True}
+            else:
+                out = {"err": cmd}
+            conn.sendall((json.dumps(out) + "\n").encode())
+
+
+def daemon_stats():
+    """Counters of the daemon behind MC_NVLINK_PROXY_SOCKET (or {})."""
+    import struct
+
+    path = os.environ.get("MC_NVLINK_PROXY_SOCKET")
+    if not path:
+        return {}
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(5)
+            s.connect(path)
+            s.sendall(struct.pack("<IHHIIQ", 0x504E434D, 1, 6, 0, 0, 1))
+            hdr = b""
+            while len(hdr) < 24:
+                hdr += s.recv(24 - len(hdr))
+            plen = struct.unpack("<IHHIIQ", hdr)[4]
+            body = b""
+            while len(body) < plen:
+                body += s.recv(plen - len(body))
+        return {k: v for k, v in (kv.split("=", 1) for kv in body.decode().split()) if v.isdigit()}
+    except OSError:
+        return {}
+
+
+def _pattern(name, rng):
+    """Returns (src_blk, src_off, dst_blk, dst_off, length) arrays."""
+    per = [NENT // NBLK + (1 if i < NENT % NBLK else 0) for i in range(NBLK)]
+    rows = []
+    if name.startswith("size"):
+        size = int(name[4:])
+        slots = BLK // size
+        n = max(1, (NENT * SLOT) // size)
+        per = [n // NBLK + (1 if i < n % NBLK else 0) for i in range(NBLK)]
+        for b in range(NBLK):
+            k = min(per[b], slots)
+            for s_, d_ in zip(rng.choice(slots, k, replace=False), rng.choice(slots, k, replace=False)):
+                rows.append((b, int(s_) * size, b, int(d_) * size, size))
+        return rows
+    adj = 0.5 if name == "runs50" else 0.0
+    for b in range(NBLK):
+        used_s, used_d = set(), set()
+        prev = None
+        while len(used_d) < per[b]:
+            if prev and rng.random() < adj and prev[0] + 1 < SLOTS and prev[1] + 1 < SLOTS \
+                    and prev[0] + 1 not in used_s and prev[1] + 1 not in used_d:
+                s_, d_ = prev[0] + 1, prev[1] + 1
+            else:
+                s_ = int(rng.integers(SLOTS))
+                d_ = int(rng.integers(SLOTS))
+                if s_ in used_s or d_ in used_d:
+                    continue
+            used_s.add(s_)
+            used_d.add(d_)
+            prev = (s_, d_)
+            if name == "misaligned":
+                so, do = int(rng.integers(16)), int(rng.integers(16))
+                rows.append((b, s_ * SLOT + so, b, d_ * SLOT + do, SLOT - 16))
+            else:
+                rows.append((b, s_ * SLOT, b, d_ * SLOT, SLOT))
+    if name == "interleaved":
+        order = rng.permutation(len(rows))
+        rows = [rows[i] for i in order]
+    return rows
+
+
+def smallbench():
+    ck(cudart.cudaSetDevice(int(os.environ.get("DEV", "0"))), "cudaSetDevice")
+    th = os.environ["TARGET_HOST"]
+    info = ask(th, "MINFO")
+    eng, session = make_engine()
+    rng = np.random.default_rng(7)
+    src_host = [rng.integers(0, 256, size=BLK, dtype=np.uint8) for _ in range(NBLK)]
+    src = []
+    for h in src_host:
+        p = malloc(BLK)
+        h2d(p, h)
+        src.append(p)
+    regs = [eng.register_memory(p, BLK) for p in src]
+    log(f"SMALLBENCH session={session} blocks={NBLK}x{BLK} reg_ok={all(r == 0 for r in regs)} "
+        f"target_reg_ok={all(r == 0 for r in info['reg'])}")
+    peer, dblk = info["session"], info["blocks"]
+    reps = int(os.environ.get("REPS", "10"))
+    patterns = os.environ.get("PATTERNS", "random,runs50,interleaved,misaligned,size4096,size16384,size65536,size262144").split(",")
+    results = []
+    for name in patterns:
+        rows = _pattern(name, np.random.default_rng(zlib.crc32(name.encode())))
+        srcs = [src[b] + o for b, o, _, _, _ in rows]
+        dsts = [dblk[b] + o for _, _, b, o, _ in rows]
+        lens = [n for *_, n in rows]
+        nbytes = sum(lens)
+        ask(th, "MRESET")
+        for _ in range(2):  # warm-up (handle opens, table allocation)
+            assert eng.batch_transfer_sync_write(peer, srcs, dsts, lens) == 0
+        d0 = daemon_stats()
+        times = []
+        for _ in range(reps):
+            t = time.perf_counter()
+            rc = eng.batch_transfer_sync_write(peer, srcs, dsts, lens)
+            times.append(time.perf_counter() - t)
+            assert rc == 0, rc
+        d1 = daemon_stats()
+        expected = [np.zeros(BLK, dtype=np.uint8) for _ in range(NBLK)]
+        for (sb, so, db, do, n) in rows:
+            expected[db][do:do + n] = src_host[sb][so:so + n]
+        got = ask(th, "MHASH")["sha"]
+        ok = got == [sha(e) for e in expected]
+        results.append(ok)
+        med = statistics.median(times)
+        dd = {k: int(d1.get(k, 0)) - int(d0.get(k, 0)) for k in ("copy_requests", "copy_us_total", "plan_us_total", "exec_us_total", "coalesced_entries", "kernel_entries", "ce_entries")}
+        reqs = max(1, dd["copy_requests"])
+        daemon = (f" daemon/batch: total {dd['copy_us_total'] / reqs / 1e3:.2f} ms plan {dd['plan_us_total'] / reqs / 1e3:.2f} "
+                  f"exec {dd['exec_us_total'] / reqs / 1e3:.2f} merged {dd['coalesced_entries'] // reqs} "
+                  f"kernel {dd['kernel_entries'] // reqs} ce {dd['ce_entries'] // reqs}") if d1 else ""
+        log(f"BENCH {name:<12} entries={len(rows):5d} bytes={nbytes / 2**20:7.1f}MiB median {med * 1e3:7.2f} ms "
+            f"(min {min(times) * 1e3:.2f} max {max(times) * 1e3:.2f}) = {nbytes / med / 2**30:6.1f} GiB/s "
+            f"verify {'PASS' if ok else 'FAIL'}{daemon}")
+    log(f"SUMMARY {'ALL PASS' if all(results) else 'FAILURES'} ({sum(results)}/{len(results)})")
+    time.sleep(float(os.environ.get("FINAL_SLEEP", "1")))
+    return 0 if all(results) else 1
+
+
 def concurrent():
     """Several threads write disjoint regions at the same time."""
     import threading
@@ -312,5 +477,6 @@ def concurrent():
 
 
 if __name__ == "__main__":
-    modes = {"target": target, "initiator": initiator, "loop": loop, "concurrent": concurrent}
+    modes = {"target": target, "initiator": initiator, "loop": loop, "concurrent": concurrent,
+             "mtarget": mtarget, "smallbench": smallbench}
     sys.exit(modes[sys.argv[1]]() or 0)

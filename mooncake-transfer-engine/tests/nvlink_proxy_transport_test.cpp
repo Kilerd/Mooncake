@@ -63,6 +63,18 @@ TEST(NvlinkProxyProtocol, BufferRefRejectsMalformed) {
     EXPECT_FALSE(decodeBufferRef("nvlp2|node|1|2|3", out));
 }
 
+TEST(NvlinkProxyProtocol, BufferRefViewParse) {
+    const std::string s = "nvlp1|node-b|AbC|10|ff";
+    const char *node;
+    size_t node_len;
+    uint64_t client, base, size;
+    ASSERT_TRUE(decodeBufferRef(s, node, node_len, client, base, size));
+    EXPECT_EQ(std::string(node, node_len), "node-b");
+    EXPECT_EQ(client, 0xabcULL);
+    EXPECT_EQ(base, 0x10ULL);
+    EXPECT_EQ(size, 0xffULL);
+}
+
 TEST(NvlinkProxyProtocol, WireLayout) {
     EXPECT_EQ(sizeof(MsgHeader), 24u);
     EXPECT_EQ(sizeof(HelloReq), 80u);
@@ -116,6 +128,80 @@ TEST(NvlinkProxyTransport, NoDaemonUsesBaseTransport) {
     EXPECT_TRUE(engine->freeBatchID(batch).ok());
     EXPECT_EQ(engine->unregisterLocalMemory(src.data()), 0);
     EXPECT_EQ(engine->unregisterLocalMemory(dst.data()), 0);
+    unsetenv("MC_NVLINK_PROXY_SOCKET");
+    unsetenv("MC_FORCE_TCP");
+}
+
+// The multi-protocol route cache must stay exact: requests that alternate
+// between buffers route correctly, and an address in a gap between two
+// registered buffers is rejected even right after a cached hit next to it.
+TEST(NvlinkProxyTransport, MultiProtocolRouteCacheIsExact) {
+    setenv("MC_FORCE_TCP", "1", 1);
+    setenv("MC_NVLINK_PROXY_SOCKET",
+           "/tmp/mooncake-nvlink-proxy-unit-test-absent.sock", 1);
+    auto engine = std::make_unique<TransferEngine>(true);
+    ASSERT_EQ(engine->init(P2PHANDSHAKE, "127.0.0.1", "", 0), 0);
+
+    const size_t kMiB = 1 << 20;
+    std::vector<char> pool(4 * kMiB, 0), src(kMiB);
+    for (size_t i = 0; i < src.size(); ++i) src[i] = static_cast<char>(i * 7);
+    char *a = pool.data(), *b = pool.data() + 2 * kMiB;  // gap in between
+    ASSERT_EQ(engine->registerLocalMemory(a, kMiB, "cpu:0"), 0);
+    ASSERT_EQ(engine->registerLocalMemory(b, kMiB, "cpu:0"), 0);
+    ASSERT_EQ(engine->registerLocalMemory(src.data(), kMiB, "cpu:0"), 0);
+    auto handle = engine->openSegment(engine->getLocalIpAndPort());
+    ASSERT_NE(handle, static_cast<Transport::SegmentHandle>(-1));
+
+    auto request = [&](char *dst, size_t len) {
+        Transport::TransferRequest req;
+        req.opcode = Transport::TransferRequest::WRITE;
+        req.source = src.data();
+        req.target_id = handle;
+        req.target_offset = reinterpret_cast<uint64_t>(dst);
+        req.length = len;
+        return req;
+    };
+    auto wait = [&](Transport::BatchID batch, size_t n) {
+        Transport::TransferStatus status;
+        for (size_t i = 0; i < n; ++i) {
+            auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            do {
+                EXPECT_TRUE(engine->getTransferStatus(batch, i, status).ok());
+                if (status.s == Transport::TransferStatusEnum::COMPLETED ||
+                    status.s == Transport::TransferStatusEnum::FAILED)
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } while (std::chrono::steady_clock::now() < deadline);
+            EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+        }
+    };
+
+    // Alternate between the two buffers so every request switches the cache.
+    std::vector<Transport::TransferRequest> reqs;
+    for (int i = 0; i < 8; ++i)
+        reqs.push_back(request((i % 2 ? b : a) + i * 4096, 4096));
+    auto batch = engine->allocateBatchID(reqs.size());
+    ASSERT_TRUE(engine->submitTransfer(batch, reqs).ok());
+    wait(batch, reqs.size());
+    EXPECT_TRUE(engine->freeBatchID(batch).ok());
+    for (int i = 0; i < 8; ++i)
+        EXPECT_EQ(memcmp((i % 2 ? b : a) + i * 4096, src.data(), 4096), 0);
+
+    // Cached hit in |a| followed by a request into the gap after it.
+    batch = engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        engine->submitTransfer(batch, {request(a + kMiB - 4096, 4096)}).ok());
+    wait(batch, 1);
+    EXPECT_TRUE(engine->freeBatchID(batch).ok());
+    batch = engine->allocateBatchID(1);
+    EXPECT_FALSE(engine->submitTransfer(batch, {request(a + kMiB, 4096)}).ok());
+    EXPECT_FALSE(engine->submitTransfer(batch, {request(b - 4096, 4096)}).ok());
+    EXPECT_TRUE(engine->freeBatchID(batch).ok());
+
+    EXPECT_EQ(engine->unregisterLocalMemory(a), 0);
+    EXPECT_EQ(engine->unregisterLocalMemory(b), 0);
+    EXPECT_EQ(engine->unregisterLocalMemory(src.data()), 0);
     unsetenv("MC_NVLINK_PROXY_SOCKET");
     unsetenv("MC_FORCE_TCP");
 }
