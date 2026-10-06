@@ -487,7 +487,8 @@ void TransferEngineImpl::installNvlinkProxyIfRequested() {
                      << base->getName() << " only";
         return;
     }
-    static_cast<NvlinkProxyTransport*>(proxy)->setFallbackTransport(base);
+    static_cast<NvlinkProxyTransport*>(proxy)->setFallbackTransport(
+        base, base->getName());
     LOG(INFO) << "nvlink_proxy transport installed next to " << base->getName()
               << " (same-node GPU transfers go through " << socket_path << ")";
 #else

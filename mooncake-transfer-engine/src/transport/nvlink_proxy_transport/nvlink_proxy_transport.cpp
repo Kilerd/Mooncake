@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <thread>
 
 #include "common.h"
 #include "error.h"
@@ -193,7 +194,11 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
     node_id_ = resolveNodeId();
     client_id_ = randomClientId();
     timeout_ms_ = std::max(100, envInt("MC_NVLINK_PROXY_TIMEOUT_MS", 30000));
+    reconnect_wait_ms_ = std::min(
+        timeout_ms_, std::max(0, envInt("MC_NVLINK_PROXY_RECONNECT_WAIT_MS",
+                                        timeout_ms_ / 2)));
     stats_interval_s_ = envInt("MC_NVLINK_PROXY_STATS_INTERVAL", 60);
+    outage_since_ns_ = nowNs();  // until the first connection succeeds
 
     // Compose with the base transport's local segment (e.g. "tcp" ->
     // "tcp,nvlink_proxy") instead of replacing it.
@@ -221,9 +226,28 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
     snprintf(id, sizeof(id), "%016" PRIx64, client_id_);
     LOG(INFO) << "nvlink_proxy: installed (socket=" << socket_path_
               << ", node_id=" << node_id_ << ", client_id=" << id
-              << ", timeout_ms=" << timeout_ms_ << ", daemon "
+              << ", timeout_ms=" << timeout_ms_
+              << ", reconnect_wait_ms=" << reconnect_wait_ms_ << ", daemon "
               << (connected ? "connected" : "not reachable yet") << ")";
     return 0;
+}
+
+void NvlinkProxyTransport::setFallbackTransport(Transport *transport,
+                                                const std::string &name) {
+    fallback_ = transport;
+    int inflight =
+        std::max(1, envInt("MC_NVLINK_PROXY_FALLBACK_INFLIGHT", 512));
+    if (name == "tcp") {
+        // Stay below the TCP lane's per-peer queue: requests beyond it wait
+        // in a short admission queue and are then rejected (queue-full).
+        const int queue =
+            std::max(1, envInt("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", 1024));
+        inflight = std::min(inflight, std::max(1, queue / 2));
+    }
+    fallback_submitter_ =
+        std::make_unique<BoundedSubmitter>(inflight, std::min(256, inflight));
+    LOG(INFO) << "nvlink_proxy: base transport " << name << ", at most "
+              << inflight << " fallback request(s) in flight";
 }
 
 // ------------------------------------------------------------------ daemon
@@ -303,8 +327,41 @@ bool NvlinkProxyTransport::hello(int fd, bool control, uint64_t &epoch) {
 void NvlinkProxyTransport::closeControlLocked() {
     if (control_fd_ >= 0) close(control_fd_);
     control_fd_ = -1;
-    healthy_ = false;
+    markUnhealthy();
     epoch_ = 0;
+}
+
+void NvlinkProxyTransport::markUnhealthy() {
+    healthy_ = false;
+    int64_t expected = 0;
+    outage_since_ns_.compare_exchange_strong(expected, nowNs());
+}
+
+void NvlinkProxyTransport::markHealthy(bool reconnected) {
+    {
+        std::lock_guard<std::mutex> lock(state_mu_);
+        if (reconnected) epoch_since_ns_ = nowNs();
+        outage_since_ns_ = 0;
+        healthy_ = true;
+    }
+    state_cv_.notify_all();
+}
+
+bool NvlinkProxyTransport::waitForDaemon(int64_t limit_ns) {
+    std::unique_lock<std::mutex> lock(state_mu_);
+    while (!healthy_) {
+        const int64_t now = nowNs();
+        const int64_t since = outage_since_ns_.load();
+        // Requests stop waiting once the outage itself is older than the
+        // reconnect window, so a daemon that stays away does not delay every
+        // later request by the full window.
+        const int64_t window_end =
+            (since ? since : now) + int64_t(reconnect_wait_ms_) * 1000000LL;
+        const int64_t until = std::min(limit_ns, window_end);
+        if (now >= until) return false;
+        state_cv_.wait_for(lock, std::chrono::nanoseconds(until - now));
+    }
+    return true;
 }
 
 bool NvlinkProxyTransport::ensureControlLocked() {
@@ -342,7 +399,7 @@ bool NvlinkProxyTransport::ensureControlLocked() {
         }
     }
     if (control_fd_ < 0) return false;
-    healthy_ = true;
+    markHealthy(true);
     counters_.reconnects++;
     char ep[32];
     snprintf(ep, sizeof(ep), "%016" PRIx64, epoch);
@@ -417,14 +474,14 @@ void NvlinkProxyTransport::releaseCopyConnection(Connection &conn,
     idle_.push_back(conn);
 }
 
-bool NvlinkProxyTransport::copy(const std::vector<CopyEntry> &entries,
-                                size_t begin, size_t count,
-                                std::string &error) {
+NvlinkProxyTransport::CopyOutcome NvlinkProxyTransport::copy(
+    const std::vector<CopyEntry> &entries, size_t begin, size_t count,
+    std::string &error) {
     Connection conn;
     if (!acquireCopyConnection(conn)) {
         error = std::string("cannot reach daemon: ") + strerror(errno);
         requestRecheck();
-        return false;
+        return CopyOutcome::kNoDaemon;
     }
     std::string payload;
     CopyReqHeader rh{};
@@ -445,7 +502,7 @@ bool NvlinkProxyTransport::copy(const std::vector<CopyEntry> &entries,
                                                          : strerror(errno));
         releaseCopyConnection(conn, false);
         requestRecheck();
-        return false;
+        return CopyOutcome::kNoDaemon;
     }
     releaseCopyConnection(conn, true);
     if (st != ProxyStatus::kOk) {
@@ -453,15 +510,22 @@ bool NvlinkProxyTransport::copy(const std::vector<CopyEntry> &entries,
         if (reply.size() > sizeof(CopyResp)) {
             error += ": " + reply.substr(sizeof(CopyResp));
         }
-        return false;
+        // Right after a daemon (re)start the peer may not have re-registered
+        // its blocks yet: retry shortly instead of falling back.
+        if ((st == ProxyStatus::kUnknownSource ||
+             st == ProxyStatus::kUnknownDestination) &&
+            nowNs() - epoch_since_ns_.load() <
+                int64_t(reconnect_wait_ms_) * 1000000LL)
+            return CopyOutcome::kRetryLater;
+        return CopyOutcome::kFailed;
     }
-    return true;
+    return CopyOutcome::kOk;
 }
 
 void NvlinkProxyTransport::requestRecheck() {
-    // Stop routing to the proxy until the health thread has re-validated the
+    // Hold proxy traffic until the health thread has re-validated the
     // daemon (it pings and, if needed, reconnects and re-registers).
-    healthy_ = false;
+    markUnhealthy();
     {
         std::lock_guard<std::mutex> lock(health_mu_);
         recheck_ = true;
@@ -470,7 +534,7 @@ void NvlinkProxyTransport::requestRecheck() {
 }
 
 void NvlinkProxyTransport::healthLoop() {
-    int backoff_ms = 200;
+    int backoff_ms = 100;
     while (true) {
         {
             std::unique_lock<std::mutex> lock(health_mu_);
@@ -495,13 +559,15 @@ void NvlinkProxyTransport::healthLoop() {
                                  << "); using the base transport until it "
                                     "is back";
                     closeControlLocked();
-                } else {
-                    healthy_ = true;
+                } else if (!healthy_) {
+                    markHealthy(false);
                 }
             }
             if (!ok) ok = ensureControlLocked();
         }
-        backoff_ms = ok ? 200 : std::min(backoff_ms * 2, 2000);
+        // Requests may be waiting for the daemon: retry the connection
+        // often (a failed connect on a unix socket is cheap).
+        backoff_ms = ok ? 100 : std::min(backoff_ms * 2, 400);
         maybeLogStats(false);
     }
 }
@@ -523,23 +589,29 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
             if (epoch && kv.second.registered_epoch == epoch) ++registered;
     }
     const uint64_t batches = counters_.proxy_batches.load();
-    char line[768];
-    snprintf(line, sizeof(line),
-             "healthy=%d proxied_requests=%" PRIu64 " proxied_bytes=%" PRIu64
-             " proxied_batches=%" PRIu64 " avg_batch_us=%" PRIu64
-             " max_batch_us=%" PRIu64 " fallback_requests=%" PRIu64
-             " (daemon_unavailable=%" PRIu64 " daemon_error=%" PRIu64
-             " not_servable=%" PRIu64 ") remote_node_requests=%" PRIu64
-             " registered_blocks=%zu/%zu connects=%" PRIu64,
-             healthy_.load() ? 1 : 0, counters_.proxy_requests.load(),
-             counters_.proxy_bytes.load(), batches,
-             batches ? counters_.proxy_us_total.load() / batches : 0,
-             counters_.proxy_us_max.load(), counters_.fallback_requests.load(),
-             counters_.fallback_unhealthy.load(),
-             counters_.fallback_daemon_error.load(),
-             counters_.fallback_untranslatable.load(),
-             counters_.remote_node_requests.load(), registered, blocks,
-             counters_.reconnects.load());
+    char line[1024];
+    snprintf(
+        line, sizeof(line),
+        "healthy=%d proxied_requests=%" PRIu64 " proxied_bytes=%" PRIu64
+        " proxied_batches=%" PRIu64 " avg_batch_us=%" PRIu64
+        " max_batch_us=%" PRIu64 " held_requests=%" PRIu64
+        " max_hold_ms=%" PRIu64 " retried_requests=%" PRIu64
+        " fallback_requests=%" PRIu64 " (daemon_unavailable=%" PRIu64
+        " daemon_error=%" PRIu64 " not_servable=%" PRIu64
+        ") fallback_retries=%" PRIu64 " failed_requests=%" PRIu64
+        " remote_node_requests=%" PRIu64
+        " registered_blocks=%zu/%zu connects=%" PRIu64,
+        healthy_.load() ? 1 : 0, counters_.proxy_requests.load(),
+        counters_.proxy_bytes.load(), batches,
+        batches ? counters_.proxy_us_total.load() / batches : 0,
+        counters_.proxy_us_max.load(), counters_.held_requests.load(),
+        counters_.held_us_max.load() / 1000, counters_.retried_requests.load(),
+        counters_.fallback_requests.load(), counters_.fallback_unhealthy.load(),
+        counters_.fallback_daemon_error.load(),
+        counters_.fallback_untranslatable.load(),
+        counters_.fallback_retries.load(), counters_.failed_requests.load(),
+        counters_.remote_node_requests.load(), registered, blocks,
+        counters_.reconnects.load());
     if (!force && last_stats_ == line) return;  // nothing changed
     last_stats_ = line;
     LOG(INFO) << "nvlink_proxy stats: " << line;
@@ -585,18 +657,14 @@ bool NvlinkProxyTransport::canRoute(const TransferRequest &request,
         findLocalBlock(local, request.length, local_base);
     if (state == LocalBlockState::kNone) return false;
     if (healthy_ && state == LocalBlockState::kRegistered) return true;
-    // Same-node GPU traffic the proxy would carry, but the daemon (or this
-    // block's registration with it) is not available right now.
+    // While the daemon is unavailable the proxy transport keeps same-node
+    // GPU traffic: it waits for the daemon to come back and otherwise moves
+    // the requests onto the base transport with backpressure, instead of
+    // handing whole batches to the base transport at once.
+    if (!healthy_) return true;
+    // The daemon is up but refused this block (e.g. GPU compute mode).
     counters_.fallback_requests++;
-    counters_.fallback_unhealthy++;
-    int64_t now = nowNs();
-    int64_t last = last_fallback_log_ns_.load();
-    if (now - last >= kFallbackLogIntervalNs &&
-        last_fallback_log_ns_.compare_exchange_strong(last, now)) {
-        LOG(WARNING) << "nvlink_proxy: daemon unavailable, same-node request "
-                        "routed to the base transport (fallback_requests="
-                     << counters_.fallback_requests.load() << ")";
-    }
+    counters_.fallback_untranslatable++;
     return false;
 }
 
@@ -673,7 +741,7 @@ bool NvlinkProxyTransport::translate(const TransferRequest &request,
 
 // ------------------------------------------------------------- submission
 
-void NvlinkProxyTransport::completeTask(TransferTask *task) {
+void NvlinkProxyTransport::finishTask(TransferTask *task, bool ok) {
     const auto &request = *task->request;
     task->total_bytes = request.length;
     Slice *slice = getSliceCache().allocate();
@@ -686,13 +754,25 @@ void NvlinkProxyTransport::completeTask(TransferTask *task) {
     slice->ts = 0;
     task->slice_list.push_back(slice);
     __sync_fetch_and_add(&task->slice_count, 1);
-    slice->markSuccess();
+    if (ok)
+        slice->markSuccess();
+    else
+        slice->markFailed();
 }
 
-Status NvlinkProxyTransport::fallback(const std::vector<TransferTask *> &tasks,
-                                      FallbackReason reason,
-                                      const std::string &detail) {
-    if (tasks.empty()) return Status::OK();
+void NvlinkProxyTransport::completeTask(TransferTask *task) {
+    finishTask(task, true);
+}
+
+void NvlinkProxyTransport::failTask(TransferTask *task) {
+    finishTask(task, false);
+}
+
+void NvlinkProxyTransport::fallback(const std::vector<TransferTask *> &tasks,
+                                    FallbackReason reason,
+                                    const std::string &detail,
+                                    int64_t deadline_ns) {
+    if (tasks.empty()) return;
     counters_.fallback_requests += tasks.size();
     switch (reason) {
         case FallbackReason::kUnhealthy:
@@ -716,91 +796,144 @@ Status NvlinkProxyTransport::fallback(const std::vector<TransferTask *> &tasks,
                      << "); fallback_requests="
                      << counters_.fallback_requests.load();
     }
-    if (!fallback_) {
-        for (auto *task : tasks) {
-            const auto &request = *task->request;
-            task->total_bytes = request.length;
-            Slice *slice = getSliceCache().allocate();
-            slice->source_addr = request.source;
-            slice->length = request.length;
-            slice->opcode = request.opcode;
-            slice->target_id = request.target_id;
-            slice->task = task;
-            slice->status = Slice::PENDING;
-            slice->ts = 0;
-            task->slice_list.push_back(slice);
-            __sync_fetch_and_add(&task->slice_count, 1);
-            slice->markFailed();
-        }
-        return Status::Context("nvlink_proxy: no fallback transport");
+    if (!fallback_ || !fallback_submitter_) {
+        for (auto *task : tasks) failTask(task);
+        counters_.failed_requests += tasks.size();
+        return;
     }
-    // Status polling follows task->transport_, so the base transport owns
-    // these tasks from here on.
-    for (auto *task : tasks) task->transport_ = fallback_;
-    return fallback_->submitTransferTask(tasks);
+    std::vector<const TransferRequest *> requests(tasks.size());
+    for (size_t i = 0; i < tasks.size(); ++i) requests[i] = tasks[i]->request;
+    const int64_t abandon_ns =
+        deadline_ns + std::max<int64_t>(timeout_ms_, 10000) * 1000000LL;
+    auto res = fallback_submitter_->run(
+        fallback_, requests, deadline_ns, abandon_ns, [&](size_t i, bool ok) {
+            ok ? completeTask(tasks[i]) : failTask(tasks[i]);
+        });
+    counters_.fallback_retries += res.retried;
+    if (res.failed) {
+        counters_.failed_requests += res.failed;
+        LOG(ERROR) << "nvlink_proxy: " << res.failed << " of " << tasks.size()
+                   << " request(s) failed on the base transport within the "
+                      "request budget ("
+                   << timeout_ms_ << " ms)";
+    }
 }
 
 Status NvlinkProxyTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    if (!healthy_) return fallback(task_list, FallbackReason::kUnhealthy, "");
+    const int64_t start = nowNs();
+    const int64_t hold_deadline =
+        start + int64_t(reconnect_wait_ms_) * 1000000LL;
+    const int64_t deadline = start + int64_t(timeout_ms_) * 1000000LL;
 
-    std::vector<CopyEntry> entries;
-    std::vector<TransferTask *> proxied, not_servable, failed;
-    entries.reserve(task_list.size());
-    proxied.reserve(task_list.size());
-    std::vector<TargetIndex> targets;
-    const TargetIndex *last_target = nullptr;
-    for (auto *task : task_list) {
-        CopyEntry e{};
-        const TargetIndex *target = nullptr;
-        if (task->request) {
-            if (last_target && last_target->id == task->request->target_id)
-                target = last_target;
-            else
-                target = last_target =
-                    targetIndex(targets, task->request->target_id);
-        }
-        if (!target || !translate(*task->request, *target, e)) {
-            not_servable.push_back(task);
-            continue;
-        }
-        entries.push_back(e);
-        proxied.push_back(task);
-    }
-
+    std::vector<TransferTask *> pending(task_list.begin(), task_list.end());
+    std::vector<TransferTask *> not_servable, failed, unavailable;
     std::string error;
-    for (size_t begin = 0; begin < proxied.size();
-         begin += kMaxEntriesPerCopy) {
-        const size_t count =
-            std::min(kMaxEntriesPerCopy, proxied.size() - begin);
-        const int64_t t0 = nowNs();
-        std::string err;
-        if (!copy(entries, begin, count, err)) {
-            failed.insert(failed.end(), proxied.begin() + begin,
-                          proxied.begin() + begin + count);
-            error = err;
+    bool held = false;
+    int round = 0;
+    while (!pending.empty()) {
+        if (!healthy_) {
+            if (!held) {
+                held = true;
+                counters_.held_requests += pending.size();
+            }
+            if (!waitForDaemon(hold_deadline)) {
+                unavailable.swap(pending);
+                break;
+            }
             continue;
         }
-        const uint64_t us = static_cast<uint64_t>((nowNs() - t0) / 1000);
-        uint64_t bytes = 0;
-        for (size_t i = begin; i < begin + count; ++i) {
-            bytes += entries[i].length;
-            completeTask(proxied[i]);
+
+        std::vector<CopyEntry> entries;
+        std::vector<TransferTask *> proxied;
+        entries.reserve(pending.size());
+        proxied.reserve(pending.size());
+        std::vector<TargetIndex> targets;
+        const TargetIndex *last_target = nullptr;
+        for (auto *task : pending) {
+            CopyEntry e{};
+            const TargetIndex *target = nullptr;
+            if (task->request) {
+                if (last_target && last_target->id == task->request->target_id)
+                    target = last_target;
+                else
+                    target = last_target =
+                        targetIndex(targets, task->request->target_id);
+            }
+            if (!target || !translate(*task->request, *target, e)) {
+                not_servable.push_back(task);
+                continue;
+            }
+            entries.push_back(e);
+            proxied.push_back(task);
         }
-        counters_.proxy_requests += count;
-        counters_.proxy_bytes += bytes;
-        counters_.proxy_batches++;
-        counters_.proxy_us_total += us;
-        uint64_t cur = counters_.proxy_us_max.load();
-        while (us > cur &&
-               !counters_.proxy_us_max.compare_exchange_weak(cur, us)) {
+
+        std::vector<TransferTask *> retry;
+        bool retry_later = false;
+        for (size_t begin = 0; begin < proxied.size();
+             begin += kMaxEntriesPerCopy) {
+            const size_t count =
+                std::min(kMaxEntriesPerCopy, proxied.size() - begin);
+            const int64_t t0 = nowNs();
+            std::string err;
+            const CopyOutcome outcome = copy(entries, begin, count, err);
+            if (outcome != CopyOutcome::kOk) {
+                auto &dst = outcome == CopyOutcome::kFailed ? failed : retry;
+                dst.insert(dst.end(), proxied.begin() + begin,
+                           proxied.begin() + begin + count);
+                retry_later |= outcome == CopyOutcome::kRetryLater;
+                error = err;
+                continue;
+            }
+            const uint64_t us = static_cast<uint64_t>((nowNs() - t0) / 1000);
+            uint64_t bytes = 0;
+            for (size_t i = begin; i < begin + count; ++i) {
+                bytes += entries[i].length;
+                completeTask(proxied[i]);
+            }
+            counters_.proxy_requests += count;
+            counters_.proxy_bytes += bytes;
+            counters_.proxy_batches++;
+            counters_.proxy_us_total += us;
+            uint64_t cur = counters_.proxy_us_max.load();
+            while (us > cur &&
+                   !counters_.proxy_us_max.compare_exchange_weak(cur, us)) {
+            }
+        }
+        pending.swap(retry);
+        if (pending.empty()) break;
+        // Daemon restarted or a peer not re-registered yet: retry through
+        // the proxy while the reconnect window lasts.
+        const int64_t now = nowNs();
+        if (now >= hold_deadline) {
+            failed.insert(failed.end(), pending.begin(), pending.end());
+            pending.clear();
+            break;
+        }
+        counters_.retried_requests += pending.size();
+        if (retry_later) {
+            const int64_t backoff_ns =
+                std::min<int64_t>(200, 10LL << std::min(round, 5)) * 1000000LL;
+            std::this_thread::sleep_for(std::chrono::nanoseconds(
+                std::min<int64_t>(backoff_ns, hold_deadline - now)));
+        }
+        ++round;
+    }
+    if (held) {
+        const uint64_t waited = static_cast<uint64_t>((nowNs() - start) / 1000);
+        uint64_t cur = counters_.held_us_max.load();
+        while (waited > cur &&
+               !counters_.held_us_max.compare_exchange_weak(cur, waited)) {
         }
     }
 
-    Status s1 = fallback(not_servable, FallbackReason::kUntranslatable,
-                         "target or source not registered with the proxy");
-    Status s2 = fallback(failed, FallbackReason::kDaemonError, error);
-    return s1.ok() ? s2 : s1;
+    fallback(unavailable, FallbackReason::kUnhealthy,
+             "daemon unavailable for longer than the reconnect window",
+             deadline);
+    fallback(not_servable, FallbackReason::kUntranslatable,
+             "target or source not registered with the proxy", deadline);
+    fallback(failed, FallbackReason::kDaemonError, error, deadline);
+    return Status::OK();
 }
 
 Status NvlinkProxyTransport::submitTransfer(

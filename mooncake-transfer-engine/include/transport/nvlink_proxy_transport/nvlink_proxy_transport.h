@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "transfer_metadata.h"
+#include "transport/nvlink_proxy_transport/bounded_submitter.h"
 #include "transport/nvlink_proxy_transport/nvlink_proxy_protocol.h"
 #include "transport/transport.h"
 
@@ -56,7 +57,7 @@ class NvlinkProxyTransport : public Transport {
                              TransferStatus &status) override;
 
     // Transport used for requests the proxy cannot serve.
-    void setFallbackTransport(Transport *transport) { fallback_ = transport; }
+    void setFallbackTransport(Transport *transport, const std::string &name);
 
     // Routing gate used by MultiTransport::selectTransport for a target
     // buffer published under "nvlink_proxy".
@@ -101,6 +102,14 @@ class NvlinkProxyTransport : public Transport {
 
     enum class FallbackReason { kUnhealthy, kDaemonError, kUntranslatable };
 
+    // Outcome of one COPY round trip.
+    enum class CopyOutcome {
+        kOk,
+        kNoDaemon,    // connection lost / daemon gone: wait and retry
+        kRetryLater,  // a block is not registered yet under a new daemon
+        kFailed,      // anything else: use the base transport
+    };
+
     // Daemon I/O.
     int connectSocket(int timeout_ms);
     bool rpc(int fd, nvlink_proxy::MsgType type, const void *payload,
@@ -111,8 +120,8 @@ class NvlinkProxyTransport : public Transport {
     bool registerBlockLocked(Block &block);
     bool acquireCopyConnection(Connection &conn);
     void releaseCopyConnection(Connection &conn, bool reusable);
-    bool copy(const std::vector<nvlink_proxy::CopyEntry> &entries, size_t begin,
-              size_t count, std::string &error);
+    CopyOutcome copy(const std::vector<nvlink_proxy::CopyEntry> &entries,
+                     size_t begin, size_t count, std::string &error);
 
     // Request translation: local address + remote buffer -> copy entry.
     enum class LocalBlockState { kNone, kUnregistered, kRegistered };
@@ -133,9 +142,19 @@ class NvlinkProxyTransport : public Transport {
     bool translate(const TransferRequest &request, const TargetIndex &target,
                    nvlink_proxy::CopyEntry &entry);
 
+    void finishTask(TransferTask *task, bool ok);
     void completeTask(TransferTask *task);
-    Status fallback(const std::vector<TransferTask *> &tasks,
-                    FallbackReason reason, const std::string &detail);
+    void failTask(TransferTask *task);
+    // Moves |tasks| onto the base transport with backpressure and retries
+    // until |deadline_ns|; marks every task completed or failed.
+    void fallback(const std::vector<TransferTask *> &tasks,
+                  FallbackReason reason, const std::string &detail,
+                  int64_t deadline_ns);
+    // Waits until the daemon is healthy again, at most until |limit_ns| and
+    // never beyond the reconnect window of the current outage.
+    bool waitForDaemon(int64_t limit_ns);
+    void markHealthy(bool reconnected);
+    void markUnhealthy();
     void healthLoop();
     void requestRecheck();
     void maybeLogStats(bool force);
@@ -144,8 +163,12 @@ class NvlinkProxyTransport : public Transport {
     std::string node_id_;
     uint64_t client_id_ = 0;
     int timeout_ms_ = 30000;
+    // How long same-node requests wait for the daemon to come back before
+    // they use the base transport (MC_NVLINK_PROXY_RECONNECT_WAIT_MS).
+    int reconnect_wait_ms_ = 15000;
     int stats_interval_s_ = 60;
     Transport *fallback_ = nullptr;
+    std::unique_ptr<BoundedSubmitter> fallback_submitter_;
 
     // Local cudaMalloc blocks (base -> block) and registered buffers
     // (buffer addr -> block base).
@@ -158,6 +181,12 @@ class NvlinkProxyTransport : public Transport {
     int control_fd_ = -1;
     std::atomic<uint64_t> epoch_{0};  // 0 = daemon not reachable
     std::atomic<bool> healthy_{false};
+    // Start of the current outage (steady clock ns, 0 while healthy) and
+    // time this client connected to the current daemon epoch.
+    std::atomic<int64_t> outage_since_ns_{0};
+    std::atomic<int64_t> epoch_since_ns_{0};
+    std::mutex state_mu_;
+    std::condition_variable state_cv_;  // signalled when healthy again
 
     // Pool of copy connections (one in-flight COPY each).
     std::mutex pool_mu_;
@@ -181,6 +210,11 @@ class NvlinkProxyTransport : public Transport {
         std::atomic<uint64_t> fallback_untranslatable{0};
         std::atomic<uint64_t> remote_node_requests{0};
         std::atomic<uint64_t> reconnects{0};
+        std::atomic<uint64_t> held_requests{0};  // waited for the daemon
+        std::atomic<uint64_t> held_us_max{0};
+        std::atomic<uint64_t> retried_requests{0};  // re-sent to the daemon
+        std::atomic<uint64_t> fallback_retries{0};  // re-sent to the base
+        std::atomic<uint64_t> failed_requests{0};
     } counters_;
     std::atomic<int64_t> last_fallback_log_ns_{0};
     std::atomic<uint64_t> suppressed_fallback_logs_{0};
