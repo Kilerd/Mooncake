@@ -55,6 +55,7 @@
 #include <utility>
 #include <vector>
 
+#include "gather_copy.h"
 #include "transport/nvlink_proxy_transport/nvlink_proxy_protocol.h"
 
 using namespace mooncake::nvlink_proxy;
@@ -261,6 +262,13 @@ struct Stats {
     std::atomic<uint64_t> copy_us_total{0};
     std::atomic<uint64_t> copy_us_max{0};
     std::atomic<uint64_t> handle_opens{0};
+    std::atomic<uint64_t> coalesced_entries{0};  // merged into a neighbour
+    std::atomic<uint64_t> kernel_entries{0};
+    std::atomic<uint64_t> kernel_bytes{0};
+    std::atomic<uint64_t> ce_entries{0};
+    std::atomic<uint64_t> ce_bytes{0};
+    std::atomic<uint64_t> plan_us_total{0};
+    std::atomic<uint64_t> exec_us_total{0};
 } g_stats;
 
 void updateMax(std::atomic<uint64_t> &m, uint64_t v) {
@@ -277,51 +285,105 @@ std::string statsText() {
     }
     uint64_t reqs = g_stats.copy_requests.load();
     uint64_t us = g_stats.copy_us_total.load();
-    char buf[1024];
+    char buf[1536];
     snprintf(
         buf, sizeof(buf),
         "epoch=%016" PRIx64 " uptime_s=%" PRIu64
         " devices=%zu active_clients=%" PRIu64 " active_connections=%" PRIu64
         " registrations=%zu copy_requests=%" PRIu64 " copy_entries=%" PRIu64
         " copy_bytes=%" PRIu64 " copy_failures=%" PRIu64 " avg_copy_us=%" PRIu64
-        " max_copy_us=%" PRIu64 " handle_opens=%" PRIu64,
+        " max_copy_us=%" PRIu64 " avg_plan_us=%" PRIu64 " avg_exec_us=%" PRIu64
+        " copy_us_total=%" PRIu64 " plan_us_total=%" PRIu64
+        " exec_us_total=%" PRIu64 " coalesced_entries=%" PRIu64
+        " kernel_entries=%" PRIu64 " kernel_bytes=%" PRIu64
+        " ce_entries=%" PRIu64 " ce_bytes=%" PRIu64 " handle_opens=%" PRIu64,
         g_epoch, (nowUs() - g_start_us) / 1000000, g_devices.size(),
         g_stats.active_clients.load(), g_stats.active_connections.load(), regs,
         reqs, g_stats.copy_entries.load(), g_stats.copy_bytes.load(),
         g_stats.copy_failures.load(), reqs ? us / reqs : 0,
-        g_stats.copy_us_max.load(), g_stats.handle_opens.load());
+        g_stats.copy_us_max.load(),
+        reqs ? g_stats.plan_us_total.load() / reqs : 0,
+        reqs ? g_stats.exec_us_total.load() / reqs : 0, us,
+        g_stats.plan_us_total.load(), g_stats.exec_us_total.load(),
+        g_stats.coalesced_entries.load(), g_stats.kernel_entries.load(),
+        g_stats.kernel_bytes.load(), g_stats.ce_entries.load(),
+        g_stats.ce_bytes.load(), g_stats.handle_opens.load());
     return buf;
 }
 
 // ------------------------------------------------------------ copy engine
-// Per connection-thread streams, one per pulling device.
-struct ThreadStreams {
-    std::unordered_map<int, cudaStream_t> streams;
-    ~ThreadStreams() {
-        for (auto &kv : streams) {
+// Tunables (command line).
+struct CopyConfig {
+    // Entries shorter than this go through the gather/scatter kernel, longer
+    // ones through the copy engines (cudaMemcpyBatchAsync). 0 = never use
+    // the kernel.
+    uint64_t gather_threshold = 64 * 1024;
+    // Which GPU runs the kernel: the one receiving the data (reads through
+    // the peer mapping) or the one holding the source (writes through it).
+    bool gather_on_src = false;
+    // Merge consecutive entries that are contiguous in source and target.
+    bool coalesce = true;
+} g_cfg;
+
+// Per connection-thread resources, one set per executing GPU.
+struct DeviceResources {
+    cudaStream_t stream = nullptr;
+    GatherEntry *host_table = nullptr;  // pinned
+    GatherEntry *dev_table = nullptr;
+    size_t capacity = 0;
+    int grid_blocks = 0;
+};
+
+struct ThreadResources {
+    std::unordered_map<int, DeviceResources> devs;
+    ~ThreadResources() {
+        for (auto &kv : devs) {
             cudaSetDevice(kv.first);
-            cudaStreamDestroy(kv.second);
+            if (kv.second.stream) cudaStreamDestroy(kv.second.stream);
+            if (kv.second.dev_table) cudaFree(kv.second.dev_table);
+            if (kv.second.host_table) cudaFreeHost(kv.second.host_table);
         }
     }
-    cudaError_t get(int dev, cudaStream_t *out) {
-        auto it = streams.find(dev);
-        if (it != streams.end()) {
-            *out = it->second;
-            return cudaSuccess;
-        }
+    cudaError_t get(int dev, DeviceResources **out) {
+        auto &r = devs[dev];
+        *out = &r;
+        if (r.stream) return cudaSuccess;
         cudaError_t e = cudaSetDevice(dev);
         if (e != cudaSuccess) return e;
-        cudaStream_t s;
-        e = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+        e = cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking);
+        if (e != cudaSuccess) {
+            r.stream = nullptr;
+            return e;
+        }
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        r.grid_blocks = std::max(1, sms) * 16;
+        return cudaSuccess;
+    }
+    cudaError_t reserve(int dev, DeviceResources &r, size_t n) {
+        if (n <= r.capacity) return cudaSuccess;
+        size_t cap =
+            std::max<size_t>(n, std::max<size_t>(1024, r.capacity * 2));
+        cudaError_t e = cudaSetDevice(dev);
         if (e != cudaSuccess) return e;
-        streams[dev] = s;
-        *out = s;
+        if (r.dev_table) cudaFree(r.dev_table);
+        if (r.host_table) cudaFreeHost(r.host_table);
+        r.dev_table = nullptr;
+        r.host_table = nullptr;
+        r.capacity = 0;
+        e = cudaMalloc(&r.dev_table, cap * sizeof(GatherEntry));
+        if (e != cudaSuccess) return e;
+        e = cudaHostAlloc(&r.host_table, cap * sizeof(GatherEntry),
+                          cudaHostAllocDefault);
+        if (e != cudaSuccess) return e;
+        r.capacity = cap;
         return cudaSuccess;
     }
 };
 
-thread_local ThreadStreams t_streams;
+thread_local ThreadResources t_res;
 std::atomic<bool> g_batch_api_usable{true};
+std::atomic<bool> g_kernel_unusable[kMaxDevices];
 
 cudaError_t issueCopies(std::vector<void *> &dsts, std::vector<void *> &srcs,
                         std::vector<size_t> &sizes, cudaStream_t stream) {
@@ -386,130 +448,265 @@ std::shared_ptr<Registration> lookupReg(uint64_t client, uint64_t base) {
     return it == g_regs.end() ? nullptr : it->second;
 }
 
+struct RegKeyHash {
+    size_t operator()(const RegKey &k) const {
+        return std::hash<uint64_t>()(k.first * 0x9e3779b97f4a7c15ULL ^
+                                     k.second);
+    }
+};
+
+// Resolves (client, base) keys of one request, keeping every registration it
+// references alive until the copies completed even if the owner disconnects.
+class RegResolver {
+   public:
+    Registration *find(uint64_t client, uint64_t base) {
+        if (last_ && last_->client_id == client && last_->base == base)
+            return last_;
+        if (last2_ && last2_->client_id == client && last2_->base == base) {
+            std::swap(last_, last2_);
+            return last_;
+        }
+        auto it = cache_.find({client, base});
+        Registration *reg;
+        if (it != cache_.end()) {
+            reg = it->second;
+        } else {
+            auto sp = lookupReg(client, base);
+            if (!sp) return nullptr;
+            reg = sp.get();
+            keep_.push_back(std::move(sp));
+            cache_.emplace(RegKey{client, base}, reg);
+        }
+        last2_ = last_;
+        last_ = reg;
+        return reg;
+    }
+
+   private:
+    Registration *last_ = nullptr, *last2_ = nullptr;
+    std::unordered_map<RegKey, Registration *, RegKeyHash> cache_;
+    std::vector<std::shared_ptr<Registration>> keep_;
+};
+
+// Caches the mapping of a block in an executing GPU's context.
+class MapResolver {
+   public:
+    cudaError_t map(Registration *reg, int dev, char **out) {
+        for (auto &h : hot_) {
+            if (h.reg == reg && h.dev == dev) {
+                *out = h.ptr;
+                return cudaSuccess;
+            }
+        }
+        bool opened = false;
+        cudaError_t e = reg->mapFor(dev, out, &opened);
+        if (opened) g_stats.handle_opens++;
+        if (e != cudaSuccess) return e;
+        hot_[next_] = {reg, dev, *out};
+        next_ = (next_ + 1) % kHot;
+        return cudaSuccess;
+    }
+
+   private:
+    static constexpr int kHot = 4;
+    struct Hot {
+        Registration *reg = nullptr;
+        int dev = -1;
+        char *ptr = nullptr;
+    } hot_[kHot];
+    int next_ = 0;
+};
+
 CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
                   uint64_t t_recv_us) {
     CopyResult r;
     r.failed_index = count;
-    struct Planned {
-        int dev;
-        void *dst;
-        void *src;
-        size_t len;
-    };
-    std::vector<Planned> plan;
-    plan.reserve(count);
-    // Keep every registration referenced by this request alive until the
-    // copies completed, even if its owner disconnects meanwhile.
-    std::vector<std::shared_ptr<Registration>> keep;
-    std::shared_ptr<Registration> last_src, last_dst;
     auto fail = [&](ProxyStatus st, uint32_t idx, std::string msg) {
         r.status = st;
         r.failed_index = idx;
         r.message = std::move(msg);
         return r;
     };
+
+    // 1. Resolve and validate every entry; merge runs that are contiguous in
+    //    both source and destination (page-granular KV caches produce many).
+    struct Item {
+        Registration *src;
+        Registration *dst;
+        uint64_t src_off;
+        uint64_t dst_off;
+        uint64_t len;
+    };
+    std::vector<Item> items;
+    items.reserve(count);
+    RegResolver regs;
     for (uint32_t i = 0; i < count; ++i) {
         const CopyEntry &e = entries[i];
         if (e.length == 0) continue;
-        if (!last_src || last_src->client_id != e.src_client ||
-            last_src->base != e.src_base) {
-            last_src = lookupReg(e.src_client, e.src_base);
-            if (!last_src) {
-                char m[128];
-                snprintf(m, sizeof(m),
-                         "source block client=%016" PRIx64 " base=%#" PRIx64
-                         " is not registered",
-                         e.src_client, e.src_base);
-                return fail(ProxyStatus::kUnknownSource, i, m);
-            }
-            keep.push_back(last_src);
+        Registration *src = regs.find(e.src_client, e.src_base);
+        if (!src) {
+            char m[128];
+            snprintf(m, sizeof(m),
+                     "source block client=%016" PRIx64 " base=%#" PRIx64
+                     " is not registered",
+                     e.src_client, e.src_base);
+            return fail(ProxyStatus::kUnknownSource, i, m);
         }
-        if (!last_dst || last_dst->client_id != e.dst_client ||
-            last_dst->base != e.dst_base) {
-            last_dst = lookupReg(e.dst_client, e.dst_base);
-            if (!last_dst) {
-                char m[128];
-                snprintf(m, sizeof(m),
-                         "destination block client=%016" PRIx64
-                         " base=%#" PRIx64 " is not registered",
-                         e.dst_client, e.dst_base);
-                return fail(ProxyStatus::kUnknownDestination, i, m);
-            }
-            keep.push_back(last_dst);
+        Registration *dst = regs.find(e.dst_client, e.dst_base);
+        if (!dst) {
+            char m[128];
+            snprintf(m, sizeof(m),
+                     "destination block client=%016" PRIx64 " base=%#" PRIx64
+                     " is not registered",
+                     e.dst_client, e.dst_base);
+            return fail(ProxyStatus::kUnknownDestination, i, m);
         }
-        if (e.src_offset > last_src->size ||
-            e.length > last_src->size - e.src_offset ||
-            e.dst_offset > last_dst->size ||
-            e.length > last_dst->size - e.dst_offset) {
+        if (e.src_offset > src->size || e.length > src->size - e.src_offset ||
+            e.dst_offset > dst->size || e.length > dst->size - e.dst_offset) {
             return fail(ProxyStatus::kOutOfRange, i,
                         "copy range exceeds a registered block");
         }
-        const int dev = last_dst->device;
-        if (last_src->device != dev && !g_peer[dev][last_src->device].load()) {
+        if (g_cfg.coalesce && !items.empty()) {
+            Item &p = items.back();
+            if (p.src == src && p.dst == dst &&
+                p.src_off + p.len == e.src_offset &&
+                p.dst_off + p.len == e.dst_offset) {
+                p.len += e.length;
+                r.bytes += e.length;
+                continue;
+            }
+        }
+        items.push_back({src, dst, e.src_offset, e.dst_offset, e.length});
+        r.bytes += e.length;
+    }
+
+    // 2. Choose the executing GPU, map both blocks in its context and split
+    //    into kernel (small) and copy-engine (large) work.
+    struct DevWork {
+        std::vector<void *> ce_dst, ce_src;
+        std::vector<size_t> ce_len;
+        std::vector<GatherEntry> small;
+        uint64_t ce_bytes = 0, small_bytes = 0;
+    };
+    std::map<int, DevWork> work;
+    MapResolver maps;
+    for (size_t k = 0; k < items.size(); ++k) {
+        const Item &it = items[k];
+        const bool small = it.len < g_cfg.gather_threshold;
+        int dev = it.dst->device;
+        if (small && g_cfg.gather_on_src) dev = it.src->device;
+        if (small && g_kernel_unusable[dev].load(std::memory_order_relaxed))
+            dev = it.dst->device;  // copy engines of the receiving GPU
+        const int other =
+            (dev == it.dst->device) ? it.src->device : it.dst->device;
+        if (other != dev && !g_peer[dev][other].load()) {
             char m[96];
             snprintf(m, sizeof(m), "gpu %d cannot access gpu %d (no P2P)", dev,
-                     last_src->device);
-            return fail(ProxyStatus::kNoPeerAccess, i, m);
+                     other);
+            return fail(ProxyStatus::kNoPeerAccess, count, m);
         }
         char *src_map = nullptr, *dst_map = nullptr;
-        bool src_new = false, dst_new = false;
-        cudaError_t ce = last_src->mapFor(dev, &src_map, &src_new);
-        if (ce == cudaSuccess) ce = last_dst->mapFor(dev, &dst_map, &dst_new);
-        if (src_new) g_stats.handle_opens++;
-        if (dst_new) g_stats.handle_opens++;
+        cudaError_t ce = maps.map(it.src, dev, &src_map);
+        if (ce == cudaSuccess) ce = maps.map(it.dst, dev, &dst_map);
         if (ce != cudaSuccess) {
             if (isStickyCudaError(ce)) dieOnStickyError(ce, "IPC open");
             cudaGetLastError();
             return fail(
-                ProxyStatus::kCudaError, i,
+                ProxyStatus::kCudaError, count,
                 std::string("cudaIpcOpenMemHandle: ") + cudaGetErrorString(ce));
         }
-        plan.push_back(
-            {dev, dst_map + e.dst_offset, src_map + e.src_offset, e.length});
-        r.bytes += e.length;
+        DevWork &w = work[dev];
+        char *d = dst_map + it.dst_off;
+        char *s = src_map + it.src_off;
+        if (small && !g_kernel_unusable[dev].load(std::memory_order_relaxed)) {
+            w.small.push_back({reinterpret_cast<uint64_t>(d),
+                               reinterpret_cast<uint64_t>(s), it.len});
+            w.small_bytes += it.len;
+        } else {
+            w.ce_dst.push_back(d);
+            w.ce_src.push_back(s);
+            w.ce_len.push_back(it.len);
+            w.ce_bytes += it.len;
+        }
     }
+    const uint64_t t_planned = nowUs();
+    g_stats.plan_us_total += t_planned - t_recv_us;
+    g_stats.coalesced_entries += count - items.size();
 
     if (budget_ms && nowUs() - t_recv_us > uint64_t(budget_ms) * 1000) {
         return fail(ProxyStatus::kDeadlineExceeded, count,
                     "start budget exceeded before the copy was issued");
     }
 
-    // Group by pulling device (normally a single device per request).
-    std::map<int, std::vector<size_t>> by_dev;
-    for (size_t i = 0; i < plan.size(); ++i) by_dev[plan[i].dev].push_back(i);
-    std::vector<std::pair<int, cudaStream_t>> used;
-    for (auto &kv : by_dev) {
+    // 3. Issue: one kernel launch (plus its table upload) and one batched
+    //    copy-engine submission per executing GPU, then wait for all.
+    std::vector<cudaStream_t> used;
+    auto drain = [&]() {
+        for (auto s : used) cudaStreamSynchronize(s);
+    };
+    for (auto &kv : work) {
         const int dev = kv.first;
-        cudaStream_t stream;
-        cudaError_t ce = t_streams.get(dev, &stream);
+        DevWork &w = kv.second;
+        DeviceResources *res = nullptr;
+        cudaError_t ce = t_res.get(dev, &res);
         if (ce == cudaSuccess) ce = cudaSetDevice(dev);
-        std::vector<void *> dsts, srcs;
-        std::vector<size_t> sizes;
-        dsts.reserve(kv.second.size());
-        srcs.reserve(kv.second.size());
-        sizes.reserve(kv.second.size());
-        for (size_t i : kv.second) {
-            dsts.push_back(plan[i].dst);
-            srcs.push_back(plan[i].src);
-            sizes.push_back(plan[i].len);
+        if (ce == cudaSuccess && !w.small.empty()) {
+            ce = t_res.reserve(dev, *res, w.small.size());
+            if (ce == cudaSuccess) {
+                memcpy(res->host_table, w.small.data(),
+                       w.small.size() * sizeof(GatherEntry));
+                ce = cudaMemcpyAsync(res->dev_table, res->host_table,
+                                     w.small.size() * sizeof(GatherEntry),
+                                     cudaMemcpyHostToDevice, res->stream);
+            }
+            if (ce == cudaSuccess) {
+                ce = launchGatherCopy(res->dev_table,
+                                      static_cast<uint32_t>(w.small.size()),
+                                      res->grid_blocks, res->stream);
+                if (ce == cudaErrorNoKernelImageForDevice ||
+                    ce == cudaErrorInvalidDeviceFunction ||
+                    ce == cudaErrorUnsupportedPtxVersion) {
+                    // No usable kernel image for this GPU: use the copy
+                    // engines for this and all later batches.
+                    cudaGetLastError();
+                    g_kernel_unusable[dev] = true;
+                    LOGW(
+                        "gather kernel unavailable on gpu %d (%s); small "
+                        "copies use the copy engines",
+                        dev, cudaGetErrorString(ce));
+                    for (auto &g : w.small) {
+                        w.ce_dst.push_back(reinterpret_cast<void *>(g.dst));
+                        w.ce_src.push_back(reinterpret_cast<void *>(g.src));
+                        w.ce_len.push_back(g.length);
+                    }
+                    w.ce_bytes += w.small_bytes;
+                    w.small_bytes = 0;
+                    w.small.clear();
+                    ce = cudaSuccess;
+                }
+            }
         }
-        if (ce == cudaSuccess) ce = issueCopies(dsts, srcs, sizes, stream);
+        if (ce == cudaSuccess)
+            ce = issueCopies(w.ce_dst, w.ce_src, w.ce_len, res->stream);
+        if (res && res->stream) used.push_back(res->stream);
         if (ce != cudaSuccess) {
             if (isStickyCudaError(ce)) dieOnStickyError(ce, "copy submit");
             cudaGetLastError();
-            // Drain what was already queued before replying.
-            for (auto &u : used) cudaStreamSynchronize(u.second);
-            cudaStreamSynchronize(stream);
+            drain();  // nothing may still be running when we reply
             return fail(ProxyStatus::kCudaError, count,
                         std::string("copy submit: ") + cudaGetErrorString(ce));
         }
-        used.emplace_back(dev, stream);
+        g_stats.kernel_entries += w.small.size();
+        g_stats.kernel_bytes += w.small_bytes;
+        g_stats.ce_entries += w.ce_len.size();
+        g_stats.ce_bytes += w.ce_bytes;
     }
     cudaError_t first_err = cudaSuccess;
-    for (auto &u : used) {
-        cudaError_t ce = cudaStreamSynchronize(u.second);
+    for (auto s : used) {
+        cudaError_t ce = cudaStreamSynchronize(s);
         if (ce != cudaSuccess && first_err == cudaSuccess) first_err = ce;
     }
+    g_stats.exec_us_total += nowUs() - t_planned;
     if (first_err != cudaSuccess) {
         if (isStickyCudaError(first_err))
             dieOnStickyError(first_err, "copy completion");
@@ -843,6 +1040,7 @@ bool initDevices() {
     }
     for (int a = 0; a < kMaxDevices; ++a) {
         g_dev_ready[a] = false;
+        g_kernel_unusable[a] = false;
         for (int b = 0; b < kMaxDevices; ++b) g_peer[a][b] = false;
     }
     return n > 0;
@@ -998,6 +1196,19 @@ void usage(const char *argv0) {
         "                          on --socket and exit\n"
         "  --ping                  exit 0 if the daemon on --socket answers\n"
         "                          (usable as a liveness probe)\n"
+        "  --gather-threshold <B>  copies shorter than B bytes (after "
+        "merging)\n"
+        "                          run in one gather/scatter kernel per batch\n"
+        "                          instead of the copy engines (default "
+        "65536,\n"
+        "                          0 = always use the copy engines)\n"
+        "  --gather-on dst|src     GPU that runs the kernel: the receiving "
+        "one\n"
+        "                          (reads through the peer mapping, default) "
+        "or\n"
+        "                          the sending one (writes through it)\n"
+        "  --no-coalesce           do not merge consecutive copies that are\n"
+        "                          contiguous in source and destination\n"
         "  --eager-init            create a CUDA context on every visible GPU\n"
         "                          and enable peer access for all pairs at\n"
         "                          start; by default a GPU is initialized "
@@ -1010,7 +1221,9 @@ void usage(const char *argv0) {
         "\n"
         "Counters (log line / --stats): active_clients, registrations,\n"
         "copy_requests, copy_entries, copy_bytes, copy_failures, avg/max\n"
-        "copy latency in microseconds, handle_opens.\n",
+        "copy latency in microseconds (split into avg_plan_us and\n"
+        "avg_exec_us), coalesced_entries, kernel_entries/bytes and\n"
+        "ce_entries/bytes (copy engines), handle_opens.\n",
         argv0);
 }
 
@@ -1045,6 +1258,18 @@ int main(int argc, char **argv) {
             do_ping = true;
         } else if (a == "--eager-init") {
             eager = true;
+        } else if (a == "--gather-threshold") {
+            g_cfg.gather_threshold =
+                strtoull(need("--gather-threshold"), nullptr, 0);
+        } else if (a == "--gather-on") {
+            std::string v = need("--gather-on");
+            if (v != "dst" && v != "src") {
+                fprintf(stderr, "--gather-on must be dst or src\n");
+                return 2;
+            }
+            g_cfg.gather_on_src = (v == "src");
+        } else if (a == "--no-coalesce") {
+            g_cfg.coalesce = false;
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
@@ -1073,8 +1298,13 @@ int main(int argc, char **argv) {
                   uint64_t(time(nullptr));
         if (g_epoch == 0) g_epoch = 1;
     }
-    LOGI("starting, protocol v%u, epoch %016" PRIx64, kProtocolVersion,
-         g_epoch);
+    LOGI("starting, protocol v%u, epoch %016" PRIx64
+         ", gather kernel for copies < %" PRIu64
+         " bytes on the %s GPU, "
+         "coalescing %s",
+         kProtocolVersion, g_epoch, g_cfg.gather_threshold,
+         g_cfg.gather_on_src ? "sending" : "receiving",
+         g_cfg.coalesce ? "on" : "off");
     if (!initDevices()) return 1;
     if (eager) {
         for (size_t i = 0; i < g_devices.size(); ++i) {
