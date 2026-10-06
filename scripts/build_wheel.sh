@@ -135,6 +135,13 @@ echo "Copying transfer_engine_bench..."
 # Copy transfer_engine_bench
 cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
 
+# Node-local GPU copy daemon of the nvlink_proxy transport (USE_NVLINK_PROXY=ON)
+rm -f mooncake-wheel/mooncake/mooncake_nvlink_proxy
+if [ -f "${BUILD_DIR}/mooncake-transfer-engine/nvlink-proxy/mooncake_nvlink_proxy" ]; then
+    echo "Copying mooncake_nvlink_proxy..."
+    cp "${BUILD_DIR}/mooncake-transfer-engine/nvlink-proxy/mooncake_nvlink_proxy" mooncake-wheel/mooncake/
+fi
+
 if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
     cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
     echo "Copying ascend_transport_mem libraries..."
