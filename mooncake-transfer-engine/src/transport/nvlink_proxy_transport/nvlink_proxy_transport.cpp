@@ -355,6 +355,7 @@ bool NvlinkProxyTransport::ensureControlLocked() {
 // Requires control_mu_ and blocks_mu_.
 bool NvlinkProxyTransport::registerBlockLocked(Block &block) {
     block.registered_epoch = 0;
+    blocks_version_.fetch_add(1, std::memory_order_release);
     if (control_fd_ < 0) return false;
     RegisterReq req{};
     req.base = block.base;
@@ -379,6 +380,7 @@ bool NvlinkProxyTransport::registerBlockLocked(Block &block) {
         return false;
     }
     block.registered_epoch = epoch_.load();
+    blocks_version_.fetch_add(1, std::memory_order_release);
     return true;
 }
 
@@ -547,19 +549,40 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
 
 // ------------------------------------------------------------- translation
 
+namespace {
+// Last local block this thread resolved; valid while the transport's block
+// table version is unchanged.
+struct LocalBlockHint {
+    const void *owner = nullptr;
+    uint64_t version = 0;
+    uint64_t base = 0, size = 0, registered_epoch = 0;
+};
+thread_local LocalBlockHint tl_block_hint;
+}  // namespace
+
 NvlinkProxyTransport::LocalBlockState NvlinkProxyTransport::findLocalBlock(
     uint64_t addr, uint64_t length, uint64_t &base) {
-    std::lock_guard<std::mutex> lock(blocks_mu_);
-    auto it = blocks_.upper_bound(addr);
-    if (it == blocks_.begin()) return LocalBlockState::kNone;
-    --it;
-    const Block &b = it->second;
-    if (addr < b.base || addr - b.base > b.size ||
-        length > b.size - (addr - b.base))
-        return LocalBlockState::kNone;
-    base = b.base;
+    LocalBlockHint &h = tl_block_hint;
+    const uint64_t version = blocks_version_.load(std::memory_order_acquire);
+    if (h.owner != this || h.version != version || addr < h.base ||
+        addr - h.base >= h.size) {
+        std::lock_guard<std::mutex> lock(blocks_mu_);
+        auto it = blocks_.upper_bound(addr);
+        if (it == blocks_.begin()) return LocalBlockState::kNone;
+        --it;
+        const Block &b = it->second;
+        if (addr < b.base || addr - b.base >= b.size)
+            return LocalBlockState::kNone;
+        h.owner = this;
+        h.version = blocks_version_.load(std::memory_order_relaxed);
+        h.base = b.base;
+        h.size = b.size;
+        h.registered_epoch = b.registered_epoch;
+    }
+    if (length > h.size - (addr - h.base)) return LocalBlockState::kNone;
+    base = h.base;
     const uint64_t epoch = epoch_.load();
-    return (epoch != 0 && b.registered_epoch == epoch)
+    return (epoch != 0 && h.registered_epoch == epoch)
                ? LocalBlockState::kRegistered
                : LocalBlockState::kUnregistered;
 }
@@ -916,6 +939,7 @@ int NvlinkProxyTransport::registerLocalMemory(void *addr, size_t length,
         auto it = blocks_.find(fresh.base);
         if (it == blocks_.end()) {
             it = blocks_.emplace(fresh.base, fresh).first;
+            blocks_version_.fetch_add(1, std::memory_order_release);
             need_register = true;
         } else if (it->second.size != fresh.size ||
                    memcmp(it->second.handle, fresh.handle, kIpcHandleSize) ||
@@ -923,6 +947,7 @@ int NvlinkProxyTransport::registerLocalMemory(void *addr, size_t length,
             // The block was freed and reallocated at the same address.
             size_t users = it->second.users;
             it->second = fresh;
+            blocks_version_.fetch_add(1, std::memory_order_release);
             it->second.users = users;
             need_register = true;
         }
@@ -962,6 +987,7 @@ int NvlinkProxyTransport::unregisterLocalMemory(void *addr,
             }
         }
         blocks_.erase(it);
+        blocks_version_.fetch_add(1, std::memory_order_release);
     }
     return rc == ERR_ADDRESS_NOT_REGISTERED ? 0 : rc;
 }

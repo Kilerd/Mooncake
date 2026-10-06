@@ -151,6 +151,9 @@ class NvlinkProxyTransport : public Transport {
     // (buffer addr -> block base).
     std::mutex blocks_mu_;
     std::map<uint64_t, Block> blocks_;
+    // Bumped on every change of blocks_ (or a block's registration); lets
+    // findLocalBlock reuse a per-thread hint without taking blocks_mu_.
+    std::atomic<uint64_t> blocks_version_{1};
     std::unordered_map<uint64_t, uint64_t> buffers_;
 
     // Control connection: HELLO(control) + REGISTER/UNREGISTER/PING.

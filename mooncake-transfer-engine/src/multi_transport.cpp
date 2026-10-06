@@ -154,6 +154,10 @@ Status MultiTransport::submitTransfer(
     task_list.reserve(task_list.size() + entries.size());
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
+    // Requests of a batch mostly go to one transport; skip the hash lookup
+    // while the transport does not change (mapped values are stable).
+    Transport* last_transport = nullptr;
+    std::vector<Transport::TransferTask*>* last_tasks = nullptr;
     if (task_sizes) task_sizes->reserve(entries.size());
     for (size_t i = 0; i < entries.size();) {
         size_t count = 1;
@@ -177,7 +181,12 @@ Status MultiTransport::submitTransfer(
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         if (count > 1) task.submission_sealed = false;
 #endif
-        submit_tasks[transports[i]].push_back(&task);
+        if (transports[i] != last_transport) {
+            last_transport = transports[i];
+            last_tasks = &submit_tasks[last_transport];
+            last_tasks->reserve(entries.size());
+        }
+        last_tasks->push_back(&task);
         if (task_sizes) task_sizes->push_back(count);
         i += count;
     }
