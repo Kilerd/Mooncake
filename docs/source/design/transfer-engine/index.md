@@ -530,6 +530,14 @@ For the complete C++ API reference, see [Transfer Engine C++ API](../../api-refe
 ../../getting_started/supported-protocols
 :::
 
+## NVLink Proxy Transport
+
+:::{toctree}
+:maxdepth: 1
+
+nvlink-proxy
+:::
+
 ## EFA Transport (AWS)
 
 :::{toctree}
