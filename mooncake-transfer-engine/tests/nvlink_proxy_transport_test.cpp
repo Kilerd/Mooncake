@@ -19,6 +19,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "transfer_engine.h"
+#include "transport/nvlink_proxy_transport/bounded_submitter.h"
 #include "transport/nvlink_proxy_transport/nvlink_proxy_protocol.h"
 #include "transport/transport.h"
 
@@ -129,6 +131,122 @@ TEST(NvlinkProxyTransport, NoDaemonUsesBaseTransport) {
     EXPECT_EQ(engine->unregisterLocalMemory(src.data()), 0);
     EXPECT_EQ(engine->unregisterLocalMemory(dst.data()), 0);
     unsetenv("MC_NVLINK_PROXY_SOCKET");
+    unsetenv("MC_FORCE_TCP");
+}
+
+// The nvlink_proxy transport moves same-node traffic onto its base transport
+// through BoundedSubmitter when the daemon is unavailable. Eight concurrent
+// submitters sharing one submitter (as many engine threads share one
+// transport) must complete every request byte-exactly while the number of
+// requests in flight never exceeds the bound. Submitting the same amount at
+// once without a bound overflows the TCP lane queue (1024 queued + 1024
+// pending per peer by default) and fails requests.
+TEST(NvlinkProxyTransport, BoundedSubmitterKeepsTcpWithinCapacity) {
+    setenv("MC_FORCE_TCP", "1", 1);
+    auto engine = std::make_unique<TransferEngine>(true);
+    ASSERT_EQ(engine->init(P2PHANDSHAKE, "127.0.0.1", "", 0), 0);
+    Transport *tcp = engine->getTransport("tcp");
+    ASSERT_NE(tcp, nullptr);
+
+    const size_t kThreads = 8, kEntry = 2560, kCount = 3000;
+    const size_t kTotal = kThreads * kCount;
+    std::vector<char> src(kEntry * kTotal), dst(kEntry * kTotal);
+    for (size_t i = 0; i < src.size(); ++i)
+        src[i] = static_cast<char>((i * 2654435761u) >> 13);
+    ASSERT_EQ(engine->registerLocalMemory(src.data(), src.size(), "cpu:0"), 0);
+    ASSERT_EQ(engine->registerLocalMemory(dst.data(), dst.size(), "cpu:0"), 0);
+    auto handle = engine->openSegment(engine->getLocalIpAndPort());
+    ASSERT_NE(handle, static_cast<Transport::SegmentHandle>(-1));
+
+    // Permuted destination slots, like a page-granular KV cache.
+    std::vector<size_t> perm(kTotal);
+    for (size_t i = 0; i < kTotal; ++i) perm[i] = (i * 7919) % kTotal;
+    std::vector<Transport::TransferRequest> reqs(kTotal);
+    for (size_t i = 0; i < kTotal; ++i) {
+        reqs[i].opcode = Transport::TransferRequest::WRITE;
+        reqs[i].source = src.data() + i * kEntry;
+        reqs[i].target_id = handle;
+        reqs[i].target_offset =
+            reinterpret_cast<uint64_t>(dst.data() + perm[i] * kEntry);
+        reqs[i].length = kEntry;
+    }
+    auto now_ns = []() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+
+    // 1. Bounded, 8 concurrent submitters.
+    BoundedSubmitter submitter(512, 256);
+    std::atomic<size_t> ok{0}, bad{0}, max_inflight{0};
+    std::atomic<bool> running{true};
+    std::thread sampler([&] {
+        while (running) {
+            size_t v = submitter.inflight();
+            size_t cur = max_inflight.load();
+            while (v > cur && !max_inflight.compare_exchange_weak(cur, v)) {
+            }
+            std::this_thread::yield();
+        }
+    });
+    std::vector<std::thread> threads;
+    for (size_t t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            std::vector<const Transport::TransferRequest *> ptrs(kCount);
+            for (size_t i = 0; i < kCount; ++i) ptrs[i] = &reqs[t * kCount + i];
+            const int64_t now = now_ns();
+            auto res = submitter.run(
+                tcp, ptrs, now + 30000000000LL, now + 60000000000LL,
+                [&](size_t, bool success) { (success ? ok : bad)++; });
+            EXPECT_EQ(res.failed, 0u);
+        });
+    }
+    for (auto &th : threads) th.join();
+    running = false;
+    sampler.join();
+    EXPECT_EQ(ok.load(), kTotal);
+    EXPECT_EQ(bad.load(), 0u);
+    EXPECT_LE(max_inflight.load(), 512u);
+    EXPECT_EQ(submitter.inflight(), 0u);
+    size_t mismatched = 0;
+    for (size_t i = 0; i < kTotal; ++i)
+        mismatched += memcmp(dst.data() + perm[i] * kEntry,
+                             src.data() + i * kEntry, kEntry) != 0;
+    EXPECT_EQ(mismatched, 0u);
+    LOG(INFO) << "bounded: " << ok.load() << " requests from " << kThreads
+              << " threads, max in flight " << max_inflight.load();
+
+    // 2. Unbounded: one batch of every request overflows the lane queue.
+    {
+        auto batch = engine->allocateBatchID(kTotal);
+        ASSERT_TRUE(engine->submitTransfer(batch, reqs).ok());
+        size_t failed = 0, completed = 0;
+        std::vector<int> state(kTotal, 0);
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (failed + completed < kTotal &&
+               std::chrono::steady_clock::now() < deadline) {
+            for (size_t i = 0; i < kTotal; ++i) {
+                if (state[i]) continue;
+                Transport::TransferStatus st;
+                ASSERT_TRUE(engine->getTransferStatus(batch, i, st).ok());
+                if (st.s == Transport::TransferStatusEnum::COMPLETED) {
+                    state[i] = 1;
+                    ++completed;
+                } else if (st.s == Transport::TransferStatusEnum::FAILED) {
+                    state[i] = 2;
+                    ++failed;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        LOG(INFO) << "unbounded: completed=" << completed
+                  << " failed=" << failed
+                  << " unresolved=" << kTotal - completed - failed;
+        EXPECT_GT(failed, 0u) << "the unbounded baseline should overflow";
+        // The batch may still be referenced by unresolved TCP work; it is
+        // intentionally not freed.
+    }
     unsetenv("MC_FORCE_TCP");
 }
 

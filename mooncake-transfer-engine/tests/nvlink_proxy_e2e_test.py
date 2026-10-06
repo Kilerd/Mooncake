@@ -439,6 +439,148 @@ def smallbench():
     return 0 if all(results) else 1
 
 
+# --------------------------------------------------------------------------
+# Continuous stress: THREADS submitters, each sending batches of ~SNENT
+# entries of SSLOT bytes into its own region of SNBLK blocks, with a
+# different source mapping every round and a byte-exact check of the
+# thread's destination slots after every batch. Meant to run while the copy
+# daemon is killed / restarted or peers are paused.
+STHREADS = int(os.environ.get("THREADS", "8"))
+SNBLK = int(os.environ.get("SNBLK", "72"))
+SSLOT = int(os.environ.get("SSLOT", "2560"))
+SNENT = int(os.environ.get("SNENT", "20000"))
+SREGION = int(os.environ.get("SREGION", "512"))  # slots per thread per block
+SBLK = STHREADS * SREGION * SSLOT
+
+
+def _stress_dst_slots(t):
+    """Fixed destination slots of thread t: list over blocks of sorted arrays."""
+    per = [SNENT // SNBLK + (1 if b < SNENT % SNBLK else 0) for b in range(SNBLK)]
+    return [np.sort(np.random.default_rng(1000003 * t + b).choice(SREGION, per[b], replace=False))
+            for b in range(SNBLK)]
+
+
+def _stress_src_slots(t, r, dst):
+    rng = np.random.default_rng((t + 1) * 7919 + r * 104729)
+    return [rng.choice(SREGION, len(d), replace=False) for d in dst]
+
+
+def starget():
+    import socketserver
+
+    ck(cudart.cudaSetDevice(int(os.environ.get("DEV", "0"))), "cudaSetDevice")
+    eng, session = make_engine()
+    blocks = [malloc(SBLK) for _ in range(SNBLK)]
+    for b in blocks:
+        memset0(b, SBLK)
+    regs = [eng.register_memory(b, SBLK) for b in blocks]
+    dst_slots = {t: _stress_dst_slots(t) for t in range(STHREADS)}
+    log(f"STARGET session={session} blocks={SNBLK}x{SBLK} reg_ok={all(r == 0 for r in regs)}")
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            cmd = self.rfile.readline().decode().split()
+            if not cmd:
+                return
+            if cmd[0] == "SINFO":
+                out = {"session": session, "blocks": blocks, "reg": regs}
+            elif cmd[0] == "THASH":  # destination slots of one thread, in order
+                t = int(cmd[1])
+                h = hashlib.sha256()
+                for b, d in enumerate(dst_slots[t]):
+                    region = d2h(blocks[b] + t * SREGION * SSLOT, SREGION * SSLOT)
+                    h.update(region.reshape(SREGION, SSLOT)[d].tobytes())
+                out = {"sha": h.hexdigest()}
+            else:
+                out = {"err": cmd}
+            self.wfile.write((json.dumps(out) + "\n").encode())
+
+    class Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    log("READY")
+    Server(("0.0.0.0", PORT), Handler).serve_forever()
+
+
+def stress():
+    import threading
+
+    ck(cudart.cudaSetDevice(int(os.environ.get("DEV", "0"))), "cudaSetDevice")
+    th = os.environ["TARGET_HOST"]
+    info = ask(th, "SINFO")
+    eng, session = make_engine()
+    rng = np.random.default_rng(11)
+    src_host = [rng.integers(0, 256, size=SBLK, dtype=np.uint8) for _ in range(SNBLK)]
+    src = []
+    for h in src_host:
+        p = malloc(SBLK)
+        h2d(p, h)
+        src.append(p)
+    regs = [eng.register_memory(p, SBLK) for p in src]
+    peer, dblk = info["session"], info["blocks"]
+    duration = float(os.environ.get("DURATION", "60"))
+    log(f"STRESS session={session} threads={STHREADS} entries/batch={SNENT} x {SSLOT}B "
+        f"blocks={SNBLK} duration={duration}s reg_ok={all(r == 0 for r in regs)} "
+        f"target_reg_ok={all(r == 0 for r in info['reg'])}")
+    stats = {"batches": 0, "failed": 0, "mismatch": 0, "lat": []}
+    lock = threading.Lock()
+    t_end = time.time() + duration
+    t0 = time.time()
+
+    def worker(t):
+        dst = _stress_dst_slots(t)
+        dsts = [dblk[b] + (t * SREGION + int(x)) * SSLOT for b, d in enumerate(dst) for x in d]
+        r = 0
+        while time.time() < t_end:
+            srcs_slots = _stress_src_slots(t, r, dst)
+            srcs = [src[b] + (t * SREGION + int(x)) * SSLOT for b, s in enumerate(srcs_slots) for x in s]
+            ts = time.time()
+            rc = eng.batch_transfer_sync_write(peer, srcs, dsts, [SSLOT] * len(srcs))
+            dt = time.time() - ts
+            h = hashlib.sha256()
+            for b, s in enumerate(srcs_slots):
+                h.update(src_host[b][t * SREGION * SSLOT:(t + 1) * SREGION * SSLOT]
+                         .reshape(SREGION, SSLOT)[s].tobytes())
+            ok = rc == 0 and ask(th, f"THASH {t}")["sha"] == h.hexdigest()
+            with lock:
+                stats["batches"] += 1
+                stats["lat"].append(dt)
+                if rc != 0:
+                    stats["failed"] += 1
+                elif not ok:
+                    stats["mismatch"] += 1
+            if rc != 0 or not ok or dt > 1.0:
+                log(f"EVENT t={time.time() - t0:6.1f}s thread={t} round={r} rc={rc} "
+                    f"{'MISMATCH' if rc == 0 and not ok else ''} transfer {dt * 1e3:.0f} ms")
+            r += 1
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(STHREADS)]
+    for x in threads:
+        x.start()
+    last = 0
+    while any(x.is_alive() for x in threads):
+        time.sleep(1)
+        el = time.time() - t0
+        if el - last >= 5:
+            last = el
+            with lock:
+                lat = sorted(stats["lat"][-200:]) or [0]
+                log(f"PROGRESS t={el:5.1f}s batches={stats['batches']} failed={stats['failed']} "
+                    f"mismatch={stats['mismatch']} recent p50={lat[len(lat) // 2] * 1e3:.1f} ms "
+                    f"p99={lat[int(len(lat) * 0.99)] * 1e3:.1f} ms")
+    for x in threads:
+        x.join()
+    lat = sorted(stats["lat"]) or [0]
+    good = stats["failed"] == 0 and stats["mismatch"] == 0 and stats["batches"] > 0
+    log(f"STRESS SUMMARY batches={stats['batches']} failed={stats['failed']} "
+        f"mismatch={stats['mismatch']} p50={lat[len(lat) // 2] * 1e3:.1f} ms "
+        f"p99={lat[int(len(lat) * 0.99)] * 1e3:.1f} ms max={lat[-1] * 1e3:.0f} ms "
+        f"{'ALL PASS' if good else 'FAILURES'}")
+    time.sleep(float(os.environ.get("FINAL_SLEEP", "6")))
+    return 0 if good else 1
+
+
 def concurrent():
     """Several threads write disjoint regions at the same time."""
     import threading
@@ -478,5 +620,6 @@ def concurrent():
 
 if __name__ == "__main__":
     modes = {"target": target, "initiator": initiator, "loop": loop, "concurrent": concurrent,
-             "mtarget": mtarget, "smallbench": smallbench}
+             "mtarget": mtarget, "smallbench": smallbench,
+             "starget": starget, "stress": stress}
     sys.exit(modes[sys.argv[1]]() or 0)
