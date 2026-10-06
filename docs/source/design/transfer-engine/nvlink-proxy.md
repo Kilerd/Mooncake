@@ -68,6 +68,30 @@ the wheel with the console entry point `mooncake_nvlink_proxy`. The workflow
 
    The Python API is unchanged.
 
+## Batches of many small copies
+
+KV caches with small pages produce batches of thousands of entries of a few
+KB each, whose source and destination runs are short. Submitting every entry
+to the copy engines costs microseconds per entry, so the daemon:
+
+1. merges consecutive entries that are contiguous in both source and
+   destination;
+2. copies entries shorter than `--gather-threshold` bytes (default 64 KiB)
+   with one gather/scatter kernel launch per GPU and batch. The entry table is
+   uploaded to the GPU, each thread block copies whole entries with 16-byte
+   accesses where the relative alignment of source and destination allows
+   (8/4/2/1-byte otherwise). Larger entries keep using `cudaMemcpyBatchAsync`.
+
+`--gather-on dst` (default) runs the kernel on the GPU that receives the data,
+reading through the peer mapping; `--gather-on src` runs it on the sending GPU,
+writing through the mapping. `--gather-threshold 0` and `--no-coalesce` restore
+the copy-engine-only behaviour. If a GPU has no usable kernel image the daemon
+logs it and uses the copy engines for that GPU.
+
+On the client, routing a request no longer scans every buffer of the target
+segment: the buffers covering the last target address are cached per thread
+together with the exact address range in which that set is unchanged.
+
 ## Routing and fallback
 
 - Device memory is published under both `nvlink_proxy` and the base transport;
@@ -110,7 +134,9 @@ nvlink_proxy stats: healthy=1 proxied_requests=... proxied_bytes=... proxied_bat
 Daemon side, logged every `--stats-interval` seconds when they changed, or on
 demand with `mooncake_nvlink_proxy --socket <path> --stats`: active clients,
 registrations, copy requests / entries / bytes / failures, average and maximum
-copy latency, IPC handle opens.
+copy latency split into `avg_plan_us` (validation, merging, mapping) and
+`avg_exec_us` (GPU work), `coalesced_entries`, `kernel_entries/bytes` and
+`ce_entries/bytes` (copy engines), IPC handle opens.
 
 ## Wire protocol
 
