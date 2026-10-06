@@ -83,6 +83,11 @@ if(USE_INTRA_NVLINK)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:intranode_nvlink_transport>)
 endif()
 
+if(USE_NVLINK_PROXY)
+  add_subdirectory(nvlink_proxy_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_proxy_transport>)
+endif()
+
 if(USE_UBSHMEM)
   add_subdirectory(ascend_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)

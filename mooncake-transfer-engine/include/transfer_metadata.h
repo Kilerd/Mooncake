@@ -228,6 +228,13 @@ class TransferMetadata {
 
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Remove only the buffer at |addr| published under |protocol|; other
+    // transports may have published the same address.
+    int removeLocalMemoryBuffer(void *addr, bool update_metadata,
+                                const std::string &protocol);
+#endif
+
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
 

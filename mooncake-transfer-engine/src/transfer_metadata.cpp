@@ -367,7 +367,8 @@ static int encodeMultiProtocolSegmentDesc(
         } else if (buffer.protocol == "tcp") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
         } else if (buffer.protocol == "hip" || buffer.protocol == "maca" ||
-                   buffer.protocol == "musa") {
+                   buffer.protocol == "musa" ||
+                   buffer.protocol == "nvlink_proxy") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["shm_name"] = buffer.shm_name;
         }
@@ -399,7 +400,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         is_multi_protocol = true;
         for (const auto &proto : protocols) {
             if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                proto != "hip" && proto != "maca" && proto != "musa") {
+                proto != "hip" && proto != "maca" && proto != "musa" &&
+                proto != "nvlink_proxy") {
                 is_multi_protocol = false;
                 break;
             }
@@ -407,8 +409,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         if (!is_multi_protocol) {
             LOG(ERROR) << "Unsupported multi-protocol combination: "
                        << desc.protocol
-                       << ". Only cxl, tcp, rdma, hip, maca and musa may be "
-                          "combined.";
+                       << ". Only cxl, tcp, rdma, hip, maca, musa and "
+                          "nvlink_proxy may be combined.";
             return ERR_INVALID_ARGUMENT;
         }
     }
@@ -743,7 +745,8 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         } else if (buffer_protocol == "hip" || buffer_protocol == "maca" ||
-                   buffer_protocol == "musa") {
+                   buffer_protocol == "musa" ||
+                   buffer_protocol == "nvlink_proxy") {
             TransferMetadata::BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
@@ -780,7 +783,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &protocolStr : segmentJSON["protocol"]) {
                 std::string proto = protocolStr.asString();
                 if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                    proto != "hip" && proto != "maca" && proto != "musa") {
+                    proto != "hip" && proto != "maca" && proto != "musa" &&
+                    proto != "nvlink_proxy") {
                     is_multi_protocol = false;
                     break;
                 }
@@ -789,8 +793,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(ERROR)
                     << "Unsupported multi-protocol combination in segment: "
                     << segment_name
-                    << ". Only cxl, tcp, rdma, hip, maca and musa may be "
-                       "combined.";
+                    << ". Only cxl, tcp, rdma, hip, maca, musa and "
+                       "nvlink_proxy may be combined.";
                 return nullptr;
             }
         }
@@ -1436,6 +1440,31 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
     }
     return ERR_ADDRESS_NOT_REGISTERED;
 }
+
+#ifdef ENABLE_MULTI_PROTOCOL
+int TransferMetadata::removeLocalMemoryBuffer(void *addr, bool update_metadata,
+                                              const std::string &protocol) {
+    bool addr_exist = false;
+    {
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        auto new_segment_desc = std::make_shared<SegmentDesc>();
+        auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        *new_segment_desc = *segment_desc;
+        segment_desc = new_segment_desc;
+        for (auto iter = segment_desc->buffers.begin();
+             iter != segment_desc->buffers.end(); ++iter) {
+            if (iter->addr == (uint64_t)addr && iter->protocol == protocol) {
+                segment_desc->buffers.erase(iter);
+                addr_exist = true;
+                break;
+            }
+        }
+    }
+    if (!addr_exist) return ERR_ADDRESS_NOT_REGISTERED;
+    if (update_metadata) return updateLocalSegmentDesc();
+    return 0;
+}
+#endif
 
 int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
                                       RpcMetaDesc &desc) {

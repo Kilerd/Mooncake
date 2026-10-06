@@ -47,6 +47,9 @@
 #ifdef USE_INTRA_NVLINK
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 #endif
+#ifdef USE_NVLINK_PROXY
+#include "transport/nvlink_proxy_transport/nvlink_proxy_transport.h"
+#endif
 #ifdef USE_HIP
 #include "transport/hip_transport/hip_transport.h"
 #endif
@@ -478,6 +481,12 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
 
+#ifdef USE_NVLINK_PROXY
+    else if (std::string(proto) == "nvlink_proxy") {
+        transport = new NvlinkProxyTransport();
+    }
+#endif
+
 #ifdef USE_HIP
     else if (std::string(proto) == "hip") {
         transport = new HipTransport();
@@ -575,6 +584,10 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 
     transport_map_[proto] = std::shared_ptr<Transport>(transport);
+#ifdef USE_NVLINK_PROXY
+    if (proto == "nvlink_proxy")
+        nvlink_proxy_ = static_cast<NvlinkProxyTransport*>(transport);
+#endif
     return transport;
 }
 
@@ -596,6 +609,9 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
     // priority instead of relying on buffer registration order.
     if (proto.find(',') != std::string::npos) {
         auto protocol_priority = [](const std::string& p) {
+            // nvlink_proxy is offered only after its own locality and health
+            // gate below accepted the request.
+            if (p == "nvlink_proxy") return 5;
             // hip is intra-node GPU-IPC only. On a cross-node request a
             // hip+rdma segment must fall through to rdma; allow deployments
             // that know they need the cross-node path to de-prioritize hip.
@@ -629,6 +645,18 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                 if ((buffer.protocol == "hip" || buffer.protocol == "musa") &&
                     !gpu_ipc_reachable) {
                     continue;
+                }
+                if (buffer.protocol == "nvlink_proxy") {
+                    // Same node (MC_NODE_ID), local buffer registered with
+                    // the daemon and the daemon healthy; otherwise the base
+                    // transport buffer covering the same range is used.
+#ifdef USE_NVLINK_PROXY
+                    if (!nvlink_proxy_ ||
+                        !nvlink_proxy_->canRoute(entry, buffer))
+                        continue;
+#else
+                    continue;
+#endif
                 }
                 int priority = protocol_priority(buffer.protocol);
                 if (priority > chosen_priority) {
@@ -761,7 +789,11 @@ Transport* MultiTransport::getTransport(const std::string& proto) {
 }
 
 bool MultiTransport::isTcpOnly() const {
-    return transport_map_.size() == 1 && transport_map_.count("tcp") == 1;
+    // nvlink_proxy only adds a same-node GPU path next to the base transport;
+    // it does not change whether the general-purpose transport is TCP.
+    size_t count = transport_map_.size();
+    if (transport_map_.count("nvlink_proxy")) --count;
+    return count == 1 && transport_map_.count("tcp") == 1;
 }
 
 std::vector<Transport*> MultiTransport::listTransports() {

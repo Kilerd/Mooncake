@@ -457,6 +457,10 @@ class TransferEngineImpl {
 
     void eraseMemoryRegionLocked(void* addr);
 
+    // Installs the nvlink_proxy transport next to the base transport when
+    // MC_NVLINK_PROXY_SOCKET is set. Never fails engine initialization.
+    void installNvlinkProxyIfRequested();
+
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;

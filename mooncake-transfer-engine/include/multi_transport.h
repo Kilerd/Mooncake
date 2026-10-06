@@ -21,6 +21,9 @@
 
 namespace mooncake {
 class TransferEngineImplTestPeer;
+#ifdef USE_NVLINK_PROXY
+class NvlinkProxyTransport;
+#endif
 
 class MultiTransport {
     friend class TransferEngineImplTestPeer;
@@ -103,6 +106,9 @@ class MultiTransport {
     std::map<std::string, std::shared_ptr<Transport>> transport_map_;
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
+#ifdef USE_NVLINK_PROXY
+    NvlinkProxyTransport *nvlink_proxy_ = nullptr;
+#endif
 };
 }  // namespace mooncake
 

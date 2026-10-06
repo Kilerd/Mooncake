@@ -30,6 +30,9 @@
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
+#ifdef USE_NVLINK_PROXY
+#include "transport/nvlink_proxy_transport/nvlink_proxy_transport.h"
+#endif
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -217,6 +220,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             return -1;
         }
         LOG(INFO) << "MC_FORCE_TCP is set, using TCP transport only";
+        installNvlinkProxyIfRequested();
         return 0;
 #else
         LOG(ERROR) << "MC_FORCE_TCP is set but USE_TCP is not compiled in";
@@ -457,7 +461,39 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
+    installNvlinkProxyIfRequested();
     return 0;
+}
+
+void TransferEngineImpl::installNvlinkProxyIfRequested() {
+    const char* socket_path = getenv("MC_NVLINK_PROXY_SOCKET");
+    if (!socket_path || !*socket_path) return;
+#ifdef USE_NVLINK_PROXY
+    Transport* base = nullptr;
+    for (const char* name : {"rdma", "rdma_twosided", "tcp"}) {
+        base = multi_transports_->getTransport(name);
+        if (base) break;
+    }
+    if (!base) {
+        LOG(WARNING) << "MC_NVLINK_PROXY_SOCKET is set but no rdma/tcp base "
+                        "transport is installed; nvlink_proxy disabled";
+        return;
+    }
+    Transport* proxy =
+        multi_transports_->installTransport("nvlink_proxy", nullptr);
+    if (!proxy) {
+        LOG(WARNING) << "Failed to install the nvlink_proxy transport; "
+                        "continuing with "
+                     << base->getName() << " only";
+        return;
+    }
+    static_cast<NvlinkProxyTransport*>(proxy)->setFallbackTransport(base);
+    LOG(INFO) << "nvlink_proxy transport installed next to " << base->getName()
+              << " (same-node GPU transfers go through " << socket_path << ")";
+#else
+    LOG(WARNING) << "MC_NVLINK_PROXY_SOCKET is set but this build has no "
+                    "nvlink_proxy support (USE_NVLINK_PROXY=OFF); ignoring";
+#endif
 }
 
 int TransferEngineImpl::freeEngine() {
