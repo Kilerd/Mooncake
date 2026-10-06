@@ -970,17 +970,39 @@ void handleConnection(int fd) {
                 } else {
                     g_stats.copy_failures++;
                     out += res.message;
-                    LOGW("copy from client %016" PRIx64
-                         " failed: %s (%s, "
-                         "entry %u of %u)",
-                         c.client_id, proxyStatusName(res.status),
-                         res.message.c_str(), res.failed_index, rh.count);
+                    // At most one line per second; a restart can make
+                    // clients retry many batches against peers that have
+                    // not re-registered yet.
+                    static std::atomic<uint64_t> last_log_us{0};
+                    static std::atomic<uint64_t> suppressed{0};
+                    const uint64_t now_us = nowUs();
+                    uint64_t last = last_log_us.load();
+                    if (now_us - last >= 1000000 &&
+                        last_log_us.compare_exchange_strong(last, now_us)) {
+                        const uint64_t more = suppressed.exchange(0);
+                        const std::string tail =
+                            more ? " [+" + std::to_string(more) + " similar]"
+                                 : std::string();
+                        LOGW("copy from client %016" PRIx64
+                             " failed: %s (%s, entry %u of %u)%s",
+                             c.client_id, proxyStatusName(res.status),
+                             res.message.c_str(), res.failed_index, rh.count,
+                             tail.c_str());
+                    } else {
+                        suppressed++;
+                    }
                 }
                 ok = sendMsg(fd, type, h.seq, res.status, out.data(),
                              out.size());
                 break;
             }
             case MsgType::kPing: {
+                if (g_stop) {
+                    // Shutting down: report the daemon as gone so clients
+                    // hold their requests for the next instance.
+                    ok = false;
+                    break;
+                }
                 PingResp resp{};
                 resp.daemon_epoch = g_epoch;
                 resp.uptime_ms = (nowUs() - g_start_us) / 1000;
