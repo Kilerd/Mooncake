@@ -3,8 +3,8 @@ name: Release nvlink_proxy wheel
 # Builds the CUDA 12 x86_64 wheel with the nvlink_proxy transport
 # (ENABLE_MULTI_PROTOCOL + USE_NVLINK_PROXY, on top of the regular CUDA wheel
 # flags) and attaches it to a GitHub release of this repository. Triggered by
-# pushing a tag "nvlink-proxy-*" (release named after the tag, default
-# version) or manually; never publishes to PyPI.
+# pushing a tag "nvlink-proxy-<base version>-<n>" (wheel version
+# "<base version>+nvlinkproxy<n>") or manually; never publishes to PyPI.
 
 on:
   push:
@@ -17,9 +17,9 @@ on:
         required: true
         default: 'nvlink-proxy-0.3.13.post1-1'
       version:
-        description: 'Wheel version'
-        required: true
-        default: '0.3.13.post1+nvlinkproxy1'
+        description: 'Wheel version (empty: derived from the tag)'
+        required: false
+        default: '
       python-versions:
         description: 'JSON list of Python versions'
         required: true
@@ -29,18 +29,43 @@ permissions:
   contents: read
 
 jobs:
+  meta:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        env:
+          TAG: ${{ inputs.release-tag || github.ref_name }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "$TAG" in
+            v*) echo "::error::release tag must not start with 'v' (reserved for the regular release workflows)"; exit 1 ;;
+            nvlink-proxy-*-[0-9]*) ;;
+            *) [ -n "$VERSION" ] || { echo "::error::cannot derive a version from tag $TAG"; exit 1; } ;;
+          esac
+          if [ -z "$VERSION" ]; then
+            rest=${TAG#nvlink-proxy-}
+            VERSION="${rest%-*}+nvlinkproxy${rest##*-}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release $TAG with wheel version $VERSION"
+
   build:
+    needs: meta
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       variant: cuda
       architecture: x86_64
       python-versions: ${{ inputs.python-versions || '["3.12"]' }}
       artifact-prefix: mooncake-wheel-nvlink-proxy
-      version-override: ${{ inputs.version || '0.3.13.post1+nvlinkproxy1' }}
+      version-override: ${{ needs.meta.outputs.version }}
       extra-cmake-args: '-DENABLE_MULTI_PROTOCOL=ON -DUSE_NVLINK_PROXY=ON'
 
   release:
-    needs: build
+    needs: [meta, build]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -64,12 +89,9 @@ jobs:
       - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release-tag || github.ref_name }}
-          VERSION: ${{ inputs.version || '0.3.13.post1+nvlinkproxy1' }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
-          case "$TAG" in
-            v*) echo "::error::release-tag must not start with 'v' (reserved for the regular release workflows)"; exit 1 ;;
-          esac
           notes="Mooncake Transfer Engine ${VERSION} with the nvlink_proxy transport: same-node GPU-to-GPU transfers through a node-local copy daemon for containerized deployments where each pod sees only its own GPU. Built from ${GITHUB_SHA} with ENABLE_MULTI_PROTOCOL=ON and USE_NVLINK_PROXY=ON (CUDA 12, x86_64). See docs/source/design/transfer-engine/nvlink-proxy.md."
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/*.whl dist/SHA256SUMS --clobber -R "$GITHUB_REPOSITORY"
