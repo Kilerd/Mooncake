@@ -250,6 +250,10 @@ std::mutex g_reg_mu;
 std::map<RegKey, std::shared_ptr<Registration>> g_regs;
 
 // ------------------------------------------------------------------ stats
+std::atomic<bool> g_stop{false};
+// COPY requests being executed; the daemon waits for them on shutdown.
+std::atomic<int> g_inflight_copies{0};
+
 struct Stats {
     std::atomic<uint64_t> connections{0};
     std::atomic<uint64_t> active_connections{0};
@@ -919,6 +923,17 @@ void handleConnection(int fd) {
                 break;
             }
             case MsgType::kCopy: {
+                g_inflight_copies++;
+                if (g_stop) {
+                    // Shutting down: close the connection without starting
+                    // the copy; the client retries with the next daemon.
+                    g_inflight_copies--;
+                    ok = false;
+                    break;
+                }
+                struct InflightGuard {
+                    ~InflightGuard() { g_inflight_copies--; }
+                } inflight_guard;
                 CopyReqHeader rh;
                 if (payload.size() < sizeof(rh)) {
                     replyError(fd, type, h.seq, ProxyStatus::kBadRequest,
@@ -1109,7 +1124,6 @@ bool ensureDevice(int dev) {
     return true;
 }
 
-std::atomic<bool> g_stop{false};
 std::string g_socket_path;
 
 void onSignal(int) { g_stop = true; }
@@ -1209,6 +1223,9 @@ void usage(const char *argv0) {
         "                          the sending one (writes through it)\n"
         "  --no-coalesce           do not merge consecutive copies that are\n"
         "                          contiguous in source and destination\n"
+        "  --drain-timeout-ms <ms> on SIGTERM/SIGINT, wait up to this long "
+        "for\n"
+        "                          running copies to finish (default 10000)\n"
         "  --eager-init            create a CUDA context on every visible GPU\n"
         "                          and enable peer access for all pairs at\n"
         "                          start; by default a GPU is initialized "
@@ -1234,6 +1251,7 @@ int main(int argc, char **argv) {
     mode_t socket_mode = 0666;
     int stats_interval = 60;
     bool do_stats = false, do_ping = false, eager = false;
+    int drain_timeout_ms = 10000;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto need = [&](const char *name) -> const char * {
@@ -1270,6 +1288,8 @@ int main(int argc, char **argv) {
             g_cfg.gather_on_src = (v == "src");
         } else if (a == "--no-coalesce") {
             g_cfg.coalesce = false;
+        } else if (a == "--drain-timeout-ms") {
+            drain_timeout_ms = atoi(need("--drain-timeout-ms"));
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
@@ -1373,9 +1393,20 @@ int main(int argc, char **argv) {
         if (fd < 0) continue;
         std::thread(handleConnection, fd).detach();
     }
-    LOGI("shutting down: %s", statsText().c_str());
+    // Stop accepting, then let copies already running finish and reply so
+    // their clients do not have to retry them.
     close(lfd);
     unlink(g_socket_path.c_str());
+    const uint64_t drain_until = nowUs() + uint64_t(drain_timeout_ms) * 1000;
+    int inflight = g_inflight_copies.load();
+    if (inflight > 0)
+        LOGI("draining %d in-flight copy request(s) (up to %d ms)", inflight,
+             drain_timeout_ms);
+    while ((inflight = g_inflight_copies.load()) > 0 && nowUs() < drain_until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (inflight > 0)
+        LOGW("exiting with %d copy request(s) still running", inflight);
+    LOGI("shutting down: %s", statsText().c_str());
     stats_thread.join();
     // Exit without tearing down the CUDA contexts under in-flight copies.
     _exit(0);
