@@ -180,6 +180,16 @@ if(ENABLE_MULTI_PROTOCOL)
 endif()
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 option(USE_INTRA_NVLINK "option for using IntraNode nvlink transport" OFF)
+option(USE_NVLINK_PROXY
+       "option for the nvlink_proxy transport (same-node GPU copies through a node-local daemon)"
+       OFF)
+if(USE_NVLINK_PROXY)
+  if(NOT USE_CUDA OR NOT ENABLE_MULTI_PROTOCOL)
+    message(
+      FATAL_ERROR "USE_NVLINK_PROXY requires USE_CUDA=ON and ENABLE_MULTI_PROTOCOL=ON")
+  endif()
+  add_compile_definitions(USE_NVLINK_PROXY)
+endif()
 option(USE_MLX5DV
        "enable mlx5 direct verbs (libmlx5) for QP UDP source port override" OFF)
 set(LRU_MAX_CAPACITY 1000)

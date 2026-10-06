@@ -106,6 +106,11 @@ if (USE_MNNVL OR USE_CUDA OR USE_HIP OR USE_MUSA OR USE_MACA OR USE_SUPA)
   add_subdirectory(nvlink-allocator)
 endif()
 
+# Node-local GPU copy daemon used by the nvlink_proxy transport
+if (USE_NVLINK_PROXY)
+  add_subdirectory(nvlink-proxy)
+endif()
+
 # Build ubshmem allocator for Huawei NPU fabric memory
 if (USE_UBSHMEM)
   add_subdirectory(ubshmem-allocator)
