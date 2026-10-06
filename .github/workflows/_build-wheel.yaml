@@ -26,6 +26,10 @@ on:
         # Used by nightly builds to stamp date-based dev versions.
         type: string
         default: ''
+      extra-cmake-args:
+        # Optional: CMake arguments appended to the variant's defaults.
+        type: string
+        default: ''
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -47,6 +51,7 @@ jobs:
     env:
       BUILD_ARCHITECTURE: ${{ inputs.architecture }}
       BUILD_VARIANT: ${{ inputs.variant }}
+      EXTRA_CMAKE_ARGS: ${{ inputs.extra-cmake-args }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -164,7 +169,7 @@ jobs:
           ep=(); [ -n "$EP_TORCH_VERSIONS_INPUT" ] && ep=(-DEP_TORCH_VERSIONS="$EP_TORCH_VERSIONS_INPUT")
           mkdir -p build && cd build
           # shellcheck disable=SC2086
-          cmake "${gen[@]}" .. $CMAKE_ARGS "${ep[@]}" -DPython3_EXECUTABLE="$(which python3)"
+          cmake "${gen[@]}" .. $CMAKE_ARGS $EXTRA_CMAKE_ARGS "${ep[@]}" -DPython3_EXECUTABLE="$(which python3)"
 
       - name: Build project
         env:

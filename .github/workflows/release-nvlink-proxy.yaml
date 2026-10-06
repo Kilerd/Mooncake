@@ -1,0 +1,81 @@
+name: Release nvlink_proxy wheel
+
+# Builds the CUDA 12 x86_64 wheel with the nvlink_proxy transport
+# (ENABLE_MULTI_PROTOCOL + USE_NVLINK_PROXY, on top of the regular CUDA wheel
+# flags) and attaches it to a GitHub release of this repository. Triggered by
+# pushing a tag "nvlink-proxy-*" (release named after the tag, default
+# version) or manually; never publishes to PyPI.
+
+on:
+  push:
+    tags:
+      - 'nvlink-proxy-*'
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: 'GitHub release tag to create or update (must not start with "v")'
+        required: true
+        default: 'nvlink-proxy-0.3.13.post1-1'
+      version:
+        description: 'Wheel version'
+        required: true
+        default: '0.3.13.post1+nvlinkproxy1'
+      python-versions:
+        description: 'JSON list of Python versions'
+        required: true
+        default: '["3.12"]'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda
+      architecture: x86_64
+      python-versions: ${{ inputs.python-versions || '["3.12"]' }}
+      artifact-prefix: mooncake-wheel-nvlink-proxy
+      version-override: ${{ inputs.version || '0.3.13.post1+nvlinkproxy1' }}
+      extra-cmake-args: '-DENABLE_MULTI_PROTOCOL=ON -DUSE_NVLINK_PROXY=ON'
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mooncake-wheel-nvlink-proxy-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check wheels
+        run: |
+          ls -la dist
+          for whl in dist/*.whl; do
+            python3 -m zipfile -l "$whl" | grep -E 'mooncake/(mooncake_nvlink_proxy|engine\.so)' 
+            python3 -m zipfile -l "$whl" | grep -q 'mooncake/mooncake_nvlink_proxy' || { echo "::error::$whl has no mooncake_nvlink_proxy"; exit 1; }
+          done
+          (cd dist && sha256sum *.whl | tee SHA256SUMS)
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release-tag || github.ref_name }}
+          VERSION: ${{ inputs.version || '0.3.13.post1+nvlinkproxy1' }}
+        run: |
+          case "$TAG" in
+            v*) echo "::error::release-tag must not start with 'v' (reserved for the regular release workflows)"; exit 1 ;;
+          esac
+          notes="Mooncake Transfer Engine ${VERSION} with the nvlink_proxy transport: same-node GPU-to-GPU transfers through a node-local copy daemon for containerized deployments where each pod sees only its own GPU. Built from ${GITHUB_SHA} with ENABLE_MULTI_PROTOCOL=ON and USE_NVLINK_PROXY=ON (CUDA 12, x86_64). See docs/source/design/transfer-engine/nvlink-proxy.md."
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.whl dist/SHA256SUMS --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/*.whl dist/SHA256SUMS -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "nvlink_proxy wheel ${VERSION}" \
+              --notes "$notes" --prerelease
+          fi
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | .name + "  " + .url'
