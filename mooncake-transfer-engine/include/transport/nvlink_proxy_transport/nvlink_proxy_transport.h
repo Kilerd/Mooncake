@@ -139,8 +139,10 @@ class NvlinkProxyTransport : public Transport {
     };
     const TargetIndex *targetIndex(std::vector<TargetIndex> &cache,
                                    SegmentID target_id);
-    bool translate(const TransferRequest &request, const TargetIndex &target,
-                   nvlink_proxy::CopyEntry &entry);
+    enum class TranslateResult { kOk, kRetry, kNotServable };
+    TranslateResult translate(const TransferRequest &request,
+                              const TargetIndex &target,
+                              nvlink_proxy::CopyEntry &entry);
 
     void finishTask(TransferTask *task, bool ok);
     void completeTask(TransferTask *task);

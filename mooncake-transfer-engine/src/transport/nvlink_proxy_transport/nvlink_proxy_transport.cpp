@@ -554,10 +554,12 @@ void NvlinkProxyTransport::healthLoop() {
                 ok = rpc(control_fd_, MsgType::kPing, nullptr, 0, st, reply) &&
                      st == ProxyStatus::kOk;
                 if (!ok) {
-                    LOG(WARNING) << "nvlink_proxy: lost daemon connection ("
-                                 << strerror(errno)
-                                 << "); using the base transport until it "
-                                    "is back";
+                    LOG(WARNING)
+                        << "nvlink_proxy: lost daemon connection ("
+                        << strerror(errno)
+                        << "); same-node requests wait up to "
+                        << reconnect_wait_ms_
+                        << " ms for it before using the base transport";
                     closeControlLocked();
                 } else if (!healthy_) {
                     markHealthy(false);
@@ -699,27 +701,41 @@ const NvlinkProxyTransport::TargetIndex *NvlinkProxyTransport::targetIndex(
     return &cache.back();
 }
 
-bool NvlinkProxyTransport::translate(const TransferRequest &request,
-                                     const TargetIndex &target,
-                                     CopyEntry &entry) {
+NvlinkProxyTransport::TranslateResult NvlinkProxyTransport::translate(
+    const TransferRequest &request, const TargetIndex &target,
+    CopyEntry &entry) {
+    using R = TranslateResult;
     const uint64_t remote = request.target_offset;
     // Last published buffer starting at or below the target address.
     auto it = std::upper_bound(
         target.refs.begin(), target.refs.end(), remote,
         [](uint64_t a, const TargetIndex::Ref &r) { return a < r.addr; });
-    if (it == target.refs.begin()) return false;
+    if (it == target.refs.begin()) return R::kNotServable;
     const TargetIndex::Ref &ref = *(it - 1);
     if (remote - ref.addr > ref.length ||
         request.length > ref.length - (remote - ref.addr))
-        return false;
+        return R::kNotServable;
     if (remote < ref.base || remote - ref.base > ref.size ||
         request.length > ref.size - (remote - ref.base))
-        return false;
+        return R::kNotServable;
     uint64_t local_base;
     const uint64_t local = reinterpret_cast<uint64_t>(request.source);
-    if (findLocalBlock(local, request.length, local_base) !=
-        LocalBlockState::kRegistered)
-        return false;
+    switch (findLocalBlock(local, request.length, local_base)) {
+        case LocalBlockState::kRegistered:
+            break;
+        case LocalBlockState::kNone:
+            return R::kNotServable;
+        case LocalBlockState::kUnregistered: {
+            // Being re-registered with a daemon that just (re)started; a
+            // block the daemon refused under an established epoch is not
+            // servable.
+            const int64_t since = epoch_since_ns_.load();
+            if (!healthy_ || epoch_.load() == 0 ||
+                nowNs() - since < int64_t(reconnect_wait_ms_) * 1000000LL)
+                return R::kRetry;
+            return R::kNotServable;
+        }
+    }
     entry.length = request.length;
     if (request.opcode == TransferRequest::WRITE) {
         entry.src_client = client_id_;
@@ -736,7 +752,7 @@ bool NvlinkProxyTransport::translate(const TransferRequest &request,
         entry.dst_base = local_base;
         entry.dst_offset = local - local_base;
     }
-    return true;
+    return R::kOk;
 }
 
 // ------------------------------------------------------------- submission
@@ -845,7 +861,8 @@ Status NvlinkProxyTransport::submitTransferTask(
         }
 
         std::vector<CopyEntry> entries;
-        std::vector<TransferTask *> proxied;
+        std::vector<TransferTask *> proxied, retry;
+        bool retry_later = false;
         entries.reserve(pending.size());
         proxied.reserve(pending.size());
         std::vector<TargetIndex> targets;
@@ -860,16 +877,22 @@ Status NvlinkProxyTransport::submitTransferTask(
                     target = last_target =
                         targetIndex(targets, task->request->target_id);
             }
-            if (!target || !translate(*task->request, *target, e)) {
+            const TranslateResult tr =
+                target ? translate(*task->request, *target, e)
+                       : TranslateResult::kNotServable;
+            if (tr == TranslateResult::kNotServable) {
                 not_servable.push_back(task);
+                continue;
+            }
+            if (tr == TranslateResult::kRetry) {
+                retry.push_back(task);
+                retry_later = true;
                 continue;
             }
             entries.push_back(e);
             proxied.push_back(task);
         }
 
-        std::vector<TransferTask *> retry;
-        bool retry_later = false;
         for (size_t begin = 0; begin < proxied.size();
              begin += kMaxEntriesPerCopy) {
             const size_t count =
