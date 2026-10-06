@@ -115,12 +115,23 @@ class NvlinkProxyTransport : public Transport {
               size_t count, std::string &error);
 
     // Request translation: local address + remote buffer -> copy entry.
-    bool findLocalBlock(uint64_t addr, uint64_t length, uint64_t &base,
-                        bool require_registered);
-    bool translate(const TransferRequest &request,
+    enum class LocalBlockState { kNone, kUnregistered, kRegistered };
+    LocalBlockState findLocalBlock(uint64_t addr, uint64_t length,
+                                   uint64_t &base);
+    // Same-node nvlink_proxy buffers of one target segment, sorted by
+    // address; built once per submitted batch.
+    struct TargetIndex {
+        SegmentID id = 0;
+        struct Ref {
+            uint64_t addr = 0, length = 0;            // published buffer
+            uint64_t client = 0, base = 0, size = 0;  // daemon block
+        };
+        std::vector<Ref> refs;
+    };
+    const TargetIndex *targetIndex(std::vector<TargetIndex> &cache,
+                                   SegmentID target_id);
+    bool translate(const TransferRequest &request, const TargetIndex &target,
                    nvlink_proxy::CopyEntry &entry);
-    const BufferDesc *findTargetBuffer(const SegmentDesc &desc, uint64_t addr,
-                                       uint64_t length);
 
     void completeTask(TransferTask *task);
     Status fallback(const std::vector<TransferTask *> &tasks,

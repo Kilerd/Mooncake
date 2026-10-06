@@ -95,6 +95,12 @@ class MultiTransport {
     Status selectTransport(const TransferRequest &entry, Transport *&transport);
 
 #ifdef ENABLE_MULTI_PROTOCOL
+    Status selectMultiProtocolTransport(
+        const TransferRequest &entry,
+        const std::shared_ptr<TransferMetadata::SegmentDesc>
+            &target_segment_desc,
+        Transport *&transport);
+
     Status mp_selectTransport(const TransferRequest &entry,
                               Transport *&transport,
                               std::string &preferred_proto);
@@ -106,6 +112,8 @@ class MultiTransport {
     std::map<std::string, std::shared_ptr<Transport>> transport_map_;
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
+    // Bumped by installTransport; invalidates cached routing decisions.
+    uint64_t install_generation_ = 0;
 #ifdef USE_NVLINK_PROXY
     NvlinkProxyTransport *nvlink_proxy_ = nullptr;
 #endif

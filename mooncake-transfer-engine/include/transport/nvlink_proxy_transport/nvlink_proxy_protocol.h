@@ -201,32 +201,59 @@ inline std::string encodeBufferRef(const BufferRef &ref) {
     return "nvlp1|" + ref.node_id + tail;
 }
 
-inline bool parseHex64(const std::string &s, uint64_t &out) {
-    if (s.empty() || s.size() > 16) return false;
-    char *end = nullptr;
-    unsigned long long v = strtoull(s.c_str(), &end, 16);
-    if (!end || *end != '\0') return false;
-    out = static_cast<uint64_t>(v);
+inline bool parseHex64(const char *p, size_t n, uint64_t &out) {
+    if (n == 0 || n > 16) return false;
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const char c = p[i];
+        uint64_t d;
+        if (c >= '0' && c <= '9')
+            d = uint64_t(c - '0');
+        else if (c >= 'a' && c <= 'f')
+            d = uint64_t(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F')
+            d = uint64_t(c - 'A' + 10);
+        else
+            return false;
+        v = (v << 4) | d;
+    }
+    out = v;
     return true;
 }
 
-inline bool decodeBufferRef(const std::string &s, BufferRef &ref) {
-    static const std::string kPrefix = "nvlp1|";
-    if (s.compare(0, kPrefix.size(), kPrefix) != 0) return false;
-    // Split from the right: the node id itself never contains '|' (the
-    // client sanitizes it), but parsing from the right keeps this robust.
+// Allocation-free variant used on the per-request routing path: |node_id|
+// points into |s|.
+inline bool decodeBufferRef(const std::string &s, const char *&node_id,
+                            size_t &node_id_len, uint64_t &client_id,
+                            uint64_t &base, uint64_t &size) {
+    static constexpr char kPrefix[] = "nvlp1|";
+    constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
+    if (s.size() <= kPrefixLen || s.compare(0, kPrefixLen, kPrefix) != 0)
+        return false;
+    // Split from the right: the node id never contains '|' (the client
+    // sanitizes it), but parsing from the right keeps this robust.
     size_t p3 = s.rfind('|');
-    if (p3 == std::string::npos || p3 < kPrefix.size()) return false;
+    if (p3 == std::string::npos || p3 < kPrefixLen) return false;
     size_t p2 = s.rfind('|', p3 - 1);
-    if (p2 == std::string::npos || p2 < kPrefix.size()) return false;
+    if (p2 == std::string::npos || p2 < kPrefixLen) return false;
     size_t p1 = s.rfind('|', p2 - 1);
-    if (p1 == std::string::npos || p1 < kPrefix.size()) return false;
-    ref.node_id = s.substr(kPrefix.size(), p1 - kPrefix.size());
-    if (ref.node_id.empty()) return false;
-    return parseHex64(s.substr(p1 + 1, p2 - p1 - 1), ref.client_id) &&
-           parseHex64(s.substr(p2 + 1, p3 - p2 - 1), ref.base) &&
-           parseHex64(s.substr(p3 + 1), ref.size) && ref.client_id != 0 &&
-           ref.size != 0;
+    if (p1 == std::string::npos || p1 < kPrefixLen) return false;
+    node_id = s.data() + kPrefixLen;
+    node_id_len = p1 - kPrefixLen;
+    if (node_id_len == 0) return false;
+    return parseHex64(s.data() + p1 + 1, p2 - p1 - 1, client_id) &&
+           parseHex64(s.data() + p2 + 1, p3 - p2 - 1, base) &&
+           parseHex64(s.data() + p3 + 1, s.size() - p3 - 1, size) &&
+           client_id != 0 && size != 0;
+}
+
+inline bool decodeBufferRef(const std::string &s, BufferRef &ref) {
+    const char *node;
+    size_t node_len;
+    if (!decodeBufferRef(s, node, node_len, ref.client_id, ref.base, ref.size))
+        return false;
+    ref.node_id.assign(node, node_len);
+    return true;
 }
 
 }  // namespace nvlink_proxy

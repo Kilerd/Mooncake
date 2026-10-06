@@ -547,51 +547,44 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
 
 // ------------------------------------------------------------- translation
 
-bool NvlinkProxyTransport::findLocalBlock(uint64_t addr, uint64_t length,
-                                          uint64_t &base,
-                                          bool require_registered) {
+NvlinkProxyTransport::LocalBlockState NvlinkProxyTransport::findLocalBlock(
+    uint64_t addr, uint64_t length, uint64_t &base) {
     std::lock_guard<std::mutex> lock(blocks_mu_);
     auto it = blocks_.upper_bound(addr);
-    if (it == blocks_.begin()) return false;
+    if (it == blocks_.begin()) return LocalBlockState::kNone;
     --it;
     const Block &b = it->second;
     if (addr < b.base || addr - b.base > b.size ||
         length > b.size - (addr - b.base))
-        return false;
-    if (require_registered) {
-        const uint64_t epoch = epoch_.load();
-        if (epoch == 0 || b.registered_epoch != epoch) return false;
-    }
+        return LocalBlockState::kNone;
     base = b.base;
-    return true;
-}
-
-const Transport::BufferDesc *NvlinkProxyTransport::findTargetBuffer(
-    const SegmentDesc &desc, uint64_t addr, uint64_t length) {
-    for (const auto &buffer : desc.buffers) {
-        if (buffer.protocol != kProtocol) continue;
-        if (addr >= buffer.addr && addr - buffer.addr <= buffer.length &&
-            length <= buffer.length - (addr - buffer.addr))
-            return &buffer;
-    }
-    return nullptr;
+    const uint64_t epoch = epoch_.load();
+    return (epoch != 0 && b.registered_epoch == epoch)
+               ? LocalBlockState::kRegistered
+               : LocalBlockState::kUnregistered;
 }
 
 bool NvlinkProxyTransport::canRoute(const TransferRequest &request,
                                     const BufferDesc &target_buffer) {
-    BufferRef ref;
-    if (!decodeBufferRef(target_buffer.shm_name, ref)) return false;
-    if (ref.node_id != node_id_) {
+    const char *node;
+    size_t node_len;
+    uint64_t client, base, size;
+    if (!decodeBufferRef(target_buffer.shm_name, node, node_len, client, base,
+                         size))
+        return false;
+    if (node_len != node_id_.size() ||
+        memcmp(node, node_id_.data(), node_len) != 0) {
         counters_.remote_node_requests++;
         return false;
     }
-    uint64_t base;
+    uint64_t local_base;
     const uint64_t local = reinterpret_cast<uint64_t>(request.source);
     // A local address outside every registered device block (e.g. host
     // memory) is simply not proxy traffic.
-    if (!findLocalBlock(local, request.length, base, false)) return false;
-    if (healthy_ && findLocalBlock(local, request.length, base, true))
-        return true;
+    const LocalBlockState state =
+        findLocalBlock(local, request.length, local_base);
+    if (state == LocalBlockState::kNone) return false;
+    if (healthy_ && state == LocalBlockState::kRegistered) return true;
     // Same-node GPU traffic the proxy would carry, but the daemon (or this
     // block's registration with it) is not available right now.
     counters_.fallback_requests++;
@@ -607,33 +600,68 @@ bool NvlinkProxyTransport::canRoute(const TransferRequest &request,
     return false;
 }
 
+const NvlinkProxyTransport::TargetIndex *NvlinkProxyTransport::targetIndex(
+    std::vector<TargetIndex> &cache, SegmentID target_id) {
+    for (auto &t : cache)
+        if (t.id == target_id) return &t;
+    auto desc = metadata_->getSegmentDescByID(target_id);
+    if (!desc) return nullptr;
+    TargetIndex t;
+    t.id = target_id;
+    for (const auto &buffer : desc->buffers) {
+        if (buffer.protocol != kProtocol) continue;
+        TargetIndex::Ref r;
+        const char *node;
+        size_t node_len;
+        if (!decodeBufferRef(buffer.shm_name, node, node_len, r.client, r.base,
+                             r.size))
+            continue;
+        if (node_len != node_id_.size() ||
+            memcmp(node, node_id_.data(), node_len) != 0)
+            continue;
+        r.addr = buffer.addr;
+        r.length = buffer.length;
+        t.refs.push_back(r);
+    }
+    std::sort(t.refs.begin(), t.refs.end(),
+              [](const TargetIndex::Ref &a, const TargetIndex::Ref &b) {
+                  return a.addr < b.addr;
+              });
+    cache.push_back(std::move(t));
+    return &cache.back();
+}
+
 bool NvlinkProxyTransport::translate(const TransferRequest &request,
+                                     const TargetIndex &target,
                                      CopyEntry &entry) {
-    auto desc = metadata_->getSegmentDescByID(request.target_id);
-    if (!desc) return false;
-    const BufferDesc *buffer =
-        findTargetBuffer(*desc, request.target_offset, request.length);
-    if (!buffer) return false;
-    BufferRef ref;
-    if (!decodeBufferRef(buffer->shm_name, ref) || ref.node_id != node_id_)
-        return false;
     const uint64_t remote = request.target_offset;
+    // Last published buffer starting at or below the target address.
+    auto it = std::upper_bound(
+        target.refs.begin(), target.refs.end(), remote,
+        [](uint64_t a, const TargetIndex::Ref &r) { return a < r.addr; });
+    if (it == target.refs.begin()) return false;
+    const TargetIndex::Ref &ref = *(it - 1);
+    if (remote - ref.addr > ref.length ||
+        request.length > ref.length - (remote - ref.addr))
+        return false;
     if (remote < ref.base || remote - ref.base > ref.size ||
         request.length > ref.size - (remote - ref.base))
         return false;
     uint64_t local_base;
     const uint64_t local = reinterpret_cast<uint64_t>(request.source);
-    if (!findLocalBlock(local, request.length, local_base, true)) return false;
+    if (findLocalBlock(local, request.length, local_base) !=
+        LocalBlockState::kRegistered)
+        return false;
     entry.length = request.length;
     if (request.opcode == TransferRequest::WRITE) {
         entry.src_client = client_id_;
         entry.src_base = local_base;
         entry.src_offset = local - local_base;
-        entry.dst_client = ref.client_id;
+        entry.dst_client = ref.client;
         entry.dst_base = ref.base;
         entry.dst_offset = remote - ref.base;
     } else {
-        entry.src_client = ref.client_id;
+        entry.src_client = ref.client;
         entry.src_base = ref.base;
         entry.src_offset = remote - ref.base;
         entry.dst_client = client_id_;
@@ -720,9 +748,19 @@ Status NvlinkProxyTransport::submitTransferTask(
     std::vector<TransferTask *> proxied, not_servable, failed;
     entries.reserve(task_list.size());
     proxied.reserve(task_list.size());
+    std::vector<TargetIndex> targets;
+    const TargetIndex *last_target = nullptr;
     for (auto *task : task_list) {
         CopyEntry e{};
-        if (!task->request || !translate(*task->request, e)) {
+        const TargetIndex *target = nullptr;
+        if (task->request) {
+            if (last_target && last_target->id == task->request->target_id)
+                target = last_target;
+            else
+                target = last_target =
+                    targetIndex(targets, task->request->target_id);
+        }
+        if (!target || !translate(*task->request, *target, e)) {
             not_servable.push_back(task);
             continue;
         }

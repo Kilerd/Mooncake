@@ -584,6 +584,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 
     transport_map_[proto] = std::shared_ptr<Transport>(transport);
+    ++install_generation_;
 #ifdef USE_NVLINK_PROXY
     if (proto == "nvlink_proxy")
         nvlink_proxy_ = static_cast<NvlinkProxyTransport*>(transport);
@@ -591,23 +592,47 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     return transport;
 }
 
-Status MultiTransport::selectTransport(const TransferRequest& entry,
-                                       Transport*& transport) {
-    auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
-    if (!target_segment_desc) {
-        return Status::InvalidArgument("Invalid target segment ID " +
-                                       std::to_string(entry.target_id));
-    }
-    auto proto = target_segment_desc->protocol;
 #ifdef ENABLE_MULTI_PROTOCOL
-    // Multi-protocol segment (e.g. "rdma,hip"): a single batch may target
-    // buffers owned by different transports (the device KV pool via hip, the
-    // host aux/metadata buffers via rdma). Route each request to the transport
-    // that owns the buffer covering the target address. When a buffer is
-    // registered under more than one protocol (the device KV pool is registered
-    // by both rdma and hip), pick the highest-performance transport by a fixed
-    // priority instead of relying on buffer registration order.
-    if (proto.find(',') != std::string::npos) {
+namespace {
+// Routing state of the last multi-protocol request on this thread. Requests
+// of a batch usually target the same few buffers, and scanning every buffer
+// of the segment per request dominates the submit cost of large batches.
+// [lo, hi) is the address range in which exactly the buffers listed in
+// |candidates| cover the target address, so a cache hit is exact.
+struct MultiProtocolRouteCache {
+    const MultiTransport* owner = nullptr;
+    uint64_t generation = 0;
+    std::shared_ptr<TransferMetadata::SegmentDesc> desc;
+    uint64_t lo = 0, hi = 0;
+    bool gpu_ipc_reachable = false;
+    struct Candidate {
+        size_t index;
+        std::string protocol;
+        int priority;
+        bool unreachable;  // GPU IPC buffer of a cross-host target
+        std::string transport_name;
+        Transport* transport;
+    };
+    std::vector<Candidate> candidates;
+};
+thread_local MultiProtocolRouteCache tl_mp_route_cache;
+}  // namespace
+
+// Multi-protocol segment (e.g. "rdma,hip"): a single batch may target buffers
+// owned by different transports (the device KV pool via hip, the host
+// aux/metadata buffers via rdma). Route each request to the transport that
+// owns the buffer covering the target address. When a buffer is registered
+// under more than one protocol (the device KV pool is registered by both rdma
+// and hip), pick the highest-performance transport by a fixed priority
+// instead of relying on buffer registration order.
+Status MultiTransport::selectMultiProtocolTransport(
+    const TransferRequest& entry,
+    const std::shared_ptr<TransferMetadata::SegmentDesc>& target_segment_desc,
+    Transport*& transport) {
+    auto& rc = tl_mp_route_cache;
+    const uint64_t offset = entry.target_offset;
+    if (rc.owner != this || rc.generation != install_generation_ ||
+        rc.desc != target_segment_desc || offset < rc.lo || offset >= rc.hi) {
         auto protocol_priority = [](const std::string& p) {
             // nvlink_proxy is offered only after its own locality and health
             // gate below accepted the request.
@@ -623,72 +648,112 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             if (p == "tcp") return 1;
             return 0;
         };
-        // hip transport uses GPU IPC, which cannot reach a GPU on another host.
-        // The device KV pool is registered under both rdma and hip, so a
-        // cross-host target must skip its hip buffers and fall back to rdma.
-        // This makes the intra-node fast path (hip) and the cross-node path
-        // (rdma) work automatically from a single multi-protocol segment,
-        // without requiring the operator to set MC_DISABLE_HIP.
-        const bool gpu_ipc_reachable = isGpuIpcReachableTarget(
+        rc.owner = this;
+        rc.generation = install_generation_;
+        rc.desc = target_segment_desc;
+        // hip transport uses GPU IPC, which cannot reach a GPU on another
+        // host. The device KV pool is registered under both rdma and hip, so
+        // a cross-host target must skip its hip buffers and fall back to
+        // rdma. This makes the intra-node fast path (hip) and the cross-node
+        // path (rdma) work automatically from a single multi-protocol
+        // segment, without requiring the operator to set MC_DISABLE_HIP.
+        rc.gpu_ipc_reachable = isGpuIpcReachableTarget(
             target_segment_desc->name, local_server_name_);
-        std::string chosen;
-        int chosen_priority = -1;
-        for (const auto& buffer : target_segment_desc->buffers) {
+        rc.lo = 0;
+        rc.hi = UINT64_MAX;
+        rc.candidates.clear();
+        const auto& buffers = target_segment_desc->buffers;
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            const auto& buffer = buffers[i];
             // CXL buffers locate via offset + cxl_base_addr; all other
             // protocols use the absolute virtual address in buffer.addr.
             uint64_t start =
                 (buffer.protocol == "cxl")
                     ? buffer.offset + target_segment_desc->cxl_base_addr
                     : buffer.addr;
-            if (entry.target_offset >= start &&
-                entry.target_offset < start + buffer.length) {
-                if ((buffer.protocol == "hip" || buffer.protocol == "musa") &&
-                    !gpu_ipc_reachable) {
-                    continue;
+            uint64_t end = start + buffer.length;
+            if (offset >= start && offset < end) {
+                rc.lo = std::max(rc.lo, start);
+                rc.hi = std::min(rc.hi, end);
+                MultiProtocolRouteCache::Candidate c;
+                c.index = i;
+                c.protocol = buffer.protocol;
+                c.priority = protocol_priority(buffer.protocol);
+                c.unreachable =
+                    (buffer.protocol == "hip" || buffer.protocol == "musa") &&
+                    !rc.gpu_ipc_reachable;
+                c.transport_name = buffer.protocol;
+                if (!transport_map_.count(c.transport_name) &&
+                    c.transport_name == "rdma" &&
+                    transport_map_.count("rdma_twosided")) {
+                    c.transport_name = "rdma_twosided";
                 }
-                if (buffer.protocol == "nvlink_proxy") {
-                    // Same node (MC_NODE_ID), local buffer registered with
-                    // the daemon and the daemon healthy; otherwise the base
-                    // transport buffer covering the same range is used.
-#ifdef USE_NVLINK_PROXY
-                    if (!nvlink_proxy_ ||
-                        !nvlink_proxy_->canRoute(entry, buffer))
-                        continue;
-#else
-                    continue;
-#endif
-                }
-                int priority = protocol_priority(buffer.protocol);
-                if (priority > chosen_priority) {
-                    chosen = buffer.protocol;
-                    chosen_priority = priority;
-                }
+                auto it = transport_map_.find(c.transport_name);
+                c.transport =
+                    it == transport_map_.end() ? nullptr : it->second.get();
+                rc.candidates.push_back(std::move(c));
+            } else if (end <= offset) {
+                rc.lo = std::max(rc.lo, end);
+            } else {
+                rc.hi = std::min(rc.hi, start);
             }
         }
-        if (chosen.empty()) {
-            return Status::InvalidArgument(
-                "No matching buffer for target offset in multi-protocol "
-                "segment " +
-                std::to_string(entry.target_id));
+    }
+
+    const MultiProtocolRouteCache::Candidate* chosen = nullptr;
+    for (const auto& c : rc.candidates) {
+        if (c.unreachable) continue;
+        if (c.protocol == "nvlink_proxy") {
+            // Same node (MC_NODE_ID), local buffer registered with the daemon
+            // and the daemon healthy; otherwise the base transport buffer
+            // covering the same range is used.
+#ifdef USE_NVLINK_PROXY
+            if (!nvlink_proxy_ ||
+                !nvlink_proxy_->canRoute(entry,
+                                         target_segment_desc->buffers[c.index]))
+                continue;
+#else
+            continue;
+#endif
         }
-        if (!transport_map_.count(chosen) && chosen == "rdma" &&
-            transport_map_.count("rdma_twosided")) {
-            chosen = "rdma_twosided";
-        }
-        if (!transport_map_.count(chosen)) {
-            return Status::NotSupportedTransport("Transport " + chosen +
-                                                 " not installed");
-        }
-        if (globalConfig().trace) {
-            LOG(INFO) << "MultiTransport::selectTransport route: target_id="
-                      << entry.target_id << " segment_protocol=\"" << proto
-                      << "\" gpu_ipc_reachable=" << gpu_ipc_reachable
-                      << " chosen=" << chosen;
-        }
-        transport = transport_map_[chosen].get();
-        return Status::OK();
+        if (!chosen || c.priority > chosen->priority) chosen = &c;
+    }
+    if (!chosen) {
+        return Status::InvalidArgument(
+            "No matching buffer for target offset in multi-protocol "
+            "segment " +
+            std::to_string(entry.target_id));
+    }
+    if (!chosen->transport) {
+        return Status::NotSupportedTransport(
+            "Transport " + chosen->transport_name + " not installed");
+    }
+    if (globalConfig().trace) {
+        LOG(INFO) << "MultiTransport::selectTransport route: target_id="
+                  << entry.target_id << " segment_protocol=\""
+                  << target_segment_desc->protocol
+                  << "\" gpu_ipc_reachable=" << rc.gpu_ipc_reachable
+                  << " chosen=" << chosen->transport_name;
+    }
+    transport = chosen->transport;
+    return Status::OK();
+}
+#endif
+
+Status MultiTransport::selectTransport(const TransferRequest& entry,
+                                       Transport*& transport) {
+    auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
+    if (!target_segment_desc) {
+        return Status::InvalidArgument("Invalid target segment ID " +
+                                       std::to_string(entry.target_id));
+    }
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (target_segment_desc->protocol.find(',') != std::string::npos) {
+        return selectMultiProtocolTransport(entry, target_segment_desc,
+                                            transport);
     }
 #endif
+    auto proto = target_segment_desc->protocol;
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport
