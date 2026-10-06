@@ -317,7 +317,7 @@ struct CopyConfig {
     // Entries shorter than this go through the gather/scatter kernel, longer
     // ones through the copy engines (cudaMemcpyBatchAsync). 0 = never use
     // the kernel.
-    uint64_t gather_threshold = 64 * 1024;
+    uint64_t gather_threshold = 128 * 1024;
     // Which GPU runs the kernel: the one receiving the data (reads through
     // the peer mapping) or the one holding the source (writes through it).
     bool gather_on_src = false;
@@ -1200,7 +1200,7 @@ void usage(const char *argv0) {
         "merging)\n"
         "                          run in one gather/scatter kernel per batch\n"
         "                          instead of the copy engines (default "
-        "65536,\n"
+        "131072,\n"
         "                          0 = always use the copy engines)\n"
         "  --gather-on dst|src     GPU that runs the kernel: the receiving "
         "one\n"

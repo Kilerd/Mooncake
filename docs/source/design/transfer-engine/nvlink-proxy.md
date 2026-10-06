@@ -76,7 +76,7 @@ to the copy engines costs microseconds per entry, so the daemon:
 
 1. merges consecutive entries that are contiguous in both source and
    destination;
-2. copies entries shorter than `--gather-threshold` bytes (default 64 KiB)
+2. copies entries shorter than `--gather-threshold` bytes (default 128 KiB)
    with one gather/scatter kernel launch per GPU and batch. The entry table is
    uploaded to the GPU, each thread block copies whole entries with 16-byte
    accesses where the relative alignment of source and destination allows
