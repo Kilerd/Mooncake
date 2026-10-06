@@ -63,7 +63,9 @@ the wheel with the console entry point `mooncake_nvlink_proxy`. The workflow
    |---|---|
    | `MC_NVLINK_PROXY_SOCKET` | Daemon socket. When set, `nvlink_proxy` is installed in addition to the base transport, also with `MC_FORCE_TCP=1`. |
    | `MC_NODE_ID` | Locality key, published in the segment metadata. Default: `NODE_NAME`, else the hostname. In Kubernetes set `NODE_NAME` from `spec.nodeName`; pod hostnames differ, so without it the proxy is never used. |
-   | `MC_NVLINK_PROXY_TIMEOUT_MS` | Upper bound for one daemon round trip (default 30000). The daemon refuses to start a copy after half of it. |
+   | `MC_NVLINK_PROXY_TIMEOUT_MS` | Request budget (default 30000): upper bound for one daemon round trip and for completing a request on the base transport after a fallback. The daemon refuses to start a copy after half of it. |
+   | `MC_NVLINK_PROXY_RECONNECT_WAIT_MS` | How long same-node requests wait for an unavailable daemon before they use the base transport (default: half of the request budget). |
+   | `MC_NVLINK_PROXY_FALLBACK_INFLIGHT` | Maximum requests the proxy has in flight on the base transport at a time, across all threads (default 512; with TCP at most half of `MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER`). |
    | `MC_NVLINK_PROXY_STATS_INTERVAL` | Seconds between counter log lines (default 60, 0 = off). |
 
    The Python API is unchanged.
@@ -102,16 +104,29 @@ together with the exact address range in which that set is unchanged.
 - A request uses `nvlink_proxy` when the target buffer was published with the
   same `MC_NODE_ID`, the local buffer is registered with the daemon and the
   daemon is healthy. Otherwise it uses the base transport.
-- Any proxy failure (daemon down, unknown registration, CUDA error, timeout)
-  resubmits the affected requests to the base transport. Failures are logged
-  at most every 5 seconds and counted.
+- While the daemon is unavailable (restart, crash), same-node GPU requests
+  stay with the proxy: in-flight and new batches wait for the daemon to come
+  back and are then re-sent through it. Engines retry the connection every
+  100-400 ms and re-register the same keys. A batch waits at most
+  `MC_NVLINK_PROXY_RECONNECT_WAIT_MS`, and never beyond that window after the
+  outage began, so a daemon that stays away does not delay every request.
+- Right after a daemon (re)start the peer may not have re-registered yet: a
+  COPY that names a block unknown to a daemon this engine connected to within
+  the reconnect window is retried with backoff instead of falling back.
+- Requests that still need the base transport (daemon away for longer than the
+  window, or a non-retryable error such as a CUDA error) are moved there with
+  backpressure: at most `MC_NVLINK_PROXY_FALLBACK_INFLIGHT` requests in flight,
+  rejected requests (e.g. a full TCP lane queue) retried with backoff until
+  the request budget is spent. Fallbacks are logged at most every 5 seconds
+  and counted.
 - Registrations are keyed by a random per-engine client id and the block base,
-  both published in the segment metadata. When the daemon restarts, engines
-  reconnect within about a second and re-register the same keys, so peers'
-  cached metadata stays valid.
+  both published in the segment metadata, so peers' cached metadata stays
+  valid across daemon restarts.
 - The daemon drops an engine's registrations when its control connection
-  closes; copies in flight keep the mappings alive until they finish. On an
-  unrecoverable CUDA error the daemon exits so that it can be restarted.
+  closes; copies in flight keep the mappings alive until they finish. On
+  SIGTERM it stops accepting, lets running copies finish (up to
+  `--drain-timeout-ms`, default 10 s) and exits; on an unrecoverable CUDA error
+  it exits so that it can be restarted.
 
 ## Counters
 
@@ -120,14 +135,21 @@ seconds when they changed (and at shutdown):
 
 ```
 nvlink_proxy stats: healthy=1 proxied_requests=... proxied_bytes=... proxied_batches=...
-  avg_batch_us=... max_batch_us=... fallback_requests=... (daemon_unavailable=...
-  daemon_error=... not_servable=...) remote_node_requests=... registered_blocks=N/M connects=...
+  avg_batch_us=... max_batch_us=... held_requests=... max_hold_ms=... retried_requests=...
+  fallback_requests=... (daemon_unavailable=... daemon_error=... not_servable=...)
+  fallback_retries=... failed_requests=... remote_node_requests=...
+  registered_blocks=N/M connects=...
 ```
 
 - `proxied_*`: requests, bytes and daemon round trips served by the proxy;
   `avg/max_batch_us` is the round-trip latency of one batch.
+- `held_requests` / `max_hold_ms`: requests that waited for the daemon and the
+  longest wait of a batch; `retried_requests`: requests re-sent to the daemon
+  (after a restart or while a peer re-registered).
 - `fallback_requests`: same-node GPU requests that used the base transport
-  instead, split by reason.
+  instead, split by reason; `fallback_retries`: base-transport attempts that
+  were retried (e.g. full TCP queue); `failed_requests`: requests that failed
+  within the request budget.
 - `remote_node_requests`: requests to buffers on another node (normal base
   transport traffic).
 
