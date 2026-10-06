@@ -414,6 +414,15 @@ if(ENABLE_MULTI_PROTOCOL)
   add_test(NAME mp_transport_test COMMAND mp_transport_test)
 endif()
 
+# nvlink_proxy transport: protocol and no-daemon fallback (no GPU needed)
+if(USE_NVLINK_PROXY)
+  add_executable(nvlink_proxy_transport_test
+                 ${WORKSPACE}/nvlink_proxy_transport_test.cpp)
+  target_link_libraries(nvlink_proxy_transport_test PUBLIC transfer_engine gtest
+                                                           gtest_main)
+  add_test(NAME nvlink_proxy_transport_test COMMAND nvlink_proxy_transport_test)
+endif()
+
 add_executable(graceful_shutdown_test ${WORKSPACE}/graceful_shutdown_test.cpp)
 target_link_libraries(graceful_shutdown_test PUBLIC transfer_engine gtest)
 add_test(NAME graceful_shutdown_test COMMAND graceful_shutdown_test)
