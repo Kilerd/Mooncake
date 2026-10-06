@@ -19,7 +19,7 @@ on:
       version:
         description: 'Wheel version (empty: derived from the tag)'
         required: false
-        default: '
+        default: ''
       python-versions:
         description: 'JSON list of Python versions'
         required: true
