@@ -241,6 +241,8 @@ bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept {
 
 namespace {
 constexpr size_t kMaxTcpLanesPerPeer = 16;
+constexpr size_t kDefaultMaxTcpIoThreads = 8;
+constexpr size_t kMaxTcpIoThreads = 64;
 
 size_t parseBoundedTcpSetting(const char* name, const char* value,
                               size_t default_value, size_t minimum,
@@ -336,6 +338,17 @@ TcpTransport::TcpTransport()
             "MC_TCP_ADMISSION_TIMEOUT_MS",
             getenv("MC_TCP_ADMISSION_TIMEOUT_MS"), kDefaultAdmissionTimeoutMs,
             1, kMaxAdmissionTimeoutMs));
+
+    // One io thread moves at most a few GB/s through the kernel socket
+    // copies, so a single thread caps every peer pair. Several threads, each
+    // owning its own io_context, let connections progress in parallel.
+    const size_t hardware_threads =
+        std::max<size_t>(1, std::thread::hardware_concurrency());
+    const size_t default_io_threads =
+        std::min<size_t>(kDefaultMaxTcpIoThreads, hardware_threads);
+    io_threads_ =
+        parseBoundedTcpSetting("MC_TCP_IO_THREADS", getenv("MC_TCP_IO_THREADS"),
+                               default_io_threads, 1, kMaxTcpIoThreads);
 }
 
 TcpTransport::~TcpTransport() {
@@ -388,17 +401,25 @@ int TcpTransport::install(std::string& local_server_name,
     }
 
     close(sockfd);  // the above function has opened a socket
-    LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
+    LOG(INFO) << "TcpTransport: listen on port " << tcp_port << " with "
+              << io_threads_ << " io thread(s)";
     auto metadata = metadata_;
-    context_ = new TcpContext(tcp_port, [metadata = std::move(metadata)](
-                                            uint64_t addr, uint64_t size) {
-        return validateTcpAddress(metadata, addr, size);
-    });
+    context_ = new TcpContext(
+        tcp_port, io_threads_,
+        [metadata = std::move(metadata)](uint64_t addr, uint64_t size) {
+            return validateTcpAddress(metadata, addr, size);
+        });
+    std::vector<asio::io_context::executor_type> executors;
+    executors.reserve(context_->io_contexts.size());
+    for (const auto& io_context : context_->io_contexts)
+        executors.push_back(io_context->get_executor());
     lane_runtime_ =
-        std::make_shared<ConnectionLaneRuntime>(context_->io_context);
+        std::make_shared<ConnectionLaneRuntime>(std::move(executors));
     lane_state_->runtime = lane_runtime_;
     running_ = true;
-    thread_ = std::thread(&TcpTransport::worker, this);
+    threads_.reserve(context_->io_contexts.size());
+    for (size_t i = 0; i < context_->io_contexts.size(); ++i)
+        threads_.emplace_back(&TcpTransport::worker, this, i);
     return 0;
 }
 
@@ -636,16 +657,27 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
     (*advance)();
 }
 
-void TcpTransport::worker() {
+void TcpTransport::worker(size_t index) {
+    auto& io_context = *context_->io_contexts[index];
+    // Keeps run() from returning while this context has no pending work;
+    // only stop() (shutdown) ends it.
+    auto work_guard = asio::make_work_guard(io_context);
+    bool arm_accept = index == 0;
     while (running_) {
         try {
-            context_->doAccept();
-            context_->io_context.run();
+            if (arm_accept) {
+                context_->doAccept();
+                arm_accept = false;
+            }
+            io_context.run();
+            if (io_context.stopped()) break;
         } catch (std::exception& e) {
-            LOG(ERROR) << "TcpTransport::worker encountered an exception "
-                          "during doAccept/run: "
-                       << e.what();
-            context_->io_context.restart();
+            LOG(ERROR) << "TcpTransport::worker " << index
+                       << " encountered an exception during run: " << e.what();
+            // Re-arm the acceptor as before: the throwing handler may have
+            // been the accept completion, which re-arms only on return.
+            arm_accept = index == 0;
+            io_context.restart();
         }
     }
 }
@@ -655,10 +687,10 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
     // The reusable path is owned by fixed connection lanes. This helper is
     // only for the connection-pool-disabled one-shot path.
     try {
-        asio::ip::tcp::resolver resolver(context_->io_context);
+        auto& io_context = context_->nextIoContext();
+        asio::ip::tcp::resolver resolver(io_context);
         auto endpoint_iterator = resolver.resolve(host, std::to_string(port));
-        auto socket_ptr =
-            std::make_shared<asio::ip::tcp::socket>(context_->io_context);
+        auto socket_ptr = std::make_shared<asio::ip::tcp::socket>(io_context);
         asio::connect(*socket_ptr, endpoint_iterator);
         socket_ptr->set_option(asio::ip::tcp::no_delay(true));
         return socket_ptr;
@@ -737,7 +769,35 @@ void TcpTransport::startTransfer(Slice* slice,
             TerminalAction(std::move(work), TransferStatusEnum::FAILED, false));
         return;
     }
-    startTransferWithSocket(std::move(work), std::move(socket));
+    // The session's completion handlers run on the socket's io thread;
+    // initiating from that same thread keeps initiation and completion
+    // serial. A post abandoned by shutdown fails the work instead of
+    // leaving the Slice without a terminal status.
+    struct PendingOneShot {
+        std::optional<TcpWorkItem> work;
+        std::shared_ptr<FailureCounters> counters;
+        ~PendingOneShot() {
+            if (work)
+                failWorkItem(std::move(*work), WorkFailureReason::SHUTDOWN,
+                             counters);
+        }
+    };
+    auto pending = std::make_shared<PendingOneShot>();
+    pending->work.emplace(std::move(work));
+    pending->counters = lane_state_->failure_counters;
+    try {
+        asio::post(socket->get_executor(), [this, pending, socket] {
+            auto ready = std::move(*pending->work);
+            pending->work.reset();
+            startTransferWithSocket(std::move(ready), socket);
+        });
+    } catch (...) {
+        if (pending->work) {
+            auto ready = std::move(*pending->work);
+            pending->work.reset();
+            startTransferWithSocket(std::move(ready), std::move(socket));
+        }
+    }
 }
 
 void TcpTransport::startTransferWithSocket(

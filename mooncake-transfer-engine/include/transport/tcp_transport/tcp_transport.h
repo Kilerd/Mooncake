@@ -94,7 +94,7 @@ class TcpTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
 
-    void worker();
+    void worker(size_t index);
 
     Slice *prepareTransfer(TransferTask *task, const TransferRequest &request);
 
@@ -111,7 +111,12 @@ class TcpTransport : public Transport {
    private:
     TcpContext *context_;
     std::atomic_bool running_;
-    std::thread thread_;
+    // One thread per io_context (MC_TCP_IO_THREADS). Every socket, timer and
+    // resolver is bound to exactly one io_context, so the handlers of one
+    // connection still run serially on one thread while different
+    // connections progress in parallel.
+    std::vector<std::thread> threads_;
+    size_t io_threads_ = 1;
     bool enable_connection_pool_ = true;
 
     // Client-side bounded work queues and fixed connection lanes.
@@ -211,10 +216,20 @@ class TcpTransport : public Transport {
     enum class LaneConnectStage { NONE, RESOLVING, CONNECTING };
 
     struct ConnectionLaneRuntime {
-        explicit ConnectionLaneRuntime(asio::io_context &io_context)
-            : executor(io_context.get_executor()) {}
+        explicit ConnectionLaneRuntime(
+            std::vector<asio::io_context::executor_type> executors_arg)
+            : executors(std::move(executors_arg)) {}
 
-        asio::io_context::executor_type executor;
+        // Round-robin over the io threads. A group's timers and pumps use
+        // one executor; each of its lanes gets its own, so the lanes to a
+        // single peer stream in parallel.
+        asio::io_context::executor_type pick() {
+            const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+            return executors[index % executors.size()];
+        }
+
+        std::vector<asio::io_context::executor_type> executors;
+        std::atomic<size_t> next{0};
     };
 
     struct ConnectionLaneState;
@@ -222,11 +237,16 @@ class TcpTransport : public Transport {
 
     struct ConnectionLane {
         ConnectionLane(size_t lane_id_arg,
-                       const std::shared_ptr<PeerConnectionGroup> &group_arg)
-            : lane_id(lane_id_arg), group(group_arg) {}
+                       const std::shared_ptr<PeerConnectionGroup> &group_arg,
+                       const asio::io_context::executor_type &executor_arg)
+            : lane_id(lane_id_arg), group(group_arg), executor(executor_arg) {}
 
         size_t lane_id;
         std::weak_ptr<PeerConnectionGroup> group;
+        // The lane's resolver, socket, session and session timers all live
+        // on this executor; anything that touches them from elsewhere posts
+        // here first.
+        asio::io_context::executor_type executor;
         LaneState state = LaneState::DISCONNECTED;
         LaneConnectStage connect_stage = LaneConnectStage::NONE;
         uint64_t operation_epoch = 0;
@@ -323,6 +343,9 @@ class TcpTransport : public Transport {
     static void startLaneConnect(
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch);
+    static void startLaneConnectOnLane(
+        const std::shared_ptr<PeerConnectionGroup> &group,
+        const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch);
     static void handleLaneResolved(
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch,
@@ -357,6 +380,18 @@ class TcpTransport : public Transport {
     static void startLaneSession(
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch);
+    static void startLaneSessionOnLane(
+        const std::shared_ptr<PeerConnectionGroup> &group,
+        const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch);
+    static void releaseLaneObjects(
+        const asio::io_context::executor_type &executor,
+        std::shared_ptr<ClientSession> session,
+        std::shared_ptr<asio::ip::tcp::resolver> resolver,
+        std::shared_ptr<asio::ip::tcp::socket> socket) noexcept;
+    static void releaseLaneObjectsNow(
+        const std::shared_ptr<ClientSession> &session,
+        const std::shared_ptr<asio::ip::tcp::resolver> &resolver,
+        const std::shared_ptr<asio::ip::tcp::socket> &socket) noexcept;
     static void handleLaneTerminal(
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch,

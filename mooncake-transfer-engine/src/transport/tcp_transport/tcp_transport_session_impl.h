@@ -915,8 +915,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 };
 
 struct TcpContext {
-    TcpContext(short port, ValidateAddrFn validate_addr)
-        : acceptor(io_context), validate_addr_(std::move(validate_addr)) {
+    TcpContext(short port, size_t io_threads, ValidateAddrFn validate_addr)
+        : io_contexts(makeIoContexts(io_threads)),
+          io_context(*io_contexts.front()),
+          acceptor(io_context),
+          validate_addr_(std::move(validate_addr)) {
         std::error_code ec;
         asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
 
@@ -943,8 +946,33 @@ struct TcpContext {
         acceptor.listen();
     }
 
+    static std::vector<std::unique_ptr<asio::io_context>> makeIoContexts(
+        size_t count) {
+        std::vector<std::unique_ptr<asio::io_context>> contexts;
+        contexts.reserve(std::max<size_t>(count, 1));
+        for (size_t i = 0; i < std::max<size_t>(count, 1); ++i) {
+            // One thread runs each context: concurrency hint 1 lets Asio
+            // skip internal locking it would otherwise need.
+            contexts.push_back(std::make_unique<asio::io_context>(1));
+        }
+        return contexts;
+    }
+
+    // Accepted connections are spread round-robin over the io contexts so
+    // that server sessions for different connections run on different
+    // threads. Each session is started on its own socket's executor.
+    asio::io_context& nextIoContext() {
+        const size_t index =
+            next_io_context.fetch_add(1, std::memory_order_relaxed);
+        return *io_contexts[index % io_contexts.size()];
+    }
+
     void doAccept() {
-        acceptor.async_accept([this](asio::error_code ec, tcpsocket socket) {
+        // The accepted socket is bound to the chosen context's executor.
+        const asio::any_io_executor socket_executor =
+            nextIoContext().get_executor();
+        acceptor.async_accept(socket_executor, [this](asio::error_code ec,
+                                                      tcpsocket socket) {
             if (!ec) {
                 asio::error_code nodelay_ec;
                 socket.set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
@@ -952,13 +980,23 @@ struct TcpContext {
                     std::make_shared<tcpsocket>(std::move(socket));
                 auto session =
                     std::make_shared<ServerSession>(socket_ptr, validate_addr_);
-                session->start();
+                try {
+                    asio::post(socket_ptr->get_executor(),
+                               [session] { session->start(); });
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "TcpContext: failed to start a server "
+                                  "session: "
+                               << e.what();
+                }
             }
             doAccept();
         });
     }
 
-    asio::io_context io_context;
+    std::vector<std::unique_ptr<asio::io_context>> io_contexts;
+    // The first context; it also hosts the acceptor.
+    asio::io_context& io_context;
     asio::ip::tcp::acceptor acceptor;
     ValidateAddrFn validate_addr_;
+    std::atomic<size_t> next_io_context{0};
 };
