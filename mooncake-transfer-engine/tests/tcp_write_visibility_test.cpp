@@ -454,6 +454,38 @@ class ScopedStartTransferMetadataHook {
     bool active_ = true;
 };
 
+// Hooks that block a handler model a stalled io thread. They are only
+// meaningful when every connection shares that one thread, so such tests pin
+// the transport to a single io thread (set before the engine is created);
+// tcp_multithread_test covers several threads.
+class ScopedSingleIoThread {
+   public:
+    explicit ScopedSingleIoThread(bool active) : active_(active) {
+        if (!active_) return;
+        if (const char* old = std::getenv("MC_TCP_IO_THREADS")) {
+            had_old_ = true;
+            old_ = old;
+        }
+        setenv("MC_TCP_IO_THREADS", "1", 1);
+    }
+
+    ~ScopedSingleIoThread() {
+        if (!active_) return;
+        if (had_old_)
+            setenv("MC_TCP_IO_THREADS", old_.c_str(), 1);
+        else
+            unsetenv("MC_TCP_IO_THREADS");
+    }
+
+    ScopedSingleIoThread(const ScopedSingleIoThread&) = delete;
+    ScopedSingleIoThread& operator=(const ScopedSingleIoThread&) = delete;
+
+   private:
+    bool active_;
+    bool had_old_ = false;
+    std::string old_;
+};
+
 class ScopedLaneHooks {
    public:
     explicit ScopedLaneHooks(bool block_first_connect_handler = false,
@@ -461,7 +493,10 @@ class ScopedLaneHooks {
                              bool block_retry = false,
                              bool block_retry_armed = false,
                              bool block_admission = false,
-                             bool fail_second_connect = false) {
+                             bool fail_second_connect = false)
+        : single_io_thread_(block_first_connect_handler || block_after_busy ||
+                            block_retry || block_retry_armed ||
+                            block_admission) {
         resetLaneTestState();
         tcpTransportSetLaneObserverHookForTest(observeLaneState);
         tcpTransportSetLaneFailureReasonHookForTest(observeWorkFailureReason);
@@ -508,6 +543,7 @@ class ScopedLaneHooks {
     }
 
    private:
+    ScopedSingleIoThread single_io_thread_;
     bool active_ = true;
 };
 
@@ -515,7 +551,8 @@ class ScopedSessionProgressHooks {
    public:
     ScopedSessionProgressHooks(int target_event = 0,
                                int action = kSessionProgressNoAction,
-                               bool block_timeout_commit = false) {
+                               bool block_timeout_commit = false)
+        : single_io_thread_(block_timeout_commit) {
         resetSessionProgressTestState();
         session_progress_target_event.store(target_event,
                                             std::memory_order_release);
@@ -539,6 +576,7 @@ class ScopedSessionProgressHooks {
     }
 
    private:
+    ScopedSingleIoThread single_io_thread_;
     bool active_ = true;
 };
 #endif

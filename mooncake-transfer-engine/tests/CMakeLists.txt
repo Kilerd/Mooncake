@@ -165,6 +165,10 @@ if(USE_TCP)
   target_link_libraries(tcp_write_visibility_test PUBLIC transfer_engine gtest
                                                          gtest_main)
   add_test(NAME tcp_write_visibility_test COMMAND tcp_write_visibility_test)
+
+  add_executable(tcp_multithread_test ${WORKSPACE}/tcp_multithread_test.cpp)
+  target_link_libraries(tcp_multithread_test PUBLIC transfer_engine gtest)
+  add_test(NAME tcp_multithread_test COMMAND tcp_multithread_test)
 endif()
 
 add_executable(tcp_address_validation_test
