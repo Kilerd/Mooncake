@@ -102,7 +102,14 @@ class TcpTransport : public Transport {
                        std::function<void()> continuation = nullptr,
                        bool reuse_connection = false);
 
-    void startTransferSequence(std::vector<Slice *> slices);
+    void startTransferSequence(std::vector<Slice *> slices,
+                               bool stop_on_failure = false);
+
+    // Starts independent slices. A fan-out to one peer larger than its lane
+    // queue plus admission queue is run as a few chains instead, each
+    // keeping one slice in flight, so it back-pressures on the lanes rather
+    // than overflowing the bounded queues and failing with queue-full.
+    void startTransfers(std::vector<Slice *> slices);
 
     bool validateAddress(uint64_t addr, uint64_t size) const;
 

@@ -1459,6 +1459,16 @@ struct EngineHandle {
     void* pool = nullptr;
 
     ~EngineHandle() {
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+        // A failed assertion can leave a hook holding an io thread; the
+        // engine's shutdown would then wait on it forever. Let every held
+        // handler go before the engine joins its threads.
+        releaseLaneConnectHandler();
+        releaseRetryHandler();
+        releaseRetryArmedObserver();
+        releaseAdmissionHandler();
+        release_session_timeout_commit.store(true, std::memory_order_release);
+#endif
         engine.reset();  // unregisters memory before the pool goes away
         free(pool);
     }
@@ -3152,8 +3162,13 @@ TEST(TcpWriteVisibilityTest, PendingAdmissionHardBoundRejectsImmediately) {
         request.target_offset = h.remote_base;
     }
 
+    // Separate submits, as concurrent callers would make them: one submit
+    // larger than the lane queue plus the admission queue is chained instead
+    // of rejected (tcp_multithread_test covers that), while work arriving
+    // from several submits still meets the hard admission bound.
     const auto batch_id = h.engine->allocateBatchID(kRequestCount);
-    ASSERT_TRUE(h.engine->submitTransfer(batch_id, requests).ok());
+    for (const auto& request : requests)
+        ASSERT_TRUE(h.engine->submitTransfer(batch_id, {request}).ok());
     ASSERT_TRUE(waitForPredicate(
         [] {
             return lane_connect_handler_entered.load(std::memory_order_acquire);

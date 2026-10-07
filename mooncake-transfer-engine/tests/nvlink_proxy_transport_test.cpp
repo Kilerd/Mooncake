@@ -216,7 +216,10 @@ TEST(NvlinkProxyTransport, BoundedSubmitterKeepsTcpWithinCapacity) {
     LOG(INFO) << "bounded: " << ok.load() << " requests from " << kThreads
               << " threads, max in flight " << max_inflight.load();
 
-    // 2. Unbounded: one batch of every request overflows the lane queue.
+    // 2. Unbounded: one batch of every request is larger than the TCP lane
+    // queue plus its admission queue. TCP used to reject most of it with
+    // queue-full (and could strand the rest); it now chains such a submit,
+    // so the batch completes without the bounded submitter as well.
     {
         auto batch = engine->allocateBatchID(kTotal);
         ASSERT_TRUE(engine->submitTransfer(batch, reqs).ok());
@@ -243,9 +246,11 @@ TEST(NvlinkProxyTransport, BoundedSubmitterKeepsTcpWithinCapacity) {
         LOG(INFO) << "unbounded: completed=" << completed
                   << " failed=" << failed
                   << " unresolved=" << kTotal - completed - failed;
-        EXPECT_GT(failed, 0u) << "the unbounded baseline should overflow";
-        // The batch may still be referenced by unresolved TCP work; it is
-        // intentionally not freed.
+        EXPECT_EQ(completed, kTotal);
+        EXPECT_EQ(failed, 0u);
+        // Unresolved work would still reference the batch; free it only
+        // when everything is terminal.
+        if (completed + failed == kTotal) (void)engine->freeBatchID(batch);
     }
     unsetenv("MC_FORCE_TCP");
 }

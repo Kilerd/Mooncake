@@ -524,23 +524,27 @@ Status TcpTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
+    std::vector<Slice*> slices;
+    slices.reserve(entries.size());
     for (auto& request : entries) {
         TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
-        startTransfer(prepareTransfer(&task, request));
+        slices.push_back(prepareTransfer(&task, request));
     }
+    startTransfers(std::move(slices));
 
     return Status::OK();
 }
 
 Status TcpTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
+    std::vector<Slice*> independent;
     for (size_t i = 0; i < task_list.size();) {
         auto* task = task_list[i];
         assert(task && task->request);
         const auto group_id = task->request->task_group_id;
         if (group_id == TransferRequest::kNoTaskGroup) {
-            startTransfer(prepareTransfer(task, *task->request));
+            independent.push_back(prepareTransfer(task, *task->request));
             ++i;
             continue;
         }
@@ -557,6 +561,7 @@ Status TcpTransport::submitTransferTask(
                      task_list[i]->request);
         startTransferSequence(std::move(slices));
     }
+    startTransfers(std::move(independent));
     return Status::OK();
 }
 
@@ -589,7 +594,55 @@ Transport::Slice* TcpTransport::prepareTransfer(
     return slice;
 }
 
-void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
+void TcpTransport::startTransfers(std::vector<Slice*> slices) {
+    // A peer's lane queue holds MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER slices
+    // and its admission queue MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER more;
+    // anything beyond fails with queue-full, so a large fragmented transfer
+    // used to fail outright. A submit that by itself exceeds both is
+    // chained instead: its slices to that peer are split into a few
+    // sequences (twice the lane count, so a lane never idles between two of
+    // them), and each sequence submits its next slice when the previous one
+    // completes. Submits that fit keep the direct path and its admission
+    // semantics unchanged.
+    const size_t threshold =
+        std::max<size_t>(1, lane_state_->max_queued_transfers_per_peer +
+                                lane_state_->max_pending_admissions_per_peer);
+    if (slices.size() <= threshold) {
+        for (auto* slice : slices) startTransfer(slice);
+        return;
+    }
+
+    std::unordered_map<SegmentID, std::vector<Slice*>> by_target;
+    std::vector<SegmentID> targets;
+    for (auto* slice : slices) {
+        auto& group = by_target[slice->target_id];
+        if (group.empty()) targets.push_back(slice->target_id);
+        group.push_back(slice);
+    }
+    const size_t max_chains =
+        std::max<size_t>(1, 2 * lane_state_->lanes_per_peer);
+    for (const auto target : targets) {
+        auto& group = by_target[target];
+        if (group.size() <= threshold) {
+            for (auto* slice : group) startTransfer(slice);
+            continue;
+        }
+        const size_t chains = std::min(max_chains, group.size());
+        for (size_t k = 0; k < chains; ++k) {
+            const size_t begin = k * group.size() / chains;
+            const size_t end = (k + 1) * group.size() / chains;
+            // Once a slice of a chain fails (typically the peer is gone),
+            // the rest of that chain fails at once instead of each waiting
+            // out a reconnect cooldown in turn.
+            startTransferSequence(
+                std::vector<Slice*>(group.begin() + begin, group.begin() + end),
+                /*stop_on_failure=*/true);
+        }
+    }
+}
+
+void TcpTransport::startTransferSequence(std::vector<Slice*> slices,
+                                         bool stop_on_failure) {
     struct Sequence {
         std::mutex mutex;
         std::vector<Slice*> slices;
@@ -604,7 +657,7 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
     auto advance = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak_advance = advance;
 
-    *advance = [this, sequence, weak_advance]() {
+    *advance = [this, sequence, weak_advance, stop_on_failure]() {
         auto advance = weak_advance.lock();
         if (!advance) return;
 
@@ -621,15 +674,31 @@ void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
         while (true) {
             Slice* slice = nullptr;
             bool has_more = false;
+            std::vector<Slice*> abandoned;
             {
                 std::lock_guard<std::mutex> lock(sequence->mutex);
                 if (sequence->next == sequence->slices.size()) {
                     sequence->advancing = false;
                     return;
                 }
-                slice = sequence->slices[sequence->next++];
-                has_more = sequence->next < sequence->slices.size();
-                sequence->resume_requested = false;
+                // The previous slice is terminal here: this runs from its
+                // completion (or from the initial call, when next == 0).
+                if (stop_on_failure && sequence->next > 0 &&
+                    sequence->slices[sequence->next - 1]->status ==
+                        Slice::FAILED) {
+                    abandoned.assign(sequence->slices.begin() + sequence->next,
+                                     sequence->slices.end());
+                    sequence->next = sequence->slices.size();
+                    sequence->advancing = false;
+                } else {
+                    slice = sequence->slices[sequence->next++];
+                    has_more = sequence->next < sequence->slices.size();
+                    sequence->resume_requested = false;
+                }
+            }
+            if (!slice) {
+                for (auto* failed : abandoned) failed->markFailed();
+                return;
             }
 
             std::function<void()> continuation;

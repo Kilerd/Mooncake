@@ -27,10 +27,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -137,15 +140,16 @@ TransferStatusEnum waitTask(TransferEngine* engine, Transport::BatchID batch,
     TransferStatus status;
     status.s = TransferStatusEnum::WAITING;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
+    while (true) {  // checks at least once, even with no time left
         if (!engine->getTransferStatus(batch, task, status).ok())
             return TransferStatusEnum::FAILED;
         if (status.s == TransferStatusEnum::COMPLETED ||
             status.s == TransferStatusEnum::FAILED)
             return status.s;
+        if (std::chrono::steady_clock::now() >= deadline)
+            return TransferStatusEnum::TIMEOUT;
         std::this_thread::yield();
     }
-    return TransferStatusEnum::TIMEOUT;
 }
 
 // Submit `requests` as one batch and wait for all of them.
@@ -429,9 +433,259 @@ TEST(TcpMultiThreadTest, PeerShutdownMidStreamFailsInFlightWork) {
     EXPECT_EQ(memcmp(client.base(), fresh.base(), kPiece), 0);
 }
 
+struct FanOutResult {
+    size_t completed = 0;
+    size_t failed = 0;
+    size_t pending = 0;
+    double seconds = 0;
+};
+
+// Submits `blocks` small, scattered blocks to one peer as a single batch and
+// waits up to `timeout` for every task to become terminal.
+FanOutResult runFanOut(const Peer& client, size_t blocks, size_t block_size,
+                       std::chrono::seconds timeout) {
+    std::vector<TransferRequest> requests;
+    requests.reserve(blocks);
+    for (size_t i = 0; i < blocks; ++i) {
+        // A stride coprime to the block count scatters the destinations.
+        const size_t dst = (i * 7919) % blocks;
+        requests.push_back(makeRequest(client, TransferRequest::WRITE,
+                                       client.base() + i * block_size,
+                                       dst * block_size, block_size));
+    }
+    FanOutResult result;
+    const auto start = std::chrono::steady_clock::now();
+    auto batch = client.engine->allocateBatchID(blocks);
+    EXPECT_TRUE(client.engine->submitTransfer(batch, requests).ok());
+    const auto deadline = start + timeout;
+    std::vector<bool> done(blocks, false);
+    size_t remaining = blocks;
+    while (remaining && std::chrono::steady_clock::now() < deadline) {
+        for (size_t i = 0; i < blocks; ++i) {
+            if (done[i]) continue;
+            TransferStatus status;
+            if (!client.engine->getTransferStatus(batch, i, status).ok())
+                continue;
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                ++result.completed;
+            } else if (status.s == TransferStatusEnum::FAILED) {
+                ++result.failed;
+            } else {
+                continue;
+            }
+            done[i] = true;
+            --remaining;
+        }
+        if (remaining)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    result.pending = remaining;
+    result.seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    if (!remaining) (void)client.engine->freeBatchID(batch);
+    LOG(INFO) << "fan-out of " << blocks << " x " << block_size
+              << " B: completed=" << result.completed
+              << " failed=" << result.failed << " pending=" << result.pending
+              << " in " << result.seconds << " s";
+    return result;
+}
+
+// A fragmented transfer is many small blocks to one peer, far more than the
+// per-peer lane queue (1024) plus admission queue (1024) hold. It must
+// back-pressure and complete, not fail with queue-full or stall.
+TEST(TcpMultiThreadTest, LargeFanOutToOnePeerCompletes) {
+    constexpr size_t kBlocks = 20000;
+    constexpr size_t kBlockSize = 4096;
+    for (const char* io_threads : {"1", "4"}) {
+        ScopedEnvVar io("MC_TCP_IO_THREADS", io_threads);
+        Peer server;
+        server.init(std::string("127.0.0.2:1836") + io_threads,
+                    kBlocks * kBlockSize);
+        ASSERT_TRUE(server.ok);
+        Peer client;
+        client.init(std::string("127.0.0.2:1837") + io_threads,
+                    kBlocks * kBlockSize, &server);
+        ASSERT_TRUE(client.ok);
+        for (size_t i = 0; i < kBlocks; ++i)
+            fillPattern(client.base() + i * kBlockSize, kBlockSize,
+                        static_cast<uint32_t>(i));
+
+        const auto result =
+            runFanOut(client, kBlocks, kBlockSize, std::chrono::seconds(120));
+        EXPECT_EQ(result.completed, kBlocks) << "io threads " << io_threads;
+        EXPECT_EQ(result.failed, 0u) << "io threads " << io_threads;
+        EXPECT_EQ(result.pending, 0u) << "io threads " << io_threads;
+        size_t mismatched = 0;
+        for (size_t i = 0; i < kBlocks; ++i) {
+            const size_t dst = (i * 7919) % kBlocks;
+            if (memcmp(client.base() + i * kBlockSize,
+                       server.base() + dst * kBlockSize, kBlockSize) != 0)
+                ++mismatched;
+        }
+        EXPECT_EQ(mismatched, 0u) << "io threads " << io_threads;
+    }
+}
+
+// The same fan-out to a peer that has gone away fails every block promptly
+// instead of retrying the dead peer once per block.
+TEST(TcpMultiThreadTest, LargeFanOutToGonePeerFailsPromptly) {
+    constexpr size_t kBlocks = 20000;
+    constexpr size_t kBlockSize = 4096;
+    auto server = std::make_unique<Peer>();
+    server->init("127.0.0.2:18381", kBlocks * kBlockSize);
+    ASSERT_TRUE(server->ok);
+    Peer client;
+    client.init("127.0.0.2:18382", kBlocks * kBlockSize, server.get());
+    ASSERT_TRUE(client.ok);
+    server.reset();
+
+    const auto result =
+        runFanOut(client, kBlocks, kBlockSize, std::chrono::seconds(60));
+    EXPECT_EQ(result.failed, kBlocks);
+    EXPECT_EQ(result.pending, 0u);
+    EXPECT_LT(result.seconds, 20.0);
+}
+
+// Many concurrent submits, each small enough for the direct path, still
+// overflow the bounded per-peer queue and some are rejected with
+// queue-full. A rejection must not strand the work that was admitted: every
+// admitted block completes and nothing stays pending.
+TEST(TcpMultiThreadTest, QueueFullRejectionDoesNotStallAdmittedWork) {
+    constexpr size_t kThreads = 8;
+    constexpr size_t kBatches = 5;
+    constexpr size_t kPerBatch = 100;  // well under the chaining threshold
+    constexpr size_t kBlockSize = 4096;
+    constexpr size_t kBlocks = kThreads * kBatches * kPerBatch;
+    ScopedEnvVar queue("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "256");
+    ScopedEnvVar pending("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER", "64");
+    Peer server;
+    server.init("127.0.0.2:18391", kBlocks * kBlockSize);
+    ASSERT_TRUE(server.ok);
+    Peer client;
+    client.init("127.0.0.2:18392", kBlocks * kBlockSize, &server);
+    ASSERT_TRUE(client.ok);
+
+    std::atomic<size_t> completed{0}, failed{0}, pending_after{0};
+    // One overall deadline: a stalled peer must show up as pending work,
+    // not as a test that waits per task.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    std::vector<std::thread> threads;
+    for (size_t t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            std::vector<Transport::BatchID> batches;
+            for (size_t b = 0; b < kBatches; ++b) {
+                std::vector<TransferRequest> requests;
+                for (size_t i = 0; i < kPerBatch; ++i) {
+                    const size_t block = (t * kBatches + b) * kPerBatch + i;
+                    requests.push_back(
+                        makeRequest(client, TransferRequest::WRITE,
+                                    client.base() + block * kBlockSize,
+                                    block * kBlockSize, kBlockSize));
+                }
+                auto batch = client.engine->allocateBatchID(kPerBatch);
+                EXPECT_TRUE(
+                    client.engine->submitTransfer(batch, requests).ok());
+                batches.push_back(batch);
+            }
+            for (auto batch : batches) {
+                for (size_t i = 0; i < kPerBatch; ++i) {
+                    const auto left = std::max(
+                        std::chrono::seconds(0),
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            deadline - std::chrono::steady_clock::now()));
+                    switch (waitTask(client.engine.get(), batch, i, left)) {
+                        case TransferStatusEnum::COMPLETED:
+                            ++completed;
+                            break;
+                        case TransferStatusEnum::FAILED:
+                            ++failed;
+                            break;
+                        default:
+                            ++pending_after;
+                    }
+                }
+                if (pending_after.load() == 0)
+                    (void)client.engine->freeBatchID(batch);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    LOG(INFO) << "concurrent overflow: completed=" << completed.load()
+              << " failed=" << failed.load()
+              << " pending=" << pending_after.load();
+    EXPECT_EQ(pending_after.load(), 0u);
+    EXPECT_GT(completed.load(), 0u);
+    EXPECT_EQ(completed.load() + failed.load(), kBlocks);
+}
+
+namespace {
+// Fails a test that hangs instead of letting it block the whole run: a
+// transport hang must surface as a failure with a clear message.
+class Watchdog : public ::testing::EmptyTestEventListener {
+   public:
+    explicit Watchdog(std::chrono::seconds limit) : limit_(limit) {
+        thread_ = std::thread([this] { run(); });
+    }
+    ~Watchdog() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+
+    void OnTestStart(const ::testing::TestInfo& info) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        name_ = std::string(info.test_suite_name()) + "." + info.name();
+        deadline_ = std::chrono::steady_clock::now() + limit_;
+        armed_ = true;
+        cv_.notify_all();
+    }
+
+    void OnTestEnd(const ::testing::TestInfo&) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        armed_ = false;
+        cv_.notify_all();
+    }
+
+   private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!stop_) {
+            if (!armed_) {
+                cv_.wait(lock);
+                continue;
+            }
+            if (cv_.wait_until(lock, deadline_) == std::cv_status::timeout &&
+                armed_ && std::chrono::steady_clock::now() >= deadline_) {
+                fprintf(stderr, "watchdog: %s exceeded %llds, aborting\n",
+                        name_.c_str(), (long long)limit_.count());
+                fflush(stderr);
+                std::abort();
+            }
+        }
+    }
+
+    std::chrono::seconds limit_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::string name_;
+    std::chrono::steady_clock::time_point deadline_;
+    bool armed_ = false;
+    bool stop_ = false;
+    std::thread thread_;
+};
+}  // namespace
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     google::InitGoogleLogging(argv[0]);
     FLAGS_logtostderr = 1;
+    // Every test here finishes in seconds; three minutes means a hang.
+    ::testing::UnitTest::GetInstance()->listeners().Append(
+        new Watchdog(std::chrono::seconds(180)));
     return RUN_ALL_TESTS();
 }

@@ -655,8 +655,12 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
     if (rejected)
         failWorkItem(std::move(*rejected), rejection_reason,
                      state->failure_counters);
-    else if (pump_epoch != 0)
-        postGroupPump(group, pump_epoch);
+    // The pump was requested under the group lock whether or not this item
+    // was admitted. Requesting it marks the group pump_scheduled, so a
+    // request that is not posted makes every later request a no-op: after a
+    // queue-full rejection the queued work then never ran again and the
+    // peer's lanes stayed idle for good. Always post a granted request.
+    if (pump_epoch != 0) postGroupPump(group, pump_epoch);
 }
 
 void TcpTransport::postGroupPump(
