@@ -620,6 +620,41 @@ TEST(TcpMultiThreadTest, QueueFullRejectionDoesNotStallAdmittedWork) {
     EXPECT_EQ(completed.load() + failed.load(), kBlocks);
 }
 
+// Work submitted to a dead peer while its group cools down after a failed
+// connect round must fail once the next round fails too, not wait forever.
+TEST(TcpMultiThreadTest, WorkQueuedDuringReconnectCooldownStillFails) {
+    for (const char* io_threads : {"1", "8"}) {
+        ScopedEnvVar io("MC_TCP_IO_THREADS", io_threads);
+        auto server = std::make_unique<Peer>();
+        server->init(std::string("127.0.0.2:1840") + io_threads, 1 << 20);
+        ASSERT_TRUE(server->ok);
+        Peer client;
+        client.init(std::string("127.0.0.2:1841") + io_threads, 1 << 20,
+                    server.get());
+        ASSERT_TRUE(client.ok);
+        server.reset();
+
+        auto request =
+            makeRequest(client, TransferRequest::WRITE, client.base(), 0, 4096);
+        // The first submit fails its connect round and starts the cooldown.
+        EXPECT_FALSE(
+            runBatch(client.engine.get(), {request}, std::chrono::seconds(10)));
+        // These arrive during the cooldown, one after another.
+        for (int i = 0; i < 3; ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            auto batch = client.engine->allocateBatchID(1);
+            ASSERT_TRUE(client.engine->submitTransfer(batch, {request}).ok());
+            EXPECT_EQ(waitTask(client.engine.get(), batch, 0,
+                               std::chrono::seconds(15)),
+                      TransferStatusEnum::FAILED)
+                << "io threads " << io_threads << ", submit " << i;
+            EXPECT_LT(std::chrono::steady_clock::now() - start,
+                      std::chrono::seconds(10));
+            (void)client.engine->freeBatchID(batch);
+        }
+    }
+}
+
 namespace {
 // Fails a test that hangs instead of letting it block the whole run: a
 // transport hang must surface as a failure with a clear message.
