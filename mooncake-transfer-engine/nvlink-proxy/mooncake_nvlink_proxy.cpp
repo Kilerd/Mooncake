@@ -21,6 +21,13 @@
 // between every GPU pair; it then opens the clients' legacy CUDA IPC handles
 // lazily in the context of the GPU that receives the data and copies with
 // that GPU's copy engines over NVLink / PCIe P2P.
+//
+// Before it serves copies between two GPUs it copies a known pattern between
+// them in both directions (P2P self-test, --p2p-selftest): some platforms
+// report working peer access yet deliver corrupt data over it. A pair that
+// fails is denied, as are pairs named with --deny-peer / --deny-pair; copies
+// between the GPUs of a denied pair are refused with kNoPeerAccess and the
+// engines move them to their base transport (see p2p_policy.h).
 
 #include <cuda_runtime.h>
 #include <errno.h>
@@ -56,6 +63,7 @@
 #include <vector>
 
 #include "gather_copy.h"
+#include "p2p_policy.h"
 #include "transport/nvlink_proxy_transport/nvlink_proxy_protocol.h"
 
 using namespace mooncake::nvlink_proxy;
@@ -153,6 +161,8 @@ struct Device {
     uint8_t uuid[kUuidSize];
     std::string name;
     std::string pci;
+    PciAddr addr;
+    bool exclusive = false;  // compute mode not Default
 };
 
 constexpr int kMaxDevices = 64;
@@ -166,6 +176,22 @@ std::atomic<bool> g_dev_ready[kMaxDevices];
 bool ensureDevice(int dev);
 uint64_t g_epoch = 0;
 uint64_t g_start_us = 0;
+
+// P2P policy (p2p_policy.h): --p2p-selftest and the pairs denied by the
+// command line or by the self-test, indexed by daemon ordinal.
+SelfTestMode g_selftest = SelfTestMode::kEnforce;
+PeerPolicy g_policy;
+std::vector<std::string> g_pci_short;  // ordinal -> "bb:dd" for stats
+// Per ordered pair [src][dst]: not tested yet / passed / failed. A pair the
+// startup test could not test is tested when engines first register on both
+// GPUs (ensureDevice).
+enum : uint8_t {
+    kNotTested = 0,
+    kTestPassed = 1,
+    kTestFailed = 2,
+    kTestDecided = 3,  // could not be tested; denied (enforce) or trusted
+};
+std::atomic<uint8_t> g_test_state[kMaxDevices][kMaxDevices];
 
 bool isStickyCudaError(cudaError_t e) {
     switch (e) {
@@ -273,6 +299,7 @@ struct Stats {
     std::atomic<uint64_t> ce_bytes{0};
     std::atomic<uint64_t> plan_us_total{0};
     std::atomic<uint64_t> exec_us_total{0};
+    std::atomic<uint64_t> denied_copies{0};  // refused by the P2P policy
 } g_stats;
 
 void updateMax(std::atomic<uint64_t> &m, uint64_t v) {
@@ -312,7 +339,15 @@ std::string statsText() {
         g_stats.coalesced_entries.load(), g_stats.kernel_entries.load(),
         g_stats.kernel_bytes.load(), g_stats.ce_entries.load(),
         g_stats.ce_bytes.load(), g_stats.handle_opens.load());
-    return buf;
+    std::string out = buf;
+    const std::string denied = g_policy.deniedList(g_pci_short);
+    out += " p2p_selftest=";
+    out += selfTestModeName(g_selftest);
+    out += " denied_pairs=" + std::to_string(g_policy.deniedCount());
+    if (!denied.empty()) out += "(" + denied + ")";
+    out +=
+        " denied_copy_requests=" + std::to_string(g_stats.denied_copies.load());
+    return out;
 }
 
 // ------------------------------------------------------------ copy engine
@@ -444,6 +479,7 @@ struct CopyResult {
     uint32_t failed_index = 0;
     uint64_t bytes = 0;
     std::string message;
+    bool denied = false;  // refused by the P2P policy, not a failure
 };
 
 std::shared_ptr<Registration> lookupReg(uint64_t client, uint64_t base) {
@@ -603,6 +639,18 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
             dev = it.dst->device;  // copy engines of the receiving GPU
         const int other =
             (dev == it.dst->device) ? it.src->device : it.dst->device;
+        if (it.src->device != it.dst->device &&
+            g_policy.denied(it.src->device, it.dst->device)) {
+            // The engine moves the request to its base transport.
+            const int s = it.src->device, d = it.dst->device;
+            char m[192];
+            snprintf(m, sizeof(m),
+                     "P2P from gpu %d (%s) to gpu %d (%s) is denied: %s", s,
+                     g_devices[s].pci.c_str(), d, g_devices[d].pci.c_str(),
+                     PeerPolicy::reasonName(g_policy.reason(s, d)));
+            r.denied = true;
+            return fail(ProxyStatus::kNoPeerAccess, count, m);
+        }
         if (other != dev && !g_peer[dev][other].load()) {
             char m[96];
             snprintf(m, sizeof(m), "gpu %d cannot access gpu %d (no P2P)", dev,
@@ -967,6 +1015,26 @@ void handleConnection(int fd) {
                 std::string out(reinterpret_cast<char *>(&resp), sizeof(resp));
                 if (res.status == ProxyStatus::kOk) {
                     g_stats.copy_bytes += res.bytes;
+                } else if (res.denied) {
+                    // Expected for every copy between the GPUs of a denied
+                    // pair: counted apart from failures, logged rarely.
+                    g_stats.denied_copies++;
+                    out += res.message;
+                    static std::atomic<uint64_t> last_denied_log_us{0};
+                    static std::atomic<uint64_t> denied_since_log{0};
+                    const uint64_t now_us = nowUs();
+                    uint64_t last = last_denied_log_us.load();
+                    denied_since_log++;
+                    if ((last == 0 || now_us - last >= 60000000) &&
+                        last_denied_log_us.compare_exchange_strong(last,
+                                                                   now_us)) {
+                        LOGI("refused %" PRIu64
+                             " copy request(s) from client %016" PRIx64
+                             " and others since the last report: %s; the "
+                             "engines use their base transport for them",
+                             denied_since_log.exchange(0), c.client_id,
+                             res.message.c_str());
+                    }
                 } else {
                     g_stats.copy_failures++;
                     out += res.message;
@@ -1060,8 +1128,13 @@ bool initDevices() {
         snprintf(pci, sizeof(pci), "%04x:%02x:%02x", prop.pciDomainID,
                  prop.pciBusID, prop.pciDeviceID);
         d.pci = pci;
+        d.addr.domain = static_cast<uint32_t>(prop.pciDomainID);
+        d.addr.bus = static_cast<uint32_t>(prop.pciBusID);
+        d.addr.device = static_cast<uint32_t>(prop.pciDeviceID);
         g_devices.push_back(d);
+        g_pci_short.push_back(formatPciAddrShort(d.addr));
         const bool exclusive = prop.computeMode != cudaComputeModeDefault;
+        g_devices.back().exclusive = exclusive;
         LOGI("gpu %d: %s %s pci %s%s", i, d.name.c_str(),
              hexUuid(d.uuid).c_str(), d.pci.c_str(),
              exclusive ? " compute mode NOT DEFAULT" : "");
@@ -1075,12 +1148,372 @@ bool initDevices() {
                 i);
         }
     }
+    g_policy.reset(n);
     for (int a = 0; a < kMaxDevices; ++a) {
         g_dev_ready[a] = false;
         g_kernel_unusable[a] = false;
-        for (int b = 0; b < kMaxDevices; ++b) g_peer[a][b] = false;
+        for (int b = 0; b < kMaxDevices; ++b) {
+            g_peer[a][b] = false;
+            g_test_state[a][b] = kNotTested;
+        }
     }
     return n > 0;
+}
+
+// ------------------------------------------------------- P2P self-test
+// Copies patterns between GPUs with the production code paths (issueCopies on
+// the receiving GPU's stream, the gather kernel on the GPU --gather-on picks,
+// this thread's DeviceResources) and reads the whole destination buffer back:
+// copied ranges must hold the source GPU's bytes, everything else the poison
+// the buffer was filled with just before (a dropped or stray write shows).
+// Each GPU gets a source and a destination buffer of at most 4 MiB (smaller
+// ones are tried when that does not fit), freed when the test is done.
+constexpr uint64_t kSelfTestBytes[] = {4ull << 20, 2ull << 20, 1ull << 20};
+constexpr int kSelfTestIterations = 3;
+
+struct PathResult {
+    bool ran = false;
+    bool ok = true;
+    std::string detail;  // why not ok
+};
+
+struct DirectionResult {
+    int src = -1, dst = -1;
+    uint64_t bytes = 0;  // test buffer size used
+    std::string untested_reason;
+    PathResult ce, kernel;
+    int kernel_dev = -1;
+    uint64_t ce_bytes = 0, ce_us = 0;
+    bool tested() const { return ce.ran || kernel.ran; }
+    bool passed() const { return tested() && ce.ok && kernel.ok; }
+};
+
+struct TestBuffers {
+    char *src = nullptr;  // holds this GPU's pattern
+    char *dst = nullptr;  // receives copies from other GPUs
+    uint64_t bytes = 0;
+    std::string error;
+};
+
+bool allocTestBuffers(int dev, TestBuffers &b) {
+    for (uint64_t size : kSelfTestBytes) {
+        cudaError_t e = cudaSetDevice(dev);
+        if (e == cudaSuccess)
+            e = cudaMalloc(reinterpret_cast<void **>(&b.src), size);
+        if (e == cudaSuccess) {
+            e = cudaMalloc(reinterpret_cast<void **>(&b.dst), size);
+            if (e != cudaSuccess) {
+                cudaGetLastError();
+                cudaFree(b.src);
+            }
+        }
+        if (e == cudaSuccess) {
+            b.bytes = size;
+            return true;
+        }
+        if (isStickyCudaError(e)) dieOnStickyError(e, "P2P self-test alloc");
+        cudaGetLastError();
+        b.src = b.dst = nullptr;
+        b.error = std::string("cudaMalloc on gpu ") + std::to_string(dev) +
+                  ": " + cudaGetErrorString(e);
+    }
+    return false;
+}
+
+void freeTestBuffers(int dev, TestBuffers &b) {
+    if (!b.bytes) return;
+    cudaSetDevice(dev);
+    cudaFree(b.src);
+    cudaFree(b.dst);
+    cudaGetLastError();
+    b = TestBuffers();
+}
+
+// Upload |n| bytes to device memory and wait until the DMA has landed (a
+// pageable cudaMemcpy may return before it has).
+cudaError_t uploadSync(int dev, void *dst, const void *src, uint64_t n) {
+    cudaError_t e = cudaSetDevice(dev);
+    if (e == cudaSuccess) e = cudaMemcpy(dst, src, n, cudaMemcpyHostToDevice);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(cudaStreamLegacy);
+    return e;
+}
+
+// One pass: |plan| from |s| to |d| on |exec|'s stream through the gather
+// kernel or the copy engines, waited for. *unusable: the kernel has no image
+// for |exec| (production then uses the copy engines there).
+cudaError_t runSelfTestPass(int exec, bool kernel, char *s, char *d,
+                            const std::vector<TestCopy> &plan,
+                            uint64_t *elapsed_us, bool *unusable) {
+    *unusable = false;
+    DeviceResources *res = nullptr;
+    cudaError_t e = t_res.get(exec, &res);
+    if (e == cudaSuccess) e = cudaSetDevice(exec);
+    if (e != cudaSuccess) return e;
+    const uint64_t t0 = nowUs();
+    if (kernel) {
+        std::vector<GatherEntry> table;
+        table.reserve(plan.size());
+        for (const auto &c : plan)
+            table.push_back({reinterpret_cast<uint64_t>(d + c.dst_off),
+                             reinterpret_cast<uint64_t>(s + c.src_off), c.len});
+        e = t_res.reserve(exec, *res, table.size());
+        if (e != cudaSuccess) return e;
+        memcpy(res->host_table, table.data(),
+               table.size() * sizeof(GatherEntry));
+        e = cudaMemcpyAsync(res->dev_table, res->host_table,
+                            table.size() * sizeof(GatherEntry),
+                            cudaMemcpyHostToDevice, res->stream);
+        if (e == cudaSuccess)
+            e = launchGatherCopy(res->dev_table,
+                                 static_cast<uint32_t>(table.size()),
+                                 res->grid_blocks, res->stream);
+        if (e == cudaErrorNoKernelImageForDevice ||
+            e == cudaErrorInvalidDeviceFunction ||
+            e == cudaErrorUnsupportedPtxVersion) {
+            cudaGetLastError();
+            cudaStreamSynchronize(res->stream);
+            *unusable = true;
+            return cudaSuccess;
+        }
+    } else {
+        std::vector<void *> dsts, srcs;
+        std::vector<size_t> sizes;
+        for (const auto &c : plan) {
+            dsts.push_back(d + c.dst_off);
+            srcs.push_back(s + c.src_off);
+            sizes.push_back(c.len);
+        }
+        e = issueCopies(dsts, srcs, sizes, res->stream);
+    }
+    cudaError_t se = cudaStreamSynchronize(res->stream);
+    if (e == cudaSuccess) e = se;
+    *elapsed_us = nowUs() - t0;
+    return e;
+}
+
+// Tests the ordered pairs |dirs| (peer access enabled both ways): returns
+// one result per direction, in order.
+std::vector<DirectionResult> runSelfTests(
+    const std::vector<std::pair<int, int>> &dirs) {
+    std::vector<DirectionResult> results(dirs.size());
+    std::map<int, TestBuffers> bufs;
+    for (size_t i = 0; i < dirs.size(); ++i) {
+        results[i].src = dirs[i].first;
+        results[i].dst = dirs[i].second;
+        for (int dev : {dirs[i].first, dirs[i].second})
+            if (!bufs.count(dev)) allocTestBuffers(dev, bufs[dev]);
+    }
+    uint64_t max_bytes = 0;
+    for (size_t i = 0; i < dirs.size(); ++i) {
+        DirectionResult &r = results[i];
+        const TestBuffers &bs = bufs[r.src], &bd = bufs[r.dst];
+        if (!bs.bytes || !bd.bytes) {
+            r.untested_reason = !bs.bytes ? bs.error : bd.error;
+            continue;
+        }
+        r.bytes = std::min(bs.bytes, bd.bytes);
+        max_bytes = std::max(max_bytes, r.bytes);
+    }
+    const bool kernel_wanted = g_cfg.gather_threshold > 0;
+    std::map<int, std::vector<uint8_t>> src_img;  // per source GPU
+    for (const DirectionResult &r : results)
+        if (r.bytes) src_img[r.src].resize(bufs[r.src].bytes);
+    std::vector<uint8_t> poison(max_bytes), expect(max_bytes), got(max_bytes);
+    std::set<int> upload_failed;
+    auto fail = [](PathResult &p, std::string why) {
+        p.ran = true;
+        p.ok = false;
+        p.detail = std::move(why);
+    };
+    for (int iter = 0; iter < kSelfTestIterations && max_bytes; ++iter) {
+        // A different pattern per source GPU and iteration: a copy that
+        // read the wrong GPU or a stale buffer does not match.
+        for (auto &kv : src_img) {
+            fillPattern(kv.second.data(), kv.second.size(),
+                        mixSeed(g_epoch ^ (uint64_t(kv.first) << 48), iter));
+            cudaError_t e = uploadSync(kv.first, bufs[kv.first].src,
+                                       kv.second.data(), kv.second.size());
+            if (e != cudaSuccess) {
+                if (isStickyCudaError(e)) dieOnStickyError(e, "P2P self-test");
+                cudaGetLastError();
+                upload_failed.insert(kv.first);
+            }
+        }
+        for (int pass = 0; pass < 2; ++pass) {
+            const bool kernel = pass == 1;
+            if (kernel && !kernel_wanted) continue;
+            fillPattern(poison.data(), max_bytes,
+                        ~mixSeed(g_epoch, uint64_t(iter) * 2 + pass));
+            for (DirectionResult &r : results) {
+                PathResult &pr = kernel ? r.kernel : r.ce;
+                if (!r.bytes || !pr.ok) continue;  // first failure reported
+                const int exec =
+                    kernel ? (g_cfg.gather_on_src ? r.src : r.dst) : r.dst;
+                const int other = exec == r.src ? r.dst : r.src;
+                if (!g_peer[exec][other].load()) {
+                    fail(pr, "no peer access from gpu " + std::to_string(exec));
+                    continue;
+                }
+                if (kernel && g_kernel_unusable[exec].load()) continue;
+                if (upload_failed.count(r.src)) {
+                    fail(pr, "pattern upload failed");
+                    continue;
+                }
+                const std::vector<TestCopy> plan =
+                    selfTestPlan(r.bytes, static_cast<uint32_t>(iter), !kernel,
+                                 kernel_wanted ? g_cfg.gather_threshold : 0);
+                if (plan.empty()) continue;
+                uint64_t us = 0;
+                bool unusable = false;
+                cudaError_t e =
+                    uploadSync(r.dst, bufs[r.dst].dst, poison.data(), r.bytes);
+                if (e == cudaSuccess)
+                    e = runSelfTestPass(exec, kernel, bufs[r.src].src,
+                                        bufs[r.dst].dst, plan, &us, &unusable);
+                if (e == cudaSuccess && unusable) {
+                    g_kernel_unusable[exec] = true;
+                    LOGW(
+                        "gather kernel unavailable on gpu %d; small copies "
+                        "use the copy engines",
+                        exec);
+                    continue;
+                }
+                if (e == cudaSuccess) {
+                    e = cudaSetDevice(r.dst);
+                    if (e == cudaSuccess)
+                        e = cudaMemcpy(got.data(), bufs[r.dst].dst, r.bytes,
+                                       cudaMemcpyDeviceToHost);
+                }
+                if (e != cudaSuccess) {
+                    if (isStickyCudaError(e))
+                        dieOnStickyError(e, "P2P self-test");
+                    cudaGetLastError();
+                    fail(pr,
+                         std::string("CUDA error: ") + cudaGetErrorString(e));
+                    continue;
+                }
+                pr.ran = true;
+                if (kernel) r.kernel_dev = exec;
+                expectedImage(src_img[r.src].data(), poison.data(), r.bytes,
+                              plan, expect.data());
+                const Mismatch m =
+                    compareImages(expect.data(), got.data(), r.bytes);
+                if (m.any()) {
+                    uint64_t copied = 0;
+                    for (const auto &c : plan) copied += c.len;
+                    char why[224];
+                    snprintf(why, sizeof(why),
+                             "CORRUPT (iteration %d: %" PRIu64 " of %" PRIu64
+                             " bytes wrong, %" PRIu64
+                             " copied; first at +%#" PRIx64
+                             ": expected %#04x, read %#04x)",
+                             iter, m.bytes, r.bytes, copied, m.first,
+                             m.expected, m.actual);
+                    fail(pr, why);
+                } else if (!kernel) {
+                    for (const auto &c : plan) r.ce_bytes += c.len;
+                    r.ce_us += us;
+                }
+            }
+        }
+    }
+    for (auto &kv : bufs) freeTestBuffers(kv.first, kv.second);
+    for (DirectionResult &r : results)
+        if (r.bytes && !r.tested() && r.untested_reason.empty())
+            r.untested_reason = "no copy path could run";
+    return results;
+}
+
+std::string describeDirection(const DirectionResult &r) {
+    char head[160];
+    snprintf(head, sizeof(head), "gpu %d (%s) -> gpu %d (%s): ", r.src,
+             g_devices[r.src].pci.c_str(), r.dst, g_devices[r.dst].pci.c_str());
+    std::string out = head;
+    if (!r.tested()) return out + "untested (" + r.untested_reason + ")";
+    if (!r.ce.ran) {
+        out += "copy engines not tested";
+    } else if (r.ce.ok) {
+        char ce[96];
+        snprintf(ce, sizeof(ce),
+                 "copy engines OK (%d x %" PRIu64 " KiB, %.0f MB/s)",
+                 kSelfTestIterations, r.bytes >> 10,
+                 r.ce_us ? double(r.ce_bytes) / double(r.ce_us) : 0.0);
+        out += ce;
+    } else {
+        out += "copy engines " + r.ce.detail;
+    }
+    if (r.kernel.ran)
+        out += ", gather kernel on gpu " + std::to_string(r.kernel_dev) + " " +
+               (r.kernel.ok ? std::string("OK") : r.kernel.detail);
+    else
+        out += ", gather kernel not tested";
+    return out;
+}
+
+struct SelfTestCounts {
+    size_t passed = 0, failed = 0, untested = 0;  // ordered directions
+    size_t pairs_tested = 0, pairs_failed = 0;     // GPU pairs
+};
+
+// Tests both directions of every pair in |pairs| (unordered; peer access
+// already enabled) and applies --p2p-selftest. A pair is denied in both
+// directions when either direction failed or -- once |final| (engines are
+// registering on both GPUs), in enforce mode -- could not be tested; with
+// !|final| an untested pair stays undecided for a later test.
+SelfTestCounts selfTestPairs(const std::vector<std::pair<int, int>> &pairs,
+                             bool final) {
+    SelfTestCounts counts;
+    if (g_selftest == SelfTestMode::kOff || pairs.empty()) return counts;
+    std::vector<std::pair<int, int>> dirs;
+    for (const auto &p : pairs) {
+        dirs.push_back({p.first, p.second});
+        dirs.push_back({p.second, p.first});
+    }
+    const std::vector<DirectionResult> results = runSelfTests(dirs);
+    const bool enforce = g_selftest == SelfTestMode::kEnforce;
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        const DirectionResult &ab = results[2 * i], &ba = results[2 * i + 1];
+        const int a = pairs[i].first, b = pairs[i].second;
+        const bool failed =
+            (ab.tested() && !ab.passed()) || (ba.tested() && !ba.passed());
+        const bool untested = !ab.tested() || !ba.tested();
+        const bool deny = failed || (untested && final && enforce);
+        const char *verdict =
+            failed ? (enforce ? "DENIED"
+                              : "would be denied (warn mode: still used)")
+            : untested
+                ? (final ? (enforce ? "DENIED (untested)"
+                                    : "untested (warn mode: still used)")
+                         : "untested; tested again when engines register on "
+                           "both GPUs")
+                : "allowed";
+        for (const DirectionResult *r : {&ab, &ba}) {
+            const std::string line = describeDirection(*r);
+            if (failed || untested)
+                LOGW("P2P self-test %s -> %s", line.c_str(), verdict);
+            else
+                LOGI("P2P self-test %s -> %s", line.c_str(), verdict);
+            if (r->tested())
+                (r->passed() ? counts.passed : counts.failed)++;
+            else
+                counts.untested++;
+        }
+        if (!untested || failed) {
+            counts.pairs_tested++;
+            if (failed) counts.pairs_failed++;
+        }
+        const uint8_t state = failed      ? kTestFailed
+                              : !untested ? kTestPassed
+                              : final     ? kTestDecided
+                                          : kNotTested;
+        g_test_state[a][b] = state;
+        g_test_state[b][a] = state;
+        if (deny && enforce)
+            g_policy.denyPair(
+                a, b,
+                failed ? PeerPolicy::kSelfTestFailed : PeerPolicy::kUntested);
+    }
+    return counts;
 }
 
 bool enablePeer(int dst, int src) {
@@ -1130,6 +1563,7 @@ bool ensureDevice(int dev) {
     }
     int peers = 0;
     std::string list;
+    std::vector<int> to_test;
     for (size_t o = 0; o < g_devices.size(); ++o) {
         int other = static_cast<int>(o);
         if (other == dev || !g_dev_ready[other].load()) continue;
@@ -1139,11 +1573,118 @@ bool ensureDevice(int dev) {
             ++peers;
             list += " " + std::to_string(other);
         }
+        if (a || b) to_test.push_back(other);
     }
-    g_dev_ready[dev].store(true, std::memory_order_release);
     LOGI("gpu %d initialized; peer access with %d gpu(s):%s", dev, peers,
          list.empty() ? " none yet" : list.c_str());
+    // Pairs the startup self-test left undecided, tested before |dev| is
+    // ready: no copy can involve |dev| until then (registrations on it wait
+    // for this function).
+    std::vector<std::pair<int, int>> pairs;
+    for (int other : to_test) {
+        if (g_policy.denied(other, dev) && g_policy.denied(dev, other))
+            continue;
+        if (g_test_state[other][dev] == kNotTested ||
+            g_test_state[dev][other] == kNotTested)
+            pairs.push_back({other, dev});
+    }
+    selfTestPairs(pairs, /*final=*/true);
+    g_dev_ready[dev].store(true, std::memory_order_release);
     return true;
+}
+
+// Startup P2P self-test of every pair of visible GPUs (compute mode Default):
+// creates the contexts (in parallel), enables peer access, tests, logs a
+// node verdict and releases the contexts again, so GPUs without engines keep
+// no daemon context (unless --eager-init recreates them afterwards). Runs
+// before the socket is opened.
+void startupSelfTest(bool at_start) {
+    if (g_selftest == SelfTestMode::kOff) {
+        LOGW(
+            "P2P self-test off (--p2p-selftest=off): peer copies are trusted "
+            "without verification");
+        return;
+    }
+    if (!at_start) {
+        LOGI(
+            "P2P self-test (%s) runs when engines first register on both "
+            "GPUs of a pair (--no-startup-selftest)",
+            selfTestModeName(g_selftest));
+        return;
+    }
+    const uint64_t t0 = nowUs();
+    const int n = static_cast<int>(g_devices.size());
+    std::vector<int> ok(n, 0);
+    {
+        std::vector<std::thread> threads;
+        for (int d = 0; d < n; ++d) {
+            if (g_devices[d].exclusive) continue;
+            threads.emplace_back([d, &ok]() {
+                cudaError_t e = cudaSetDevice(d);
+                if (e == cudaSuccess) e = cudaFree(nullptr);
+                if (e == cudaSuccess) {
+                    ok[d] = 1;
+                } else {
+                    cudaGetLastError();
+                    LOGW(
+                        "P2P self-test: no context on gpu %d (%s): %s; its "
+                        "pairs are tested when engines register on it",
+                        d, g_devices[d].pci.c_str(), cudaGetErrorString(e));
+                }
+            });
+        }
+        for (auto &t : threads) t.join();
+    }
+    std::vector<std::pair<int, int>> pairs;
+    size_t skipped = 0;
+    for (int a = 0; a < n; ++a) {
+        for (int b = a + 1; b < n; ++b) {
+            if (!ok[a] || !ok[b]) continue;
+            if (g_policy.denied(a, b) && g_policy.denied(b, a)) {
+                ++skipped;
+                continue;
+            }
+            const bool ab = enablePeer(a, b), ba = enablePeer(b, a);
+            if (ab && ba) pairs.push_back({a, b});
+        }
+    }
+    SelfTestCounts counts;
+    // In its own thread: its DeviceResources (streams, tables) are released
+    // when it ends, before the contexts are.
+    std::thread worker([&]() { counts = selfTestPairs(pairs, false); });
+    worker.join();
+    for (int d = 0; d < n; ++d) {
+        if (!ok[d]) continue;
+        cudaSetDevice(d);
+        cudaDeviceReset();
+        cudaGetLastError();
+        for (int o = 0; o < kMaxDevices; ++o) {
+            g_peer[d][o] = false;
+            g_peer[o][d] = false;
+        }
+    }
+    const double secs = (nowUs() - t0) / 1e6;
+    LOGI(
+        "P2P self-test (%s) of %d GPU(s) took %.1f s: %zu ordered pair(s) "
+        "passed, %zu failed, %zu untested, %zu pair(s) denied by the command "
+        "line",
+        selfTestModeName(g_selftest), n, secs, counts.passed, counts.failed,
+        counts.untested, skipped);
+    if (counts.pairs_tested && counts.pairs_failed == counts.pairs_tested) {
+        LOGW(
+            "P2P unusable on this node: %zu/%zu GPU pairs failed the "
+            "self-test (%zu/%zu directions); %s",
+            counts.pairs_failed, counts.pairs_tested, counts.failed,
+            counts.passed + counts.failed,
+            g_selftest == SelfTestMode::kEnforce
+                ? "every copy between two GPUs is refused and the engines "
+                  "use their base transport"
+                : "warn mode: they are still used");
+    } else if (counts.pairs_failed) {
+        LOGW("P2P self-test: %zu/%zu GPU pairs failed; denied: %s",
+             counts.pairs_failed, counts.pairs_tested,
+             g_policy.deniedList(g_pci_short).c_str());
+    }
 }
 
 std::string g_socket_path;
@@ -1248,13 +1789,34 @@ void usage(const char *argv0) {
         "  --drain-timeout-ms <ms> on SIGTERM/SIGINT, wait up to this long "
         "for\n"
         "                          running copies to finish (default 10000)\n"
+        "  --p2p-selftest <mode>   before serving copies between two GPUs, "
+        "copy\n"
+        "                          known patterns between them in both\n"
+        "                          directions (copy engines and gather "
+        "kernel)\n"
+        "                          and verify every byte; at start for every\n"
+        "                          pair, and again when engines register for\n"
+        "                          pairs that could not be tested then.\n"
+        "                          enforce (default): deny a pair that fails\n"
+        "                          or cannot be tested; warn: log only; off\n"
+        "  --no-startup-selftest   skip the start-up test (it briefly creates\n"
+        "                          a context and two 4 MiB buffers on every\n"
+        "                          GPU); pairs are then tested when engines\n"
+        "                          first register on both of their GPUs\n"
+        "  --deny-peer <bus id>    deny every pair with this GPU (PCI bus id,\n"
+        "                          e.g. 0000:3b:00.0); repeatable\n"
+        "  --deny-pair <a>,<b>     deny the pair of these two GPUs; "
+        "repeatable\n"
+        "                          Copies between the GPUs of a denied pair\n"
+        "                          are refused (no P2P) and the engines use\n"
+        "                          their base transport for them.\n"
         "  --eager-init            create a CUDA context on every visible GPU\n"
         "                          and enable peer access for all pairs at\n"
         "                          start; by default a GPU is initialized "
         "when\n"
         "                          the first block on it is registered, so\n"
-        "                          GPUs without Mooncake engines are "
-        "untouched\n"
+        "                          GPUs without Mooncake engines keep no\n"
+        "                          daemon context after the start-up test\n"
         "                          (CUDA_VISIBLE_DEVICES also limits the set)\n"
         "  -h, --help              show this help\n"
         "\n"
@@ -1262,7 +1824,8 @@ void usage(const char *argv0) {
         "copy_requests, copy_entries, copy_bytes, copy_failures, avg/max\n"
         "copy latency in microseconds (split into avg_plan_us and\n"
         "avg_exec_us), coalesced_entries, kernel_entries/bytes and\n"
-        "ce_entries/bytes (copy engines), handle_opens.\n",
+        "ce_entries/bytes (copy engines), handle_opens, p2p_selftest,\n"
+        "denied_pairs (count and src>dst bus ids), denied_copy_requests.\n",
         argv0);
 }
 
@@ -1274,6 +1837,8 @@ int main(int argc, char **argv) {
     int stats_interval = 60;
     bool do_stats = false, do_ping = false, eager = false;
     int drain_timeout_ms = 10000;
+    std::vector<std::string> deny_peers, deny_pairs;
+    bool startup_selftest = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto need = [&](const char *name) -> const char * {
@@ -1310,6 +1875,43 @@ int main(int argc, char **argv) {
             g_cfg.gather_on_src = (v == "src");
         } else if (a == "--no-coalesce") {
             g_cfg.coalesce = false;
+        } else if (a == "--no-startup-selftest") {
+            startup_selftest = false;
+        } else if (a == "--p2p-selftest" ||
+                   a.rfind("--p2p-selftest=", 0) == 0) {
+            std::string v =
+                a == "--p2p-selftest" ? need("--p2p-selftest") : a.substr(15);
+            if (!parseSelfTestMode(v, g_selftest)) {
+                fprintf(stderr,
+                        "--p2p-selftest must be enforce, warn or off\n");
+                return 2;
+            }
+        } else if (a == "--deny-peer" || a.rfind("--deny-peer=", 0) == 0) {
+            std::string v =
+                a == "--deny-peer" ? need("--deny-peer") : a.substr(12);
+            PciAddr addr;
+            if (!parsePciAddr(v, addr)) {
+                fprintf(stderr,
+                        "--deny-peer: %s is not a PCI bus id "
+                        "([domain:]bus:device[.function])\n",
+                        v.c_str());
+                return 2;
+            }
+            deny_peers.push_back(v);
+        } else if (a == "--deny-pair" || a.rfind("--deny-pair=", 0) == 0) {
+            std::string v =
+                a == "--deny-pair" ? need("--deny-pair") : a.substr(12);
+            const size_t comma = v.find(',');
+            PciAddr x, y;
+            if (comma == std::string::npos ||
+                !parsePciAddr(v.substr(0, comma), x) ||
+                !parsePciAddr(v.substr(comma + 1), y)) {
+                fprintf(stderr,
+                        "--deny-pair: expected <bus id>,<bus id>, got %s\n",
+                        v.c_str());
+                return 2;
+            }
+            deny_pairs.push_back(v);
         } else if (a == "--drain-timeout-ms") {
             drain_timeout_ms = atoi(need("--drain-timeout-ms"));
         } else if (a == "-h" || a == "--help") {
@@ -1348,12 +1950,46 @@ int main(int argc, char **argv) {
          g_cfg.gather_on_src ? "sending" : "receiving",
          g_cfg.coalesce ? "on" : "off");
     if (!initDevices()) return 1;
-    if (eager) {
-        for (size_t i = 0; i < g_devices.size(); ++i) {
-            if (!ensureDevice(static_cast<int>(i))) return 1;
+    // Command-line denials, by PCI bus id (a DaemonSet may name GPUs that
+    // some nodes do not have: those are ignored with a warning).
+    auto findBus = [](const std::string &v) -> int {
+        PciAddr addr;
+        if (!parsePciAddr(v, addr)) return -1;
+        for (const Device &d : g_devices)
+            if (d.addr == addr) return d.ordinal;
+        return -1;
+    };
+    for (const std::string &v : deny_peers) {
+        const int d = findBus(v);
+        if (d < 0) {
+            LOGW("--deny-peer %s: no such GPU visible to the daemon; ignored",
+                 v.c_str());
+            continue;
         }
+        g_policy.denyDevice(d, PeerPolicy::kStatic);
+        LOGI(
+            "--deny-peer %s: P2P between gpu %d (%s) and every other GPU is "
+            "denied",
+            v.c_str(), d, g_devices[d].pci.c_str());
     }
-
+    for (const std::string &v : deny_pairs) {
+        const size_t comma = v.find(',');
+        const int x = findBus(v.substr(0, comma));
+        const int y = findBus(v.substr(comma + 1));
+        if (x < 0 || y < 0 || x == y) {
+            LOGW(
+                "--deny-pair %s: not two different GPUs visible to the "
+                "daemon; ignored",
+                v.c_str());
+            continue;
+        }
+        g_policy.denyPair(x, y, PeerPolicy::kStatic);
+        LOGI(
+            "--deny-pair %s: P2P between gpu %d (%s) and gpu %d (%s) is "
+            "denied",
+            v.c_str(), x, g_devices[x].pci.c_str(), y,
+            g_devices[y].pci.c_str());
+    }
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     if (socket_path.size() >= sizeof(addr.sun_path)) {
@@ -1375,6 +2011,12 @@ int main(int argc, char **argv) {
             return 2;
         }
         unlink(socket_path.c_str());  // stale socket of a previous run
+    }
+    startupSelfTest(startup_selftest);
+    if (eager) {
+        for (size_t i = 0; i < g_devices.size(); ++i) {
+            if (!ensureDevice(static_cast<int>(i))) return 1;
+        }
     }
     int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (lfd < 0 ||
