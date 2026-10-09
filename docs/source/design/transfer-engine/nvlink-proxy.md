@@ -132,45 +132,62 @@ together with the exact address range in which that set is unchanged.
 
 Some platforms report peer access between two GPUs (`cudaDeviceCanAccessPeer`,
 `nvidia-smi topo -p2p`) and complete peer copies without any error, yet the
-data never arrives or arrives corrupted. The daemon therefore verifies every
-GPU pair before it serves copies between them:
+data never arrives or arrives corrupted. The daemon therefore verifies a GPU
+pair before it serves copies between them.
 
-- At start it creates a context on every visible GPU in compute mode Default,
-  enables peer access and, for both directions of every pair, copies patterns
-  with the production code paths -- `cudaMemcpyBatchAsync` on the receiving
-  GPU's stream (entries from the gather threshold up to 2 MiB, whole 2 KiB rows,
-  odd lengths, misaligned offsets) and the gather kernel on the GPU
-  `--gather-on` selects (single 2 KiB rows, small and byte-misaligned
-  entries) -- three iterations each. The destination buffer is filled with a
-  different poison before every pass and read back in full: copied ranges
-  must hold the source GPU's bytes and everything else the poison, so dropped,
-  corrupted and stray writes all fail the pair. Each GPU gets two buffers of at
-  most 4 MiB (smaller sizes are tried when that does not fit); buffers and
-  contexts are released afterwards, so GPUs without engines keep no daemon
-  context. `--no-startup-selftest` skips this step.
-- Pairs that could not be tested at start (no context or no memory on a GPU
-  then) are tested when engines first register on both GPUs, before any copy
-  between them is served.
-- `--p2p-selftest=enforce` (default) denies a pair that fails in either
-  direction or cannot be tested; `warn` only logs; `off` skips the test.
+- The test never runs inside the daemon: the daemon re-executes its own binary
+  in a child process (`posix_spawn`, nothing CUDA is forked) for the pairs to
+  test and reads one verdict per direction from a pipe. A child that makes no
+  progress for `--p2p-selftest-timeout` seconds (default 30) is killed. A pair
+  the child was testing when it died (for instance on an unrecoverable CUDA
+  error) or hung is failed; pairs it had not reached are tested by a new
+  child. The daemon keeps serving throughout.
+- For both directions of a pair the child copies patterns with the production
+  code paths -- `cudaMemcpyBatchAsync` on the receiving GPU's stream (an entry
+  of at least the gather threshold, whole 2 KiB rows, small and odd lengths,
+  misaligned offsets, runs of up to 2 MiB) and the gather kernel on the GPU
+  `--gather-on` selects (single 2 KiB rows, small and byte-misaligned entries)
+  -- three iterations each. The destination buffer is filled with a different
+  poison before every pass and read back in full: copied ranges must hold the
+  source GPU's bytes and everything else the poison, so dropped, corrupted and
+  stray writes are all caught. Each tested GPU gets two buffers of up to
+  4 MiB (more if the gather threshold needs it; smaller sizes are tried when
+  memory is short).
+- Only a data mismatch (or the child dying or hanging on the pair) fails a
+  pair. A test that could not run (no memory, a CUDA error, a failed pattern
+  upload) leaves the pair untested; it is tested again at the next
+  registration on either GPU. A direction without peer access is not judged:
+  its copies are refused as no-P2P anyway.
+- When it runs: when an engine registers its first block on a GPU, the
+  GPU's pairs with the other GPUs that engines use are tested in the
+  background unless they already passed or failed. By default every pair of
+  GPUs in compute mode Default is also tested right after the socket is up
+  (a node audit); `--no-startup-selftest` skips that, so GPUs without engines
+  are never touched -- recommended in production.
+- `--p2p-selftest=enforce` (default): a pair is refused from the moment it is
+  requested until its test passes, for good if it failed; while it is
+  untested it stays refused. `warn` only logs; `off` skips the test.
 - `--deny-peer <bus id>` (repeatable) denies every pair with that GPU and
   `--deny-pair <bus id>,<bus id>` one pair, without testing. Bus ids not
   present on the node are ignored with a warning.
 
 A copy between the GPUs of a denied pair is refused with `kNoPeerAccess`
-before anything is mapped; the engine moves the request to its base transport
-(counted under `fallback_requests` / `daemon_error`). A copy within one GPU is
-never denied.
+while its entries are resolved, before anything is merged or mapped; the
+engine moves the request to its base transport (counted under
+`fallback_requests` / `daemon_error`). A copy within one GPU is never denied.
 
-The daemon logs one line per tested direction, e.g.
+The child logs one line per direction and the daemon one verdict per pair,
+e.g.
 
 ```
-P2P self-test gpu 0 (0000:1a:00) -> gpu 1 (0000:3d:00): copy engines OK (3 x 4096 KiB, 21000 MB/s), gather kernel on gpu 1 OK -> allowed
-P2P self-test gpu 2 (0000:5e:00) -> gpu 3 (0000:b1:00): copy engines CORRUPT (iteration 0: ... bytes wrong ...) ... -> DENIED
+P2P self-test gpu 0 (0000:1a:00) -> gpu 1 (0000:3d:00): copy engines OK (3 x 4096 KiB, 21000 MB/s), gather kernel on gpu 1 OK: PASS
+P2P self-test gpu 0 (0000:1a:00) <-> gpu 1 (0000:3d:00): passed -> allowed
+P2P self-test gpu 2 (0000:5e:00) -> gpu 3 (0000:b1:00): copy engines CORRUPT (iteration 0: ... bytes wrong ...), ...: FAIL
+P2P self-test gpu 2 (0000:5e:00) <-> gpu 3 (0000:b1:00): FAILED -> DENIED, copies between them use the engines' base transport
 ```
 
-and a summary; when every tested pair failed it says so plainly:
-`P2P unusable on this node: N/N ordered pairs failed the self-test; ...`.
+followed by a summary per batch and, when every pair tested so far failed,
+`P2P unusable on this node: N/N GPU pairs tested so far failed the self-test`.
 
 ## Counters
 
@@ -203,8 +220,10 @@ registrations, copy requests / entries / bytes / failures, average and maximum
 copy latency split into `avg_plan_us` (validation, merging, mapping) and
 `avg_exec_us` (GPU work), `coalesced_entries`, `kernel_entries/bytes` and
 `ce_entries/bytes` (copy engines), IPC handle opens, the self-test mode,
-`denied_pairs` (count and `src>dst` bus ids) and `denied_copy_requests`
-(copies refused because their pair is denied; not counted as failures).
+`denied_pairs` (the number of denied ordered `src>dst` directions -- a denied
+GPU pair counts twice -- followed by their bus ids) and
+`denied_copy_requests` (copies refused because their pair is denied; not
+counted as failures).
 
 ## Wire protocol
 
