@@ -37,6 +37,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mooncake {
@@ -164,7 +165,7 @@ class PeerPolicy {
         kAllowed = 0,
         kStatic = 1,          // --deny-peer / --deny-pair
         kSelfTestFailed = 2,  // the self-test read back corrupt data
-        kUntested = 3,        // the self-test could not run (enforce mode)
+        kUntested = 3,        // not (yet) verified by a self-test (enforce)
     };
 
     explicit PeerPolicy(int num_devices = 0) { reset(num_devices); }
@@ -176,6 +177,21 @@ class PeerPolicy {
     }
 
     int numDevices() const { return n_; }
+
+    // Sets the state of a direction (kAllowed clears it). A denial from the
+    // command line (kStatic) is never overridden.
+    void set(int src, int dst, Reason reason) {
+        if (!valid(src, dst) || src == dst) return;
+        std::atomic<uint8_t> &e = m_[index(src, dst)];
+        uint8_t cur = e.load();
+        while (cur != kStatic && !e.compare_exchange_weak(cur, reason)) {
+        }
+    }
+
+    void setPair(int a, int b, Reason reason) {
+        set(a, b, reason);
+        set(b, a, reason);
+    }
 
     // Keeps the first reason a pair was denied for.
     void deny(int src, int dst, Reason reason) {
@@ -236,7 +252,7 @@ class PeerPolicy {
             case kSelfTestFailed:
                 return "P2P self-test failed";
             case kUntested:
-                return "P2P self-test could not run";
+                return "not verified by the P2P self-test (yet)";
         }
         return "?";
     }
@@ -292,15 +308,21 @@ inline std::vector<TestCopy> selfTestPlan(uint64_t buf_bytes, uint32_t iter,
     if (large) {
         const uint64_t min_len =
             std::max<uint64_t>((gather_threshold + row - 1) / row * row, row);
-        // Smallest first, so that small buffers still get the misaligned
-        // odd-length entry.
-        for (uint64_t len : {min_len, min_len + 1000, min_len + row,
-                             std::max(min_len, 356 * row) + 7 * row,
-                             std::max(min_len, 1024 * row) + 3 * row}) {
-            if (len >= gather_threshold) lens.push_back(len);
-        }
-        src_mis = {0, 16, 2 * row, 0, 0};
-        dst_mis = {0, 3, row, 0, 0};
+        // First an entry of at least the gather threshold (it always fits a
+        // buffer of selfTestMinBufferBytes()), then small entries (the copy
+        // engines take those too when the kernel is unusable or disabled),
+        // then a misaligned odd length and longer runs as they fit.
+        lens = {min_len,
+                row,
+                1000,
+                3 * row + 16,
+                8192,
+                min_len + 1000,
+                min_len + row,
+                std::max(min_len, 356 * row) + 7 * row,
+                std::max(min_len, 1024 * row) + 3 * row};
+        src_mis = {0, 0, 16, 1, 0, 16, 2 * row, 0, 0};
+        dst_mis = {0, 0, 3, 0, 0, 3, row, 0, 0};
     } else {
         for (int k = 0; k < 12; ++k) lens.push_back(row);
         for (uint64_t len : {3 * row + 16, uint64_t(8192), uint64_t(1000),
@@ -334,6 +356,17 @@ inline std::vector<TestCopy> selfTestPlan(uint64_t buf_bytes, uint32_t iter,
         cursor = (dst_off + len + guard + row - 1) / row * row;
     }
     return plan;
+}
+
+// Smallest test buffer whose copy-engine plan still holds its first entry,
+// one of at least |gather_threshold| bytes, in every iteration.
+inline uint64_t selfTestMinBufferBytes(uint64_t gather_threshold) {
+    const uint64_t row = kSelfTestRowBytes;
+    const uint64_t min_len =
+        std::max<uint64_t>((gather_threshold + row - 1) / row * row, row);
+    const uint64_t need = min_len + 3 * row + 3 * 4096;  // shift and guards
+    const uint64_t align = 64 * 1024;
+    return std::max<uint64_t>((need + align - 1) / align * align, 1ull << 20);
 }
 
 // Deterministic pattern: one splitmix64 word per 8 bytes (|n| need not be a
@@ -387,6 +420,121 @@ inline Mismatch compareImages(const uint8_t *expected, const uint8_t *actual,
         i += chunk;
     }
     return m;
+}
+
+// ------------------------------------------------------------- verdicts
+// Outcome of testing one direction (data flows src -> dst). Only a data
+// mismatch is evidence against a pair; anything that kept the test from
+// running (no memory, a CUDA error, ...) leaves it untested. A direction
+// without peer access is not judged: its copies are refused as no-P2P.
+enum class DirVerdict { kPass, kFail, kUntested, kNoPeer };
+
+inline const char *dirVerdictName(DirVerdict v) {
+    switch (v) {
+        case DirVerdict::kPass:
+            return "PASS";
+        case DirVerdict::kFail:
+            return "FAIL";
+        case DirVerdict::kUntested:
+            return "UNTESTED";
+        case DirVerdict::kNoPeer:
+            return "NOPEER";
+    }
+    return "?";
+}
+
+inline bool parseDirVerdict(const std::string &s, DirVerdict &out) {
+    for (DirVerdict v : {DirVerdict::kPass, DirVerdict::kFail,
+                         DirVerdict::kUntested, DirVerdict::kNoPeer}) {
+        if (s == dirVerdictName(v)) {
+            out = v;
+            return true;
+        }
+    }
+    return false;
+}
+
+enum class PairVerdict { kPassed, kFailed, kUntested };
+
+// A pair fails when either direction read back wrong data; otherwise it is
+// untested while a direction with peer access could not be tested.
+inline PairVerdict combineVerdicts(DirVerdict ab, DirVerdict ba) {
+    if (ab == DirVerdict::kFail || ba == DirVerdict::kFail)
+        return PairVerdict::kFailed;
+    if (ab == DirVerdict::kUntested || ba == DirVerdict::kUntested)
+        return PairVerdict::kUntested;
+    return PairVerdict::kPassed;
+}
+
+// ------------------------------------------- self-test child process wire
+// The daemon tests pairs in a child process (the same binary, re-executed)
+// that reports on its stdout, one line each:
+//   BEGIN <bus a> <bus b>      testing of the pair started
+//   DIR <bus src> <bus dst> <PASS|FAIL|UNTESTED|NOPEER>
+//   END <bus a> <bus b>        both directions reported
+// A pair with BEGIN but no END when the child died or hung is failed.
+using PciPair = std::pair<PciAddr, PciAddr>;
+
+// "<bus a>+<bus b>,..." (the child's --p2p-selftest-pairs argument).
+inline std::string encodePciPairs(const std::vector<PciPair> &pairs) {
+    std::string out;
+    for (const auto &p : pairs) {
+        if (!out.empty()) out += ',';
+        out += formatPciAddr(p.first) + "+" + formatPciAddr(p.second);
+    }
+    return out;
+}
+
+inline bool parsePciPairs(const std::string &s, std::vector<PciPair> &out) {
+    out.clear();
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t comma = s.find(',', start);
+        std::string item = s.substr(start, comma - start);
+        size_t plus = item.find('+');
+        PciPair p;
+        if (plus == std::string::npos ||
+            !parsePciAddr(item.substr(0, plus), p.first) ||
+            !parsePciAddr(item.substr(plus + 1), p.second))
+            return false;
+        out.push_back(p);
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return !out.empty();
+}
+
+struct ChildLine {
+    enum Kind { kInvalid, kBegin, kDir, kEnd } kind = kInvalid;
+    PciAddr a, b;
+    DirVerdict verdict = DirVerdict::kUntested;
+};
+
+inline ChildLine parseChildLine(const std::string &line) {
+    ChildLine out;
+    std::vector<std::string> f;
+    size_t i = 0;
+    while (i < line.size()) {
+        while (i < line.size() && line[i] == ' ') ++i;
+        size_t j = line.find(' ', i);
+        if (j == std::string::npos) j = line.size();
+        if (j > i) f.push_back(line.substr(i, j - i));
+        i = j;
+    }
+    if (f.size() < 3 || !parsePciAddr(f[1], out.a) ||
+        !parsePciAddr(f[2], out.b))
+        return ChildLine();
+    if (f[0] == "BEGIN" && f.size() == 3) {
+        out.kind = ChildLine::kBegin;
+    } else if (f[0] == "END" && f.size() == 3) {
+        out.kind = ChildLine::kEnd;
+    } else if (f[0] == "DIR" && f.size() == 4 &&
+               parseDirVerdict(f[3], out.verdict)) {
+        out.kind = ChildLine::kDir;
+    } else {
+        return ChildLine();
+    }
+    return out;
 }
 
 }  // namespace nvlink_proxy

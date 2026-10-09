@@ -112,10 +112,9 @@ void checkPlan(const std::vector<TestCopy> &plan, uint64_t buf, bool large,
         EXPECT_GT(c.len, 0u);
         EXPECT_LE(c.src_off + c.len, buf);
         EXPECT_LE(c.dst_off + c.len, buf);
-        if (large)
-            EXPECT_GE(c.len, threshold);
-        else
+        if (!large) {
             EXPECT_LT(c.len, threshold);
+        }
         dst.push_back({c.dst_off, c.dst_off + c.len});
     }
     std::sort(dst.begin(), dst.end());
@@ -124,6 +123,10 @@ void checkPlan(const std::vector<TestCopy> &plan, uint64_t buf, bool large,
         EXPECT_GT(dst[i].first, dst[i - 1].second)
             << "destination ranges must not touch";
     EXPECT_LT(dst.back().second, buf);  // and after the last one
+    if (large) {
+        // The first copy-engine entry reaches the gather threshold.
+        EXPECT_GE(plan.front().len, std::max<uint64_t>(threshold, 1));
+    }
 }
 }  // namespace
 
@@ -161,6 +164,26 @@ TEST(NvlinkProxyPolicy, SelfTestPlans) {
     auto p1 = selfTestPlan(4ull << 20, 1, true, thr);
     ASSERT_EQ(p0.size(), p1.size());
     EXPECT_NE(p0[0].dst_off, p1[0].dst_off);
+    // Copy-engine plans also carry entries below the threshold (what the
+    // copy engines get when the kernel is unusable).
+    EXPECT_TRUE(std::any_of(big.begin(), big.end(),
+                            [&](const TestCopy &c) { return c.len < thr; }));
+    // Whatever the threshold, a buffer of selfTestMinBufferBytes() holds an
+    // entry of at least the threshold in every iteration.
+    for (uint64_t t : {uint64_t(0), uint64_t(1), uint64_t(128 * 1024),
+                       uint64_t(3 << 20), uint64_t(9 << 20) + 5}) {
+        const uint64_t buf = selfTestMinBufferBytes(t);
+        EXPECT_GE(buf, 1u << 20);
+        EXPECT_EQ(buf % (64 * 1024), 0u);
+        for (uint32_t iter = 0; iter < 4; ++iter) {
+            SCOPED_TRACE(testing::Message()
+                         << "threshold " << t << " " << iter);
+            auto p = selfTestPlan(buf, iter, true, t);
+            ASSERT_FALSE(p.empty());
+            EXPECT_GE(p.front().len, t);
+            checkPlan(p, buf, true, t);
+        }
+    }
     // A threshold of 0 (copy engines only) leaves nothing for the kernel and
     // gives the copy engines small entries too.
     EXPECT_TRUE(selfTestPlan(4ull << 20, 0, false, 0).empty());
@@ -213,4 +236,73 @@ TEST(NvlinkProxyPolicy, VerifierCatchesCorruptDroppedAndStrayWrites) {
     EXPECT_NE(a, b);
     EXPECT_TRUE(
         std::any_of(a.begin() + 8, a.end(), [](uint8_t v) { return v != 0; }));
+}
+
+TEST(NvlinkProxyPolicy, SetOverridesAllButCommandLineDenials) {
+    PeerPolicy p(3);
+    p.setPair(0, 1, PeerPolicy::kUntested);  // requested, not verified yet
+    EXPECT_TRUE(p.denied(0, 1) && p.denied(1, 0));
+    p.setPair(0, 1, PeerPolicy::kAllowed);  // the test passed
+    EXPECT_FALSE(p.denied(0, 1) || p.denied(1, 0));
+    p.setPair(0, 1, PeerPolicy::kSelfTestFailed);
+    EXPECT_EQ(p.reason(1, 0), PeerPolicy::kSelfTestFailed);
+    p.denyPair(1, 2, PeerPolicy::kStatic);
+    p.setPair(1, 2, PeerPolicy::kAllowed);  // never lifts --deny-*
+    EXPECT_EQ(p.reason(1, 2), PeerPolicy::kStatic);
+    EXPECT_EQ(p.reason(2, 1), PeerPolicy::kStatic);
+}
+
+TEST(NvlinkProxyPolicy, Verdicts) {
+    using V = DirVerdict;
+    for (V v : {V::kPass, V::kFail, V::kUntested, V::kNoPeer}) {
+        V back = V::kPass;
+        ASSERT_TRUE(parseDirVerdict(dirVerdictName(v), back));
+        EXPECT_EQ(back, v);
+    }
+    V x;
+    EXPECT_FALSE(parseDirVerdict("pass", x));
+    EXPECT_EQ(combineVerdicts(V::kPass, V::kPass), PairVerdict::kPassed);
+    // No peer access in one direction is not judged.
+    EXPECT_EQ(combineVerdicts(V::kPass, V::kNoPeer), PairVerdict::kPassed);
+    EXPECT_EQ(combineVerdicts(V::kNoPeer, V::kNoPeer), PairVerdict::kPassed);
+    // Only data evidence fails a pair.
+    EXPECT_EQ(combineVerdicts(V::kUntested, V::kPass), PairVerdict::kUntested);
+    EXPECT_EQ(combineVerdicts(V::kNoPeer, V::kUntested),
+              PairVerdict::kUntested);
+    EXPECT_EQ(combineVerdicts(V::kUntested, V::kFail), PairVerdict::kFailed);
+    EXPECT_EQ(combineVerdicts(V::kFail, V::kNoPeer), PairVerdict::kFailed);
+}
+
+TEST(NvlinkProxyPolicy, ChildWire) {
+    PciAddr a, b, c;
+    ASSERT_TRUE(parsePciAddr("0000:3b:00", a));
+    ASSERT_TRUE(parsePciAddr("0000:5e:00", b));
+    ASSERT_TRUE(parsePciAddr("0001:d8:00", c));
+    const std::vector<PciPair> pairs = {{a, b}, {b, c}};
+    const std::string arg = encodePciPairs(pairs);
+    EXPECT_EQ(arg, "0000:3b:00+0000:5e:00,0000:5e:00+0001:d8:00");
+    std::vector<PciPair> back;
+    ASSERT_TRUE(parsePciPairs(arg, back));
+    ASSERT_EQ(back.size(), 2u);
+    EXPECT_TRUE(back[1].first == b && back[1].second == c);
+    for (const char *bad :
+         {"", "0000:3b:00", "0000:3b:00+", "a+b", "0000:3b:00+0000:5e:00,"}) {
+        EXPECT_FALSE(parsePciPairs(bad, back)) << bad;
+    }
+
+    ChildLine l = parseChildLine("BEGIN 0000:3b:00 0000:5e:00");
+    EXPECT_EQ(l.kind, ChildLine::kBegin);
+    EXPECT_TRUE(l.a == a && l.b == b);
+    l = parseChildLine("DIR 0000:5e:00 0000:3b:00 FAIL");
+    EXPECT_EQ(l.kind, ChildLine::kDir);
+    EXPECT_TRUE(l.a == b && l.b == a);
+    EXPECT_EQ(l.verdict, DirVerdict::kFail);
+    EXPECT_EQ(parseChildLine("END 0000:3b:00 0000:5e:00").kind,
+              ChildLine::kEnd);
+    for (const char *bad :
+         {"", "BEGIN", "BEGIN 0000:3b:00", "DIR 0000:3b:00 0000:5e:00",
+          "DIR 0000:3b:00 0000:5e:00 MAYBE", "END x y", "HELLO 3b:00 5e:00",
+          "BEGIN 0000:3b:00 0000:5e:00 extra"}) {
+        EXPECT_EQ(parseChildLine(bad).kind, ChildLine::kInvalid) << bad;
+    }
 }
