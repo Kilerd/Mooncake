@@ -164,7 +164,8 @@ pair before it serves copies between them.
 - GPU memory: while it tests a pair the child holds, on each of the pair's
   GPUs, its own CUDA context (typically a few hundred MiB, depending on GPU
   and driver) and two test buffers of up to 4 MiB each (down to 1 MiB each
-  with the default gather threshold when memory is short). Engines that
+  with the default gather threshold when memory is short); the host-path
+  test of a GPU adds 1 MiB on it and 3 MiB of pinned host memory. Engines that
   reserve nearly all GPU memory should leave about 0.5 GiB free per GPU, or
   the pair stays untested -- and refused in enforce mode -- until memory
   frees up.
@@ -181,10 +182,58 @@ pair before it serves copies between them.
   `--deny-pair <bus id>,<bus id>` one pair, without testing. Bus ids not
   present on the node are ignored with a warning.
 
-A copy between the GPUs of a denied pair is refused with `kNoPeerAccess`
-while its entries are resolved, before anything is merged or mapped; the
-engine moves the request to its base transport (counted under
-`fallback_requests` / `daemon_error`). A copy within one GPU is never denied.
+What happens to a copy between the GPUs of a refused pair (failed,
+not verified yet in enforce mode, or denied on the command line) depends on
+`--p2p-fallback`:
+
+- `host` (default): the daemon copies it through pinned host memory itself
+  (below), provided both GPUs passed the host-path self-test.
+- `tcp`, or a GPU whose host path failed or is not verified yet: the copy is
+  refused with `kNoPeerAccess` while its entries are resolved, before
+  anything is merged or mapped, and the engine moves the request to its base
+  transport (counted under `fallback_requests` / `daemon_error`).
+
+A copy within one GPU is never refused.
+
+## Host-staged copies
+
+Some platforms drop or corrupt peer-to-peer DMA while copies between a GPU
+and host memory work. For such pairs the daemon moves the data through a
+pinned host buffer: the sending GPU copies a piece into a host slot -- the
+copy engines for runs of at least the gather threshold, one gather kernel
+launch packing all smaller entries (single 2 KiB rows) contiguously -- and
+the receiving GPU copies it out again, the copy engines and the same kernel
+scattering the rows into place. Two slots alternate, so piece k+1 travels to
+the host while piece k travels on (an event on the sending GPU's stream
+orders each H2D after its D2H; the host reuses a slot once the receiving GPU
+is done with it). Nothing else is staged: no device memory is allocated for
+it (beyond the kernel's small entry table), and blocks are mapped in their own GPU's context, so peer access is not
+needed.
+
+- Each GPU's host path is verified by the self-test child before it is used:
+  copy engines host -> device -> host, and the gather kernel writing into and
+  reading from pinned host memory, every byte compared. A GPU whose host path
+  fails or could not be tested keeps the TCP fallback (an untested host path
+  is retried like an untested pair).
+- The pinned pool is `--host-staging-mb` (default 128 MiB) in total, split
+  over the NUMA nodes that hold GPUs and allocated on first use, in slots of
+  1 to 16 MiB. A copy takes two slots of the sending GPU's node, both or
+  none, so concurrent copies queue but never deadlock; one that cannot get
+  its slots within its start budget is refused (base transport). The pool of
+  a node is pinned by a thread bound to that node's CPUs, so its pages are
+  local to the sending GPU (the receiving GPU of a cross-socket pair reads
+  them over the inter-socket link). Pinned memory counts against the memory
+  limit of the daemon's container: allow the pool plus the daemon's own
+  resident memory (CUDA contexts on the GPUs that engines use) plus the
+  self-test child (see below) -- 2 GiB is a comfortable limit for 8 GPUs
+  with the default pool.
+- Any error on the host path refuses the request like a denied pair, so the
+  engine falls back to its base transport, which rewrites every byte; TCP
+  stays the last resort. A copy is never started after its start budget.
+
+Counters: `staged_copies`, `staged_bytes`, `staged_failures`. The pair
+verdicts in the log say where a refused pair's copies go:
+`P2P denied -> host-staged` or `P2P denied -> TCP (...)`.
 
 The child logs one line per direction and the daemon one verdict per pair,
 e.g.
@@ -233,8 +282,10 @@ copy latency split into `avg_plan_us` (validation, merging, mapping) and
 `denied_pairs` (the number of denied ordered `src>dst` directions -- a denied
 GPU pair counts twice -- followed by their bus ids) and
 `denied_copy_requests` (copies refused because their pair is denied; not
-counted as failures) and `untested_pairs` (GPU pairs whose last test could
-not run, waiting for a retry; worth an alert when it stays above 0).
+counted as failures), `untested_pairs` / `untested_host_paths` (GPU pairs
+and per-GPU host paths whose last test could not run, waiting for a retry;
+worth an alert when they stay above 0) and
+`staged_copies` / `staged_bytes` / `staged_failures` (host-staged copies).
 
 ## Wire protocol
 
