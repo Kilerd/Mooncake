@@ -128,6 +128,50 @@ together with the exact address range in which that set is unchanged.
   `--drain-timeout-ms`, default 10 s) and exits; on an unrecoverable CUDA error
   it exits so that it can be restarted.
 
+## P2P integrity self-test
+
+Some platforms report peer access between two GPUs (`cudaDeviceCanAccessPeer`,
+`nvidia-smi topo -p2p`) and complete peer copies without any error, yet the
+data never arrives or arrives corrupted. The daemon therefore verifies every
+GPU pair before it serves copies between them:
+
+- At start it creates a context on every visible GPU in compute mode Default,
+  enables peer access and, for both directions of every pair, copies patterns
+  with the production code paths -- `cudaMemcpyBatchAsync` on the receiving
+  GPU's stream (entries from the gather threshold up to 2 MiB, whole 2 KiB rows,
+  odd lengths, misaligned offsets) and the gather kernel on the GPU
+  `--gather-on` selects (single 2 KiB rows, small and byte-misaligned
+  entries) -- three iterations each. The destination buffer is filled with a
+  different poison before every pass and read back in full: copied ranges
+  must hold the source GPU's bytes and everything else the poison, so dropped,
+  corrupted and stray writes all fail the pair. Each GPU gets two buffers of at
+  most 4 MiB (smaller sizes are tried when that does not fit); buffers and
+  contexts are released afterwards, so GPUs without engines keep no daemon
+  context. `--no-startup-selftest` skips this step.
+- Pairs that could not be tested at start (no context or no memory on a GPU
+  then) are tested when engines first register on both GPUs, before any copy
+  between them is served.
+- `--p2p-selftest=enforce` (default) denies a pair that fails in either
+  direction or cannot be tested; `warn` only logs; `off` skips the test.
+- `--deny-peer <bus id>` (repeatable) denies every pair with that GPU and
+  `--deny-pair <bus id>,<bus id>` one pair, without testing. Bus ids not
+  present on the node are ignored with a warning.
+
+A copy between the GPUs of a denied pair is refused with `kNoPeerAccess`
+before anything is mapped; the engine moves the request to its base transport
+(counted under `fallback_requests` / `daemon_error`). A copy within one GPU is
+never denied.
+
+The daemon logs one line per tested direction, e.g.
+
+```
+P2P self-test gpu 0 (0000:1a:00) -> gpu 1 (0000:3d:00): copy engines OK (3 x 4096 KiB, 21000 MB/s), gather kernel on gpu 1 OK -> allowed
+P2P self-test gpu 2 (0000:5e:00) -> gpu 3 (0000:b1:00): copy engines CORRUPT (iteration 0: ... bytes wrong ...) ... -> DENIED
+```
+
+and a summary; when every tested pair failed it says so plainly:
+`P2P unusable on this node: N/N ordered pairs failed the self-test; ...`.
+
 ## Counters
 
 Engine side, logged by each engine every `MC_NVLINK_PROXY_STATS_INTERVAL`
@@ -158,7 +202,9 @@ demand with `mooncake_nvlink_proxy --socket <path> --stats`: active clients,
 registrations, copy requests / entries / bytes / failures, average and maximum
 copy latency split into `avg_plan_us` (validation, merging, mapping) and
 `avg_exec_us` (GPU work), `coalesced_entries`, `kernel_entries/bytes` and
-`ce_entries/bytes` (copy engines), IPC handle opens.
+`ce_entries/bytes` (copy engines), IPC handle opens, the self-test mode,
+`denied_pairs` (count and `src>dst` bus ids) and `denied_copy_requests`
+(copies refused because their pair is denied; not counted as failures).
 
 ## Wire protocol
 
@@ -176,4 +222,6 @@ dst offset, length)` plus a start budget; replied after the copies completed),
 initiator process (e.g. two one-GPU containers on one node plus the daemon) and
 verifies large and paged writes, reads, sub-allocated buffers, guard regions
 and host memory byte by byte. `nvlink_proxy_transport_test` covers the
-protocol helpers and the no-daemon path without GPUs.
+protocol helpers and the no-daemon path without GPUs;
+`nvlink_proxy_policy_test` the self-test plans, the verifier, bus id parsing
+and the deny matrix.
