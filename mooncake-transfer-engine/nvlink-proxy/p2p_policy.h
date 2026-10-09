@@ -422,6 +422,27 @@ inline Mismatch compareImages(const uint8_t *expected, const uint8_t *actual,
     return m;
 }
 
+// ------------------------------------------------------- host staging pool
+// Slots of the pinned pool of one NUMA node: |total_bytes| split over
+// |nodes| nodes, slots of 1 to 16 MiB (an eighth of the node's share, in
+// 64 KiB units). False when that leaves fewer than two slots: a copy needs
+// two.
+inline bool stagingGeometry(uint64_t total_bytes, size_t nodes,
+                            uint64_t *slot_bytes, size_t *slots) {
+    const uint64_t share = total_bytes / std::max<size_t>(1, nodes);
+    uint64_t slot = std::min<uint64_t>(16ull << 20, share / 8);
+    slot = std::max<uint64_t>(1ull << 20, slot / (64 << 10) * (64 << 10));
+    *slot_bytes = slot;
+    *slots = size_t(share / slot);
+    return *slots >= 2;
+}
+
+// Offset of the next piece in a slot: 16-byte aligned (the widest access
+// of the gather kernel and the copy engines' preferred alignment).
+inline uint64_t alignSlotOffset(uint64_t off) {
+    return (off + 15) & ~uint64_t(15);
+}
+
 // ------------------------------------------------------------- verdicts
 // Outcome of testing one direction (data flows src -> dst). Only a data
 // mismatch is evidence against a pair; anything that kept the test from
@@ -504,8 +525,17 @@ inline bool parsePciPairs(const std::string &s, std::vector<PciPair> &out) {
     return !out.empty();
 }
 
+//   STAGE <bus src> <bus dst> <PASS|FAIL|UNTESTED>   host-staged copy test
+//   NOKERNEL <bus> <bus>       the gather kernel has no image for that GPU
 struct ChildLine {
-    enum Kind { kInvalid, kBegin, kDir, kEnd } kind = kInvalid;
+    enum Kind {
+        kInvalid,
+        kBegin,
+        kDir,
+        kEnd,
+        kStage,
+        kNoKernel
+    } kind = kInvalid;
     PciAddr a, b;
     DirVerdict verdict = DirVerdict::kUntested;
 };
@@ -528,9 +558,15 @@ inline ChildLine parseChildLine(const std::string &line) {
         out.kind = ChildLine::kBegin;
     } else if (f[0] == "END" && f.size() == 3) {
         out.kind = ChildLine::kEnd;
+    } else if (f[0] == "NOKERNEL" && f.size() == 3) {
+        out.kind = ChildLine::kNoKernel;
     } else if (f[0] == "DIR" && f.size() == 4 &&
                parseDirVerdict(f[3], out.verdict)) {
         out.kind = ChildLine::kDir;
+    } else if (f[0] == "STAGE" && f.size() == 4 &&
+               parseDirVerdict(f[3], out.verdict) &&
+               out.verdict != DirVerdict::kNoPeer) {
+        out.kind = ChildLine::kStage;
     } else {
         return ChildLine();
     }

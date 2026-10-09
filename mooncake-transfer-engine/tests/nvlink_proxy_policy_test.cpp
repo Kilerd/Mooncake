@@ -306,3 +306,34 @@ TEST(NvlinkProxyPolicy, ChildWire) {
         EXPECT_EQ(parseChildLine(bad).kind, ChildLine::kInvalid) << bad;
     }
 }
+
+TEST(NvlinkProxyPolicy, ChildWireStageAndKernelLines) {
+    ChildLine l = parseChildLine("STAGE 0000:3b:00 0000:5e:00 PASS");
+    EXPECT_EQ(l.kind, ChildLine::kStage);
+    EXPECT_EQ(l.verdict, DirVerdict::kPass);
+    EXPECT_EQ(parseChildLine("STAGE 0000:3b:00 0000:5e:00 NOPEER").kind,
+              ChildLine::kInvalid);
+    l = parseChildLine("NOKERNEL 0000:3b:00 0000:3b:00");
+    EXPECT_EQ(l.kind, ChildLine::kNoKernel);
+    EXPECT_EQ(parseChildLine("NOKERNEL 0000:3b:00").kind, ChildLine::kInvalid);
+}
+
+TEST(NvlinkProxyPolicy, StagingGeometry) {
+    uint64_t slot = 0;
+    size_t slots = 0;
+    ASSERT_TRUE(stagingGeometry(128ull << 20, 2, &slot, &slots));
+    EXPECT_EQ(slot, 8ull << 20);  // 64 MiB per node, an eighth
+    EXPECT_EQ(slots, 8u);
+    ASSERT_TRUE(stagingGeometry(1ull << 30, 1, &slot, &slots));
+    EXPECT_EQ(slot, 16ull << 20);  // capped
+    EXPECT_EQ(slots, 64u);
+    ASSERT_TRUE(stagingGeometry(2ull << 20, 1, &slot, &slots));
+    EXPECT_EQ(slot, 1ull << 20);  // floor
+    EXPECT_EQ(slots, 2u);
+    EXPECT_FALSE(stagingGeometry(2ull << 20, 2, &slot, &slots));  // 1 slot/node
+    EXPECT_FALSE(stagingGeometry(3ull << 20, 2, &slot, &slots));
+    EXPECT_EQ(alignSlotOffset(0), 0u);
+    EXPECT_EQ(alignSlotOffset(1), 16u);
+    EXPECT_EQ(alignSlotOffset(2048), 2048u);
+    EXPECT_EQ(alignSlotOffset(2049), 2064u);
+}
