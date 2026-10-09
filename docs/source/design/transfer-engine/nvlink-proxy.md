@@ -154,10 +154,20 @@ pair before it serves copies between them.
   4 MiB (more if the gather threshold needs it; smaller sizes are tried when
   memory is short).
 - Only a data mismatch (or the child dying or hanging on the pair) fails a
-  pair. A test that could not run (no memory, a CUDA error, a failed pattern
-  upload) leaves the pair untested; it is tested again at the next
-  registration on either GPU. A direction without peer access is not judged:
-  its copies are refused as no-P2P anyway.
+  pair, for good (until the daemon restarts). A test that could not run (no
+  memory, a CUDA error, a failed pattern upload) leaves the pair untested: it
+  is tested again 10, 30 and 60 s later, then every 5 minutes, one child at a
+  time, and at the next registration on either GPU; each attempt logs a
+  warning, and `untested_pairs` in the counters says how many pairs wait for
+  one. A direction without peer access is not judged: its copies are refused
+  as no-P2P anyway.
+- GPU memory: while it tests a pair the child holds, on each of the pair's
+  GPUs, its own CUDA context (typically a few hundred MiB, depending on GPU
+  and driver) and two test buffers of up to 4 MiB each (down to 1 MiB each
+  with the default gather threshold when memory is short). Engines that
+  reserve nearly all GPU memory should leave about 0.5 GiB free per GPU, or
+  the pair stays untested -- and refused in enforce mode -- until memory
+  frees up.
 - When it runs: when an engine registers its first block on a GPU, the
   GPU's pairs with the other GPUs that engines use are tested in the
   background unless they already passed or failed. By default every pair of
@@ -223,7 +233,8 @@ copy latency split into `avg_plan_us` (validation, merging, mapping) and
 `denied_pairs` (the number of denied ordered `src>dst` directions -- a denied
 GPU pair counts twice -- followed by their bus ids) and
 `denied_copy_requests` (copies refused because their pair is denied; not
-counted as failures).
+counted as failures) and `untested_pairs` (GPU pairs whose last test could
+not run, waiting for a retry; worth an alert when it stays above 0).
 
 ## Wire protocol
 

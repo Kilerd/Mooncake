@@ -201,6 +201,8 @@ std::atomic<uint8_t> g_test_state[kMaxDevices][kMaxDevices];
 // killed when it makes no progress for this long.
 int g_selftest_timeout_s = 30;
 std::string g_self_exe;  // /proc/self/exe
+// GPU pairs whose last test could not run, waiting for a retry (--stats).
+std::atomic<size_t> g_untested_pairs{0};
 void requestSelfTestForDevice(int dev);
 
 bool isStickyCudaError(cudaError_t e) {
@@ -357,6 +359,7 @@ std::string statsText() {
     if (!denied.empty()) out += "(" + denied + ")";
     out +=
         " denied_copy_requests=" + std::to_string(g_stats.denied_copies.load());
+    out += " untested_pairs=" + std::to_string(g_untested_pairs.load());
     return out;
 }
 
@@ -1807,12 +1810,61 @@ class SelfTester {
     }
 
    private:
+    // A pair whose test could not run (typically no GPU memory for the
+    // child next to the engines) is retried here, besides at the next
+    // registration on either GPU: a running engine never registers again.
+    struct Retry {
+        int attempts = 0;
+        uint64_t next_us = 0;
+    };
+
+    static uint64_t retryDelayS(int attempts) {
+        return attempts <= 1   ? 10
+               : attempts == 2 ? 30
+               : attempts == 3 ? 60
+                               : 300;
+    }
+
+    // Under mu_: queues the retries that are due; returns the time of the
+    // next one (0: none).
+    uint64_t queueDueRetries() {
+        const uint64_t now = nowUs();
+        uint64_t next = 0;
+        for (auto it = retry_.begin(); it != retry_.end();) {
+            const auto p = it->first;
+            if (g_test_state[p.first][p.second] != kNotTested) {
+                it = retry_.erase(it);  // decided meanwhile
+                continue;
+            }
+            if (!pending_.count(p)) {
+                if (it->second.next_us <= now) {
+                    queue_.push_back(p);
+                    pending_.insert(p);
+                } else if (!next || it->second.next_us < next) {
+                    next = it->second.next_us;
+                }
+            }
+            ++it;
+        }
+        g_untested_pairs = retry_.size();
+        return next;
+    }
+
     void loop() {
         while (true) {
             std::vector<std::pair<int, int>> batch;
             {
                 std::unique_lock<std::mutex> lock(mu_);
-                cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+                while (!stop_ && queue_.empty()) {
+                    const uint64_t next = queueDueRetries();
+                    if (!queue_.empty()) break;
+                    const uint64_t now = nowUs();
+                    if (next)
+                        cv_.wait_for(lock, std::chrono::microseconds(
+                                               next > now ? next - now : 0));
+                    else
+                        cv_.wait(lock);
+                }
                 if (stop_) return;
                 batch.swap(queue_);
             }
@@ -1820,6 +1872,25 @@ class SelfTester {
             std::lock_guard<std::mutex> lock(mu_);
             for (const auto &p : batch) pending_.erase(p);
         }
+    }
+
+    // Records the outcome for the retry schedule; returns the delay until
+    // the next retry of an untested pair (0 otherwise).
+    uint64_t noteOutcome(int a, int b, PairVerdict v, int *attempt) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto p = std::make_pair(std::min(a, b), std::max(a, b));
+        uint64_t delay = 0;
+        if (v == PairVerdict::kUntested) {
+            Retry &r = retry_[p];
+            ++r.attempts;
+            delay = retryDelayS(r.attempts);
+            r.next_us = nowUs() + delay * 1000000;
+            *attempt = r.attempts;
+        } else {
+            retry_.erase(p);
+        }
+        g_untested_pairs = retry_.size();
+        return delay;
     }
 
     void apply(int a, int b, PairVerdict v, const std::string &why) {
@@ -1844,17 +1915,24 @@ class SelfTester {
                                "base transport"
                              : "would be denied (warn mode: still used)");
                 break;
-            case PairVerdict::kUntested:
+            case PairVerdict::kUntested: {
                 g_test_state[a][b] = g_test_state[b][a] = kNotTested;
                 if (enforce) g_policy.setPair(a, b, PeerPolicy::kUntested);
+                int attempt = 0;
+                const uint64_t delay = noteOutcome(a, b, v, &attempt);
+                // One line per attempt: the retry schedule rate-limits it.
                 LOGW(
-                    "%s: untested%s -> %s; tested again at the next "
-                    "registration on either GPU",
+                    "%s: untested%s -> %s; attempt %d, tested again in "
+                    "%" PRIu64 " s or at the next registration on either GPU",
                     head, reason.c_str(),
                     enforce ? "denied until a test passes"
-                            : "still used (warn mode)");
-                break;
+                            : "still used (warn mode)",
+                    attempt, delay);
+                return;
+            }
         }
+        int unused = 0;
+        noteOutcome(a, b, v, &unused);
     }
 
     void runBatch(std::vector<std::pair<int, int>> remaining) {
@@ -1923,6 +2001,7 @@ class SelfTester {
     std::condition_variable cv_;
     std::vector<std::pair<int, int>> queue_;
     std::set<std::pair<int, int>> pending_;
+    std::map<std::pair<int, int>, Retry> retry_;
     bool stop_ = false;
 };
 SelfTester g_tester;
@@ -2047,8 +2126,11 @@ void usage(const char *argv0) {
         "                          enforce (default): a pair is refused until\n"
         "                          its test passes, for good if the data came\n"
         "                          back wrong (or the child died or hung on\n"
-        "                          it); a test that could not run is repeated\n"
-        "                          at the next registration on either GPU.\n"
+        "                          it); a test that could not run (e.g. no "
+        "GPU\n"
+        "                          memory for it) is repeated after 10, 30,\n"
+        "                          60 s, then every 5 min, and at the next\n"
+        "                          registration on either GPU.\n"
         "                          warn: log only; off: no test\n"
         "  --no-startup-selftest   test a pair only when engines first\n"
         "                          register on both of its GPUs (recommended\n"
@@ -2080,7 +2162,8 @@ void usage(const char *argv0) {
         "avg_exec_us), coalesced_entries, kernel_entries/bytes and\n"
         "ce_entries/bytes (copy engines), handle_opens, p2p_selftest,\n"
         "denied_pairs (denied ordered src>dst directions: count and bus\n"
-        "ids), denied_copy_requests.\n",
+        "ids), denied_copy_requests, untested_pairs (GPU pairs whose test\n"
+        "could not run, waiting for a retry).\n",
         argv0);
 }
 
