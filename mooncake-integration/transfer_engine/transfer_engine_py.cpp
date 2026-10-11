@@ -20,6 +20,7 @@
 #include <fstream>
 
 #include <pybind11/stl.h>
+#include "batch_quiesce.h"
 #include "shared_segment_py.h"
 #include "transport/rpc_communicator/rpc_interface.h"
 
@@ -128,6 +129,10 @@ TransferEnginePy::TransferEnginePy() {
         transfer_timeout_nsec_ = timeout_sec * kNanosPerSecond;
     } else {
         transfer_timeout_nsec_ = 30 * kNanosPerSecond;
+    }
+    if (const char* q = std::getenv("MC_TRANSFER_QUIESCE_WAIT_MS")) {
+        const long v = std::atol(q);
+        if (v >= 0) quiesce_wait_ms_ = v;
     }
 }
 
@@ -463,17 +468,21 @@ int TransferEnginePy::batchTransferSyncRead(
 batch_id_t TransferEnginePy::batchTransferAsyncWrite(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
-    const std::vector<size_t>& lengths, const std::string& transport_hint) {
+    const std::vector<size_t>& lengths, const std::string& transport_hint,
+    int64_t deadline_ms) {
     return batchTransferAsync(target_hostname, buffers, peer_buffer_addresses,
-                              lengths, TransferOpcode::WRITE, transport_hint);
+                              lengths, TransferOpcode::WRITE, transport_hint,
+                              deadline_ms);
 }
 
 batch_id_t TransferEnginePy::batchTransferAsyncRead(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
-    const std::vector<size_t>& lengths, const std::string& transport_hint) {
+    const std::vector<size_t>& lengths, const std::string& transport_hint,
+    int64_t deadline_ms) {
     return batchTransferAsync(target_hostname, buffers, peer_buffer_addresses,
-                              lengths, TransferOpcode::READ, transport_hint);
+                              lengths, TransferOpcode::READ, transport_hint,
+                              deadline_ms);
 }
 
 int TransferEnginePy::transferSync(const char* target_hostname,
@@ -498,77 +507,78 @@ int TransferEnginePy::transferSync(const char* target_hostname,
         }
     }
 
-    // TODO this is just a workaround
     // When transfer engine submits one task, it will be dispatch to a worker
     // associated with one local RNIC. If the local RNIC fails to connect to any
     // remote RNIC, it will eventually fail. This allows selecting multiple
-    // local RNIC in one transferSync call. Will be fixed in the next revision.
+    // local RNIC in one transferSync call (advise_retry_cnt per attempt).
+    // An attempt is retried, or freed, only once it is quiesced
+    // (batch_quiesce.h).
     const int max_retry =
         engine_->numContexts() + 1;  // Iter all possible local contexts
-    auto start_ts = getCurrentTimeInNano();
-    for (int retry = 0; retry < max_retry; ++retry) {
-        auto batch_id = engine_->allocateBatchID(1);
-        TransferRequest entry;
-        if (opcode == TransferOpcode::WRITE) {
-            entry.opcode = TransferRequest::WRITE;
-        } else {
-            entry.opcode = TransferRequest::READ;
-        }
+    auto entries = std::make_shared<std::vector<TransferRequest>>(1);
+    {
+        TransferRequest& entry = (*entries)[0];
+        entry.opcode = opcode == TransferOpcode::WRITE ? TransferRequest::WRITE
+                                                       : TransferRequest::READ;
         entry.length = length;
         entry.source = (void*)buffer;
         entry.target_id = handle;
         entry.target_offset = peer_buffer_address;
-        entry.advise_retry_cnt = retry;
         entry.transport_hint = parseTransportHint(transport_hint);
+    }
+    return runSync(target_hostname, handle, entries, max_retry,
+                   transfer_timeout_nsec_ + length,  // 1GiB per second
+                   notify);
+}
 
-        Status s =
-            notify
-                ? engine_->submitTransferWithNotify(
-                      batch_id, {entry},
-                      TransferMetadata::NotifyDesc{notify->name, notify->msg})
-                : engine_->submitTransfer(batch_id, {entry});
-        if (!s.ok()) {
+int TransferEnginePy::runSync(
+    const char* target_hostname, Transport::SegmentHandle handle,
+    const std::shared_ptr<std::vector<TransferRequest>>& entries,
+    int max_attempts, int64_t timeout_ns, TransferNotify* notify) {
+    SyncOptions opt;
+    opt.max_attempts = max_attempts;
+    opt.start_ns = batchQuiesceNowNs();
+    opt.timeout_ns = timeout_ns;
+    opt.quiesce_wait_ms = quiesce_wait_ms_;
+    const std::string target = target_hostname;
+    const SyncOutcome outcome = runSyncWithRetries(
+        *engine_, entries->size(), opt,
+        [&](Transport::BatchID batch_id, int attempt) {
+            for (auto& entry : *entries) entry.advise_retry_cnt = attempt;
+            return notify ? engine_->submitTransferWithNotify(
+                                batch_id, *entries,
+                                TransferMetadata::NotifyDesc{notify->name,
+                                                             notify->msg})
+                          : engine_->submitTransfer(batch_id, *entries);
+        },
+        [&]() {
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
                 LOG(WARNING)
-                    << "submitTransfer failed with target " << target_hostname
+                    << "submitTransfer failed with target " << target
                     << ", CheckSegmentStatus not ok, ready to closeSegment";
                 std::lock_guard<std::mutex> guard(mutex_);
                 engine_->closeSegment(handle);
-                engine_->getMetadata()->removeSegmentDesc(target_hostname);
-                handle_map_.erase(target_hostname);
+                engine_->getMetadata()->removeSegmentDesc(target);
+                handle_map_.erase(target);
             }
+        });
+    switch (outcome) {
+        case SyncOutcome::kCompleted:
+            return 0;
+        case SyncOutcome::kFailed:
             return -1;
-        }
-
-        TransferStatus status;
-        bool completed = false;
-        while (!completed) {
-            Status s = engine_->getTransferStatus(batch_id, 0, status);
-            LOG_ASSERT(s.ok());
-            if (status.s == TransferStatusEnum::COMPLETED) {
-                engine_->freeBatchID(batch_id);
-                return 0;
-            } else if (status.s == TransferStatusEnum::FAILED) {
-                engine_->freeBatchID(batch_id);
-                completed = true;
-            } else if (status.s == TransferStatusEnum::TIMEOUT) {
-                LOG(INFO) << "Sync data transfer timeout";
-                completed = true;
-            }
-            auto current_ts = getCurrentTimeInNano();
-            const int64_t timeout =
-                transfer_timeout_nsec_ + length;  // 1GiB per second
-            if (current_ts - start_ts > timeout) {
-                LOG(INFO) << "Sync data transfer timeout after "
-                          << current_ts - start_ts << "ns, local buffer "
-                          << (void*)buffer << " remote buffer "
-                          << (void*)peer_buffer_address << " length " << length;
-                return -1;
-            }
-        }
+        case SyncOutcome::kUnquiesced:
+            break;
     }
-    return -1;
+    // Its batch stays allocated and references these requests.
+    {
+        std::lock_guard<std::mutex> guard(batches_mu_);
+        unquiesced_requests_.push_back(entries);
+    }
+    LOG(ERROR) << "Sync transfer to " << target
+               << " failed and is not quiesced: writes may still land";
+    return -2;
 }
 
 int TransferEnginePy::batchTransferSync(
@@ -597,90 +607,31 @@ int TransferEnginePy::batchTransferSync(
     }
 
     const int max_retry = engine_->numContexts() + 1;
-    auto start_ts = getCurrentTimeInNano();
     auto total_length = std::accumulate(lengths.begin(), lengths.end(), 0ull);
-    auto batch_size = buffers.size();
-    std::vector<TransferRequest> entries;
-    for (size_t i = 0; i < batch_size; ++i) {
+    auto entries = std::make_shared<std::vector<TransferRequest>>();
+    entries->reserve(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i) {
         TransferRequest entry;
-        if (opcode == TransferOpcode::WRITE) {
-            entry.opcode = TransferRequest::WRITE;
-        } else {
-            entry.opcode = TransferRequest::READ;
-        }
+        entry.opcode = opcode == TransferOpcode::WRITE ? TransferRequest::WRITE
+                                                       : TransferRequest::READ;
         entry.length = lengths[i];
         entry.source = (void*)buffers[i];
         entry.target_id = handle;
         entry.target_offset = peer_buffer_addresses[i];
         entry.advise_retry_cnt = 0;
         entry.transport_hint = parseTransportHint(transport_hint);
-        entries.push_back(entry);
+        entries->push_back(entry);
     }
-
-    for (int retry = 0; retry < max_retry; ++retry) {
-        auto batch_id = engine_->allocateBatchID(batch_size);
-        Status s =
-            notify
-                ? engine_->submitTransferWithNotify(
-                      batch_id, entries,
-                      TransferMetadata::NotifyDesc{notify->name, notify->msg})
-                : engine_->submitTransfer(batch_id, entries);
-        if (!s.ok()) {
-            engine_->freeBatchID(batch_id);
-            Status segment_status = engine_->CheckSegmentStatus(handle);
-            if (!segment_status.ok()) {
-                LOG(WARNING)
-                    << "submitTransfer failed with target " << target_hostname
-                    << ", CheckSegmentStatus not ok, ready to closeSegment";
-                std::lock_guard<std::mutex> guard(mutex_);
-                engine_->closeSegment(handle);
-                engine_->getMetadata()->removeSegmentDesc(target_hostname);
-                handle_map_.erase(target_hostname);
-            }
-            return -1;
-        }
-
-        TransferStatus status;
-        bool completed = false;
-        bool already_freed = false;
-        while (!completed) {
-            Status s = engine_->getBatchTransferStatus(batch_id, status);
-            LOG_ASSERT(s.ok());
-            if (status.s == TransferStatusEnum::COMPLETED) {
-                engine_->freeBatchID(batch_id);
-                return 0;
-            } else if (status.s == TransferStatusEnum::FAILED) {
-                engine_->freeBatchID(batch_id);
-                already_freed = true;
-                completed = true;
-            } else if (status.s == TransferStatusEnum::TIMEOUT) {
-                LOG(INFO) << "Sync data transfer timeout";
-                completed = true;
-            }
-            auto current_ts = getCurrentTimeInNano();
-            const int64_t timeout =
-                transfer_timeout_nsec_ + total_length;  // 1GiB per second
-            if (current_ts - start_ts > timeout) {
-                LOG(INFO) << "Sync batch data transfer timeout after "
-                          << current_ts - start_ts << "ns";
-                // TODO: as @doujiang24 mentioned, early free(while there are
-                // still waiting tasks) the batch_id may fail and cause memory
-                // leak(a known issue).
-                if (!already_freed) {
-                    engine_->freeBatchID(batch_id);
-                }
-                return -1;
-            }
-        }
-    }
-    return -1;
+    return runSync(target_hostname, handle, entries, max_retry,
+                   transfer_timeout_nsec_ + total_length,  // 1GiB per second
+                   notify);
 }
 
 batch_id_t TransferEnginePy::batchTransferAsync(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
     const std::vector<size_t>& lengths, TransferOpcode opcode,
-    const std::string& transport_hint) {
+    const std::string& transport_hint, int64_t deadline_ms) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -703,62 +654,116 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         return 0;
     }
 
-    const int max_retry = engine_->numContexts() + 1;
-    auto batch_size = buffers.size();
-    std::vector<TransferRequest> entries;
-    batch_id_t batch_id = 0;
-    for (size_t i = 0; i < batch_size; ++i) {
+    // The requests live as long as the batch: its tasks point at them.
+    auto entries = std::make_shared<std::vector<TransferRequest>>();
+    entries->reserve(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i) {
         TransferRequest entry;
-        if (opcode == TransferOpcode::WRITE) {
-            entry.opcode = TransferRequest::WRITE;
-        } else {
-            entry.opcode = TransferRequest::READ;
-        }
+        entry.opcode = opcode == TransferOpcode::WRITE ? TransferRequest::WRITE
+                                                       : TransferRequest::READ;
         entry.length = lengths[i];
         entry.source = (void*)buffers[i];
         entry.target_id = handle;
         entry.target_offset = peer_buffer_addresses[i];
         entry.advise_retry_cnt = 0;
         entry.transport_hint = parseTransportHint(transport_hint);
-        entries.push_back(entry);
+        entries->push_back(entry);
     }
 
-    for (int retry = 0; retry < max_retry; ++retry) {
-        batch_id = engine_->allocateBatchID(batch_size);
-        auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
-
-        auto start_ts = getCurrentTimeInNano();
-        batch_desc->start_timestamp = start_ts;
-
-        Status s = engine_->submitTransfer(batch_id, entries);
-        if (!s.ok()) {
-            engine_->freeBatchID(batch_id);
-            return 0;
-        } else {
-            break;
-        }
+    batch_id_t batch_id = engine_->allocateBatchID(entries->size());
+    auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
+    const int64_t start_ts = getCurrentTimeInNano();
+    batch_desc->start_timestamp = start_ts;
+    if (deadline_ms > 0)
+        engine_->setBatchDeadline(
+            batch_id, batchQuiesceNowNs() + deadline_ms * 1000000LL);
+    {
+        std::lock_guard<std::mutex> guard(batches_mu_);
+        live_batches_[batch_id] = entries;
     }
-
+    Status s = engine_->submitTransfer(batch_id, *entries);
+    if (!s.ok()) {
+        // Part of it may have started: freed only once quiesced.
+        engine_->cancelBatch(batch_id);
+        if (waitBatchQuiesced(*engine_, batch_id, quiesce_wait_ms_))
+            freeBatch(batch_id);
+        return 0;
+    }
     return batch_id;
+}
+
+int TransferEnginePy::freeBatch(batch_id_t batch_id) {
+    Transport::BatchProgress p;
+    if (!engine_->getBatchProgress(batch_id, p).ok() || !p.quiesced) return -1;
+    if (!engine_->freeBatchID(batch_id).ok()) return -1;
+    std::lock_guard<std::mutex> guard(batches_mu_);
+    live_batches_.erase(batch_id);
+    return 0;
+}
+
+bool TransferEnginePy::knownBatch(batch_id_t batch_id) {
+    std::lock_guard<std::mutex> guard(batches_mu_);
+    return live_batches_.count(batch_id) != 0;
+}
+
+pybind11::dict TransferEnginePy::getBatchProgressPy(batch_id_t batch_id) {
+    if (!knownBatch(batch_id))
+        throw pybind11::value_error("unknown or already freed batch id");
+    Transport::BatchProgress p;
+    Status s;
+    {
+        pybind11::gil_scoped_release release;
+        s = engine_->getBatchProgress(batch_id, p);
+    }
+    if (!s.ok()) throw std::runtime_error(s.ToString());
+    pybind11::dict d;
+    d["state"] = !p.quiesced ? "running" : (p.failed ? "failed" : "completed");
+    d["quiesced"] = p.quiesced;
+    d["completed"] = p.completed;
+    d["failed"] = p.failed;
+    d["pending"] = p.pending;
+    d["unconfirmed"] = p.unconfirmed;
+    d["total"] = p.total;
+    return d;
+}
+
+bool TransferEnginePy::waitBatchQuiescedPy(batch_id_t batch_id,
+                                           int64_t timeout_ms) {
+    if (!knownBatch(batch_id))
+        throw pybind11::value_error("unknown or already freed batch id");
+    pybind11::gil_scoped_release release;
+    return waitBatchQuiesced(*engine_, batch_id, timeout_ms);
+}
+
+int TransferEnginePy::cancelBatchPy(batch_id_t batch_id) {
+    if (!knownBatch(batch_id))
+        throw pybind11::value_error("unknown or already freed batch id");
+    pybind11::gil_scoped_release release;
+    return engine_->cancelBatch(batch_id).ok() ? 0 : -1;
+}
+
+int TransferEnginePy::freeBatchPy(batch_id_t batch_id) {
+    if (!knownBatch(batch_id))
+        throw pybind11::value_error("unknown or already freed batch id");
+    pybind11::gil_scoped_release release;
+    return freeBatch(batch_id);
 }
 
 int TransferEnginePy::getBatchTransferStatus(
     const std::vector<batch_id_t>& batch_ids) {
     pybind11::gil_scoped_release release;
-    TransferStatus status;
     std::unordered_map<batch_id_t, int64_t> timeout_table{};
     for (auto& batch_id : batch_ids) {
+        if (!knownBatch(batch_id)) {
+            LOG(ERROR) << "get_batch_transfer_status: unknown or already "
+                          "freed batch id "
+                       << batch_id;
+            return -1;
+        }
         int64_t total_length = 0;
         auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
-        const size_t task_count = batch_desc->task_list.size();
-
-        for (size_t task_id = 0; task_id < task_count; task_id++) {
-            auto& task = batch_desc->task_list[task_id];
-            for (auto& slice : task.slice_list) {
-                total_length += slice->length;
-            }
-        }
-
+        for (auto& task : batch_desc->task_list)
+            for (auto& slice : task.slice_list) total_length += slice->length;
         timeout_table[batch_id] = total_length + transfer_timeout_nsec_;
     }
 
@@ -768,16 +773,14 @@ int TransferEnginePy::getBatchTransferStatus(
         for (auto& entry : timeout_table) {
             auto batch_desc = reinterpret_cast<BatchDesc*>(entry.first);
             auto start_timestamp = batch_desc->start_timestamp;
-            Status s = engine_->getBatchTransferStatus(entry.first, status);
+            Transport::BatchProgress p;
+            Status s = engine_->getBatchProgress(entry.first, p);
             LOG_ASSERT(s.ok());
-            if (status.s == TransferStatusEnum::COMPLETED) {
-                engine_->freeBatchID(entry.first);
-                LOG(INFO) << "Batch Transfer completed!";
+            if (p.all_terminal && p.failed == 0 && p.quiesced) {
+                freeBatch(entry.first);
                 remove_ids.insert(entry.first);
-            } else if (status.s == TransferStatusEnum::FAILED) {
+            } else if (p.failed > 0) {
                 failed_or_timeout = true;
-            } else if (status.s == TransferStatusEnum::TIMEOUT) {
-                LOG(INFO) << "Sync data transfer timeout";
             }
             auto current_ts = getCurrentTimeInNano();
             if (current_ts - start_timestamp > entry.second) {
@@ -786,17 +789,17 @@ int TransferEnginePy::getBatchTransferStatus(
                 failed_or_timeout = true;
             }
         }
-
-        for (auto& remove_id : remove_ids) {
-            timeout_table.erase(remove_id);
-        }
-
+        for (auto& remove_id : remove_ids) timeout_table.erase(remove_id);
         remove_ids.clear();
     }
 
     if (failed_or_timeout) {
+        // Freed only once quiesced; the others stay allocated (and known to
+        // get_batch_progress / wait_batch_quiesced / free_batch).
+        for (auto& entry : timeout_table) engine_->cancelBatch(entry.first);
         for (auto& entry : timeout_table) {
-            engine_->freeBatchID(entry.first);
+            if (waitBatchQuiesced(*engine_, entry.first, quiesce_wait_ms_))
+                freeBatch(entry.first);
         }
     }
 
@@ -822,8 +825,8 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
         }
     }
 
-    auto batch_id = engine_->allocateBatchID(1);
-    TransferRequest entry;
+    auto entries = std::make_shared<std::vector<TransferRequest>>(1);
+    TransferRequest& entry = (*entries)[0];
     entry.opcode = TransferRequest::WRITE;
     entry.length = length;
     entry.source = (void*)buffer;
@@ -831,9 +834,16 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     entry.target_offset = peer_buffer_address;
     entry.transport_hint = parseTransportHint(transport_hint);
 
-    Status s = engine_->submitTransfer(batch_id, {entry});
+    batch_id_t batch_id = engine_->allocateBatchID(1);
+    {
+        std::lock_guard<std::mutex> guard(batches_mu_);
+        live_batches_[batch_id] = entries;
+    }
+    Status s = engine_->submitTransfer(batch_id, *entries);
     if (!s.ok()) {
-        engine_->freeBatchID(batch_id);
+        engine_->cancelBatch(batch_id);
+        if (waitBatchQuiesced(*engine_, batch_id, quiesce_wait_ms_))
+            freeBatch(batch_id);
         return 0;
     }
 
@@ -842,20 +852,15 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
 
 int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     pybind11::gil_scoped_release release;
-    TransferStatus status;
-    Status s = engine_->getTransferStatus(batch_id, 0, status);
+    if (!knownBatch(batch_id)) return -1;
+    Transport::BatchProgress p;
+    Status s = engine_->getBatchProgress(batch_id, p);
     LOG_ASSERT(s.ok());
-    if (status.s == TransferStatusEnum::COMPLETED) {
-        engine_->freeBatchID(batch_id);
-        return 1;
-    } else if (status.s == TransferStatusEnum::FAILED) {
-        engine_->freeBatchID(batch_id);
-        return -1;
-    } else if (status.s == TransferStatusEnum::TIMEOUT) {
-        return -2;
-    } else {
-        return 0;
-    }
+    if (!p.all_terminal) return 0;
+    if (!p.quiesced) return -2;  // ended, but writes may still land
+    const bool ok = p.failed == 0;
+    freeBatch(batch_id);
+    return ok ? 1 : -1;
 }
 
 int TransferEnginePy::batchRegisterMemory(
@@ -1271,12 +1276,12 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::batchTransferAsyncWrite,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("deadline_ms") = 0)
             .def("batch_transfer_async_read",
                  &TransferEnginePy::batchTransferAsyncRead,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
-                 py::arg("transport_hint") = "")
+                 py::arg("transport_hint") = "", py::arg("deadline_ms") = 0)
             .def("transfer_sync", &TransferEnginePy::transferSync,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
@@ -1290,7 +1295,16 @@ PYBIND11_MODULE(engine, m) {
             .def("batch_transfer_async", &TransferEnginePy::batchTransferAsync,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
-                 py::arg("opcode"), py::arg("transport_hint") = "")
+                 py::arg("opcode"), py::arg("transport_hint") = "",
+                 py::arg("deadline_ms") = 0)
+            .def("get_batch_progress", &TransferEnginePy::getBatchProgressPy,
+                 py::arg("batch_id"))
+            .def("wait_batch_quiesced", &TransferEnginePy::waitBatchQuiescedPy,
+                 py::arg("batch_id"), py::arg("timeout_ms"))
+            .def("cancel_batch", &TransferEnginePy::cancelBatchPy,
+                 py::arg("batch_id"))
+            .def("free_batch", &TransferEnginePy::freeBatchPy,
+                 py::arg("batch_id"))
 #ifdef USE_CUDA
             .def("transfer_write_on_cuda",
                  &TransferEnginePy::transferWriteOnCuda,

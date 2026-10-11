@@ -468,6 +468,12 @@ if(USE_NVLINK_PROXY)
   endif()
 endif()
 
+# Waiting for batch quiescence and the binding's retrying sync submit
+add_executable(batch_quiesce_test ${WORKSPACE}/batch_quiesce_test.cpp)
+target_link_libraries(batch_quiesce_test PUBLIC transfer_engine gtest
+                                                gtest_main)
+add_test(NAME batch_quiesce_test COMMAND batch_quiesce_test)
+
 add_executable(graceful_shutdown_test ${WORKSPACE}/graceful_shutdown_test.cpp)
 target_link_libraries(graceful_shutdown_test PUBLIC transfer_engine gtest)
 add_test(NAME graceful_shutdown_test COMMAND graceful_shutdown_test)

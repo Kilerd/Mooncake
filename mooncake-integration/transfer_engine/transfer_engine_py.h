@@ -100,13 +100,13 @@ class TransferEnginePy {
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths,
-        const std::string &transport_hint = "");
+        const std::string &transport_hint = "", int64_t deadline_ms = 0);
 
     batch_id_t batchTransferAsyncRead(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths,
-        const std::string &transport_hint = "");
+        const std::string &transport_hint = "", int64_t deadline_ms = 0);
 
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,
@@ -127,9 +127,17 @@ class TransferEnginePy {
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths, TransferOpcode opcode,
-        const std::string &transport_hint = "");
+        const std::string &transport_hint = "", int64_t deadline_ms = 0);
 
     int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
+
+    // Batches of the async APIs (see batch_quiesce.h): non-blocking
+    // progress, a wait for quiescence, cancel, and free (only once
+    // quiesced). Unknown or freed ids raise ValueError.
+    pybind11::dict getBatchProgressPy(batch_id_t batch_id);
+    bool waitBatchQuiescedPy(batch_id_t batch_id, int64_t timeout_ms);
+    int cancelBatchPy(batch_id_t batch_id);
+    int freeBatchPy(batch_id_t batch_id);
 
 #ifdef USE_CUDA
     void batchTransferOnCuda(
@@ -223,4 +231,23 @@ class TransferEnginePy {
     bool auto_discovery_;
 
     uint64_t transfer_timeout_nsec_;
+
+    // Batches this binding allocated and has not freed, with the requests
+    // their tasks point at (they must outlive the batch).
+    std::mutex batches_mu_;
+    std::unordered_map<batch_id_t,
+                       std::shared_ptr<std::vector<TransferRequest>>>
+        live_batches_;
+    // Requests of sync attempts left unquiesced (never freed).
+    std::vector<std::shared_ptr<std::vector<TransferRequest>>>
+        unquiesced_requests_;
+    // How long a failed or timed-out attempt is waited for to quiesce
+    // (MC_TRANSFER_QUIESCE_WAIT_MS, default 10000).
+    int64_t quiesce_wait_ms_ = 10000;
+
+    bool knownBatch(batch_id_t batch_id);
+    int freeBatch(batch_id_t batch_id);  // 0 freed, -1 not quiesced
+    int runSync(const char *target_hostname, Transport::SegmentHandle handle,
+                const std::shared_ptr<std::vector<TransferRequest>> &entries,
+                int max_attempts, int64_t timeout_ns, TransferNotify *notify);
 };
