@@ -53,7 +53,8 @@ void BoundedSubmitter::release(size_t n) {
     cv_.notify_all();
 }
 
-bool BoundedSubmitter::quiesced(Transport::BatchDesc &batch) {
+namespace {
+bool allTasksTerminal(Transport::BatchDesc &batch) {
     for (auto &task : batch.task_list) {
         const uint64_t slices =
             __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
@@ -62,7 +63,22 @@ bool BoundedSubmitter::quiesced(Transport::BatchDesc &batch) {
             __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
         if (slices != 0 && done != slices) return false;
     }
-    return batch.control.unconfirmed()->load(std::memory_order_acquire) <= 0;
+    return true;
+}
+}  // namespace
+
+bool BoundedSubmitter::quiesced(Transport::BatchDesc &batch) {
+    return allTasksTerminal(batch) &&
+           batch.control.unconfirmed()->load(std::memory_order_acquire) <= 0;
+}
+
+bool BoundedSubmitter::settled(Transport::BatchDesc &batch) {
+    if (!allTasksTerminal(batch)) return false;
+    // Unprovable first (it is counted in unconfirmed first).
+    const int64_t unprovable =
+        batch.control.unprovable()->load(std::memory_order_acquire);
+    return batch.control.unconfirmed()->load(std::memory_order_acquire) <=
+           unprovable;
 }
 
 BoundedSubmitter::Result BoundedSubmitter::run(
@@ -70,7 +86,8 @@ BoundedSubmitter::Result BoundedSubmitter::run(
     const std::vector<const Transport::TransferRequest *> &requests,
     int64_t deadline_ns, int64_t abandon_ns,
     const std::function<void(size_t, bool)> &on_done,
-    const OnAbandon &on_abandon, const std::function<bool()> &canceled_by) {
+    const OnAbandon &on_abandon, const std::function<bool()> &canceled_by,
+    const OnUnprovable &on_unprovable) {
     using TransferStatusEnum = Transport::TransferStatusEnum;
     Result result;
     std::vector<size_t> pending(requests.size());
@@ -114,10 +131,10 @@ BoundedSubmitter::Result BoundedSubmitter::run(
             bool abandoned = false;
             bool canceled = false;
             // Until every task is terminal, and then until the attempt is
-            // quiesced (no cut transfer its receiver has not confirmed): a
+            // settled (no cut transfer its receiver may still confirm): a
             // failed request is not retried while an earlier attempt of it
             // may still be applied.
-            while (open > 0 || !quiesced(*batch)) {
+            while (open > 0 || !settled(*batch)) {
                 for (size_t k = 0; k < n; ++k) {
                     if (state[k]) continue;
                     Transport::TransferStatus st;
@@ -132,7 +149,7 @@ BoundedSubmitter::Result BoundedSubmitter::run(
                         --open;
                     }
                 }
-                if (open == 0 && quiesced(*batch)) break;
+                if (open == 0 && settled(*batch)) break;
                 const int64_t now = nowNs();
                 if (!canceled && open > 0 &&
                     (now > deadline_ns + 1000LL * 1000 * 1000 ||
@@ -161,14 +178,24 @@ BoundedSubmitter::Result BoundedSubmitter::run(
                 // its requests are reported failed below.
                 if (on_abandon) on_abandon(batch);  // else leaked
             }
+            // Settled, but a transfer of it can never be confirmed: its
+            // failed requests are not retried (it may still be applied),
+            // and the caller learns of it before they are reported.
+            const bool unprovable =
+                !abandoned && batch->control.unprovable()->load(
+                                  std::memory_order_acquire) > 0;
+            if (unprovable && on_unprovable) on_unprovable();
             size_t abandoned_now = 0;
             for (size_t k = 0; k < n; ++k) {
                 const size_t idx = pending[begin + k];
                 if (state[k] == 1) {
                     ++result.succeeded;
                     on_done(idx, true);
-                } else if (state[k] == 2 && !abandoned) {
+                } else if (state[k] == 2 && !abandoned && !unprovable) {
                     failed.push_back(idx);
+                } else if (state[k] == 2 && !abandoned) {
+                    ++result.failed;  // not retried (see above)
+                    on_done(idx, false);
                 } else {
                     // Still running, or failed in an attempt that is not
                     // quiesced: never retried, failed for good.

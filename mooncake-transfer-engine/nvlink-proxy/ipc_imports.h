@@ -63,12 +63,15 @@ namespace nvlink_proxy {
 
 constexpr size_t kImportHandleBytes = 64;
 
-// The process an engine runs in, as it reports itself (HELLO).
+// The process an engine runs in, as it reports itself (HELLO): a random
+// per-process token (0 from engines that do not send one), with pid and
+// node.
 struct ImportOwner {
     uint32_t pid = 0;
     std::string node;
+    uint64_t token = 0;
     bool operator==(const ImportOwner &o) const {
-        return pid == o.pid && node == o.node;
+        return pid == o.pid && node == o.node && token == o.token;
     }
 };
 

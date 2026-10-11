@@ -141,10 +141,14 @@ together with the exact address range in which that set is unchanged.
   waited for until quiesced before its requests are retried. Quiescence
   (`getBatchProgress`): a COPY the daemon did not answer -- it may still be
   running -- keeps its batch unquiesced until the late answer arrives on its
-  connection or a new daemon epoch shows the old daemon gone; a fallback
-  attempt not quiesced long after its deadline is handed to the health
+  connection, or until that connection closed (the daemon closes it only
+  after the copy returned, or when it exits) and then a new daemon epoch
+  shows the old daemon gone or the same daemon answers a ping; a fallback
+  attempt not settled long after its deadline is handed to the health
   thread, which keeps the batch unquiesced until the attempt is, and frees
-  it then.
+  it then. A fallback attempt with a write its TCP receiver can never
+  confirm (older than protocol v3) makes the caller's batch unprovable: it
+  never quiesces, and its failed requests are not retried.
 - Registrations are keyed by a random per-engine client id and the block base,
   both published in the segment metadata, so peers' cached metadata stays
   valid across daemon restarts.
@@ -163,11 +167,14 @@ together with the exact address range in which that set is unchanged.
   again returns the same pointer, and `cudaIpcCloseMemHandle` unmaps when
   the count reaches 0; the daemon keeps its own count to know who holds a
   mapping.) A mapping belongs to the engines that registered it, told apart
-  by their random client id and the (pid, node) they report. A restarted
+  by their random client id and the process they report: a random
+  per-process token plus (pid, node), since pid and node alone repeat
+  across containers of one pod (engines without the token are told apart
+  by (pid, node) only). A restarted
   engine registers under a new id (peers still naming the old one get
   `UNKNOWN_SOURCE` and use the base transport for that request). A handle
   whose bytes equal one already mapped is served from that mapping only to
-  another engine of the same process, (pid, node), while a holder is still
+  another engine of the same process while a holder is still
   connected (one allocation registered twice). For another process, or
   while the holder has disconnected and its copies are still in flight
   (e.g. a restarted engine whose handle bytes repeat its predecessor's: the
@@ -296,7 +303,9 @@ daemon.
   `--host-staging-wait-ms` (default 100) for them and is otherwise refused,
   and the engine uses its base transport.
 - Deadlines: the engine gives up on a copy after twice the start budget it
-  sends (its request timeout) and rewrites it over its base transport. The
+  sends (its request timeout) and rewrites it over its base transport; with
+  a batch deadline the budget is at most half the time left to it, so the
+  copy also ends before the batch deadline. The
   daemon issues nothing of a copy after the start budget, and works against
   a hard deadline a tenth of the budget (at least 50 ms) before the engine
   gives up:
@@ -313,6 +322,8 @@ daemon.
     slowdown at once, kept across copies (`rate_gbps`), and never faster
     than this copy's own progress. Until a rate is measured it is assumed to
     be 1 GB/s and the first chunk is at most 8 MiB and runs alone (a probe).
+    Chunks under 256 KiB are measured together (pooled until they add up to
+    256 KiB, less their fixed costs), so small copies alone warm a rate too.
     A chunk predicted to finish after the hard deadline is not issued: what
     is in flight is drained and the copy is refused with
     `DEADLINE_EXCEEDED` (`deadline_aborts`), also for host-staged copies.
@@ -321,8 +332,7 @@ daemon.
     two chunks or pieces per stream) runs slower than predicted, and after
     the engine gave up only if it runs slower by more than the margin -- a
     link that slows down abruptly within those chunks, or a link slower
-    than 1 GB/s during its first probe. The KV checksum of the engines
-    covers that case.
+    than 1 GB/s during its first probe.
 - Any other error on the host path refuses the request like a denied pair,
   so the engine falls back to its base transport, which rewrites every byte;
   TCP stays the last resort.
@@ -401,7 +411,8 @@ for another process or a disconnected engine).
 
 Unix stream socket, little-endian packed structs, see
 `mooncake-transfer-engine/include/transport/nvlink_proxy_transport/nvlink_proxy_protocol.h`.
-Messages: `HELLO` (client id, control flag; reply carries the daemon epoch),
+Messages: `HELLO` (client id, pid, control flag, node and process token;
+reply carries the daemon epoch),
 `REGISTER` (block base, size, GPU UUID, IPC handle), `UNREGISTER`, `COPY`
 (list of `(src client, src base, src offset, dst client, dst base,
 dst offset, length)` plus a start budget; replied after the copies completed),

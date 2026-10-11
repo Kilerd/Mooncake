@@ -119,6 +119,16 @@ std::string resolveNodeId() {
     return id;
 }
 
+// Random per process (the same for every engine in it), never 0.
+uint64_t processToken() {
+    static const uint64_t token = [] {
+        std::random_device rd;
+        uint64_t t = (uint64_t(rd()) << 32) ^ rd() ^ uint64_t(nowNs());
+        return t ? t : 1;
+    }();
+    return token;
+}
+
 uint64_t randomClientId() {
     std::random_device rd;
     uint64_t id = (uint64_t(rd()) << 32) ^ rd() ^ (uint64_t(getpid()) << 16) ^
@@ -318,8 +328,10 @@ bool NvlinkProxyTransport::hello(int fd, bool control, uint64_t &epoch) {
     HelloReq req{};
     req.client_id = client_id_;
     req.pid = static_cast<uint32_t>(getpid());
-    req.flags = control ? kHelloFlagControl : 0;
-    strncpy(req.node_id, node_id_.c_str(), kNodeIdSize - 1);
+    req.flags = (control ? kHelloFlagControl : 0) | kHelloFlagProcessToken;
+    strncpy(req.node_id, node_id_.c_str(), kHelloTokenOffset - 1);
+    const uint64_t token = processToken();
+    memcpy(req.node_id + kHelloTokenOffset, &token, sizeof(token));
     ProxyStatus st;
     std::string reply;
     if (!rpc(fd, MsgType::kHello, &req, sizeof(req), st, reply)) return false;
@@ -414,6 +426,7 @@ bool NvlinkProxyTransport::ensureControlLocked() {
     }
     control_fd_ = fd;
     epoch_ = epoch;
+    last_answer_ns_ = nowNs();
     size_t ok = 0, failed = 0;
     {
         std::lock_guard<std::mutex> lock(blocks_mu_);
@@ -531,7 +544,8 @@ void NvlinkProxyTransport::releaseCopyConnection(Connection &conn,
 
 NvlinkProxyTransport::CopyOutcome NvlinkProxyTransport::copy(
     const std::vector<CopyEntry> &entries, size_t begin, size_t count,
-    std::string &error, const UnconfirmedCounters &parents) {
+    std::string &error, const UnconfirmedCounters &parents,
+    int64_t deadline_ns) {
     Connection conn;
     if (!acquireCopyConnection(conn)) {
         error = std::string("cannot reach daemon: ") + strerror(errno);
@@ -542,8 +556,15 @@ NvlinkProxyTransport::CopyOutcome NvlinkProxyTransport::copy(
     CopyReqHeader rh{};
     rh.count = static_cast<uint32_t>(count);
     // The daemon refuses to *start* after half the timeout, so a copy we
-    // gave up on cannot land after the fallback transport rewrote the data.
-    rh.budget_ms = static_cast<uint32_t>(timeout_ms_ / 2);
+    // gave up on cannot land after the fallback transport rewrote the data;
+    // it also paces its issue to end within twice the budget, so half of
+    // the time left to the batch deadline ends the copy before that.
+    int64_t budget_ms = timeout_ms_ / 2;
+    if (deadline_ns != 0) {
+        const int64_t left_ms = (deadline_ns - nowNs()) / 1000000LL;
+        budget_ms = std::min<int64_t>(budget_ms, left_ms / 2);
+    }
+    rh.budget_ms = static_cast<uint32_t>(std::max<int64_t>(budget_ms, 1));
     payload.reserve(sizeof(rh) + count * sizeof(CopyEntry));
     payload.append(reinterpret_cast<const char *>(&rh), sizeof(rh));
     payload.append(reinterpret_cast<const char *>(entries.data() + begin),
@@ -618,6 +639,7 @@ void NvlinkProxyTransport::healthLoop() {
                 std::string reply;
                 ok = rpc(control_fd_, MsgType::kPing, nullptr, 0, st, reply) &&
                      st == ProxyStatus::kOk;
+                if (ok) last_answer_ns_ = nowNs();
                 if (!ok) {
                     LOG(WARNING)
                         << "nvlink_proxy: lost daemon connection ("
@@ -898,15 +920,19 @@ void NvlinkProxyTransport::fallback(const std::vector<TransferTask *> &tasks,
     const int64_t abandon_ns =
         deadline_ns + std::max<int64_t>(timeout_ms_, 10000) * 1000000LL;
     const UnconfirmedCounters parents = countersOf(tasks, 0, tasks.size());
+    const UnconfirmedCounters parents_unprovable =
+        countersOf(tasks, 0, tasks.size(), true);
     auto res = fallback_submitter_->run(
         fallback_, requests, deadline_ns, abandon_ns,
         [&](size_t i, bool ok) {
             ok ? completeTask(tasks[i]) : failTask(tasks[i]);
         },
-        [this, &parents](Transport::BatchDesc *batch) {
-            // Not quiesced yet: the caller's batches stay unquiesced until
+        [this, &parents, &parents_unprovable](Transport::BatchDesc *batch) {
+            // Not settled yet: the caller's batches stay unquiesced until
             // it is (the health thread frees it then).
-            addUnconfirmed(Unconfirmed{-1, 0, batch, parents});
+            Unconfirmed u{-1, 0, batch, parents};
+            u.parents_unprovable = parents_unprovable;
+            addUnconfirmed(std::move(u));
         },
         [&tasks]() {
             for (auto *task : tasks)
@@ -914,6 +940,15 @@ void NvlinkProxyTransport::fallback(const std::vector<TransferTask *> &tasks,
                     Transport::toBatchDesc(task->batch_id).control.canceled())
                     return true;
             return false;
+        },
+        [&parents, &parents_unprovable]() {
+            // An attempt settled with a write its receiver can never confirm
+            // (TCP receiver older than protocol v3): so are the caller's
+            // batches (counted unconfirmed first, then unprovable).
+            for (auto &counter : parents)
+                counter->fetch_add(1, std::memory_order_acq_rel);
+            for (auto &counter : parents_unprovable)
+                counter->fetch_add(1, std::memory_order_acq_rel);
         });
     counters_.fallback_retries += res.retried;
     if (res.failed) {
@@ -1007,8 +1042,17 @@ Status NvlinkProxyTransport::submitTransferTask(
                 std::min(kMaxEntriesPerCopy, proxied.size() - begin);
             const int64_t t0 = nowNs();
             std::string err;
-            const CopyOutcome outcome = copy(entries, begin, count, err,
-                                             countersOf(proxied, begin, count));
+            int64_t copy_deadline = 0;
+            for (size_t i = begin; i < begin + count; ++i) {
+                if (!proxied[i]->batch_id) continue;
+                const int64_t d = Transport::toBatchDesc(proxied[i]->batch_id)
+                                      .control.deadlineNs();
+                if (d != 0 && (copy_deadline == 0 || d < copy_deadline))
+                    copy_deadline = d;
+            }
+            const CopyOutcome outcome =
+                copy(entries, begin, count, err,
+                     countersOf(proxied, begin, count), copy_deadline);
             if (outcome != CopyOutcome::kOk) {
                 auto &dst = outcome == CopyOutcome::kFailed ? failed : retry;
                 dst.insert(dst.end(), proxied.begin() + begin,
@@ -1069,12 +1113,15 @@ Status NvlinkProxyTransport::submitTransferTask(
 }
 
 NvlinkProxyTransport::UnconfirmedCounters NvlinkProxyTransport::countersOf(
-    const std::vector<TransferTask *> &tasks, size_t begin, size_t count) {
+    const std::vector<TransferTask *> &tasks, size_t begin, size_t count,
+    bool unprovable) {
     UnconfirmedCounters out;
     for (size_t i = begin; i < begin + count && i < tasks.size(); ++i) {
         if (!tasks[i] || !tasks[i]->batch_id) continue;
+        const auto &control =
+            Transport::toBatchDesc(tasks[i]->batch_id).control;
         auto counter =
-            Transport::toBatchDesc(tasks[i]->batch_id).control.unconfirmed();
+            unprovable ? control.unprovable() : control.unconfirmed();
         if (std::find(out.begin(), out.end(), counter) == out.end())
             out.push_back(counter);
     }
@@ -1095,9 +1142,14 @@ void NvlinkProxyTransport::reapUnconfirmed() {
     const uint64_t epoch = epoch_.load();
     for (auto it = unconfirmed_.begin(); it != unconfirmed_.end();) {
         bool confirmed = false;
+        bool unprovable = false;
         if (it->batch) {
-            confirmed = BoundedSubmitter::quiesced(*it->batch);
+            confirmed = BoundedSubmitter::settled(*it->batch);
             if (confirmed) {
+                // Never to be confirmed: the caller's batches stay counted
+                // in unconfirmed, and now also in unprovable.
+                unprovable = it->batch->control.unprovable()->load(
+                                 std::memory_order_acquire) > 0;
                 delete it->batch;
                 it->batch = nullptr;
             }
@@ -1106,25 +1158,41 @@ void NvlinkProxyTransport::reapUnconfirmed() {
                 pollfd p{it->fd, POLLIN, 0};
                 if (poll(&p, 1, 0) > 0) {
                     char c;
-                    const ssize_t n = recv(it->fd, &c, 1, MSG_PEEK);
-                    // The late reply: the copy finished. End of stream or
-                    // an error: the daemon dropped the connection; wait for
-                    // a new epoch.
-                    confirmed = n > 0;
-                    close(it->fd);
-                    it->fd = -1;
+                    const ssize_t n =
+                        recv(it->fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+                    if (n > 0) {
+                        confirmed = true;  // the late reply: copy finished
+                    } else if (n == 0 ||
+                               (errno != EAGAIN && errno != EWOULDBLOCK &&
+                                errno != EINTR)) {
+                        // Closed without a reply: the copy returned, or the
+                        // daemon is exiting (a draining daemon closes it
+                        // only when it exits).
+                        close(it->fd);
+                        it->fd = -1;
+                        it->closed_ns = nowNs();
+                    }
                 }
             }
-            if (!confirmed && epoch != 0 && epoch != it->epoch)
-                confirmed = true;  // a new daemon: the old one is gone
+            // A new daemon epoch since: the old daemon is gone. The same
+            // daemon answering since: it is alive, so the close came from
+            // the connection's thread after the copy returned.
+            if (!confirmed && it->closed_ns != 0 && epoch != 0 &&
+                (epoch != it->epoch || last_answer_ns_.load() > it->closed_ns))
+                confirmed = true;
         }
         if (!confirmed) {
             ++it;
             continue;
         }
         if (it->fd >= 0) close(it->fd);
-        for (auto &counter : it->parents)
-            counter->fetch_sub(1, std::memory_order_acq_rel);
+        if (unprovable) {
+            for (auto &counter : it->parents_unprovable)
+                counter->fetch_add(1, std::memory_order_acq_rel);
+        } else {
+            for (auto &counter : it->parents)
+                counter->fetch_sub(1, std::memory_order_acq_rel);
+        }
         it = unconfirmed_.erase(it);
     }
 }

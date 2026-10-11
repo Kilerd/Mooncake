@@ -18,6 +18,8 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -30,6 +32,7 @@
 #include "transfer_engine.h"
 #include "transport/nvlink_proxy_transport/bounded_submitter.h"
 #include "transport/nvlink_proxy_transport/nvlink_proxy_protocol.h"
+#include "transport/nvlink_proxy_transport/nvlink_proxy_transport.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
@@ -395,6 +398,18 @@ class ScriptedTransport : public Transport {
         for (auto *slice : slices)
             if (slice->status == Slice::PENDING) slice->markSuccess();
     }
+    // Every pending transfer is cut, and its "receiver" can never confirm
+    // that (a TCP receiver older than protocol v3).
+    void failAllUnprovable() {
+        std::lock_guard<std::mutex> lock(mu);
+        for (auto *slice : slices) {
+            if (slice->status != Slice::PENDING) continue;
+            auto &control = toBatchDesc(slice->task->batch_id).control;
+            control.unconfirmed()->fetch_add(1);
+            control.unprovable()->fetch_add(1);
+            slice->markFailed();
+        }
+    }
 
    private:
     int registerLocalMemory(void *, size_t, const std::string &, bool,
@@ -450,6 +465,47 @@ TEST(NvlinkProxyTransport, BoundedSubmitterCancelsAndWaitsForQuiescence) {
     EXPECT_LT(took_ms, 5000);
 }
 
+// An attempt that settles with a transfer its receiver can never confirm:
+// the caller learns of it first, and its failed requests are reported at
+// once and never retried (they may still be applied).
+TEST(NvlinkProxyTransport, BoundedSubmitterNeverRetriesAnUnprovableAttempt) {
+    ScriptedTransport base;
+    std::vector<Transport::TransferRequest> reqs(3);
+    std::vector<const Transport::TransferRequest *> ptrs;
+    for (auto &r : reqs) {
+        r.length = 64;
+        ptrs.push_back(&r);
+    }
+    BoundedSubmitter submitter(16, 16);
+    const int64_t t0 = steadyNowNs();
+    std::thread cut([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        base.failAllUnprovable();
+    });
+    std::atomic<int> failed{0}, unprovable{0};
+    bool told_first = true;
+    auto res = submitter.run(
+        &base, ptrs, t0 + 5LL * 1000 * 1000 * 1000,
+        t0 + 10LL * 1000 * 1000 * 1000,
+        [&](size_t, bool ok) {
+            if (!ok) {
+                ++failed;
+                if (!unprovable) told_first = false;
+            }
+        },
+        nullptr, nullptr, [&] { ++unprovable; });
+    cut.join();
+    const int64_t took_ms = (steadyNowNs() - t0) / 1000000;
+    EXPECT_EQ(unprovable.load(), 1);
+    EXPECT_TRUE(told_first);
+    EXPECT_EQ(failed.load(), 3);
+    EXPECT_EQ(res.failed, 3u);
+    EXPECT_EQ(res.retried, 0u);
+    EXPECT_EQ(res.abandoned, 0u);
+    EXPECT_EQ(base.cancels.load(), 0);
+    EXPECT_LT(took_ms, 1000);
+}
+
 // An attempt that is not quiesced by the abandon time is handed over (its
 // caller then counts it unconfirmed) before its requests are reported
 // failed; it is freed only once quiesced.
@@ -484,4 +540,73 @@ TEST(NvlinkProxyTransport, BoundedSubmitterHandsOverAnUnquiescedAttempt) {
     base.completeAll();
     EXPECT_TRUE(BoundedSubmitter::quiesced(*handed));
     delete handed;
+}
+
+namespace mooncake {
+struct NvlinkProxyTransportTestAccess {
+    static void setDaemon(NvlinkProxyTransport &t, uint64_t epoch,
+                          int64_t answered_ns) {
+        t.epoch_ = epoch;
+        t.last_answer_ns_ = answered_ns;
+    }
+    static void addUnansweredCopy(
+        NvlinkProxyTransport &t, int fd, uint64_t epoch,
+        const std::shared_ptr<std::atomic<int64_t>> &counter) {
+        NvlinkProxyTransport::Unconfirmed u;
+        u.fd = fd;
+        u.epoch = epoch;
+        u.parents.push_back(counter);
+        t.addUnconfirmed(std::move(u));
+    }
+    static void reap(NvlinkProxyTransport &t) { t.reapUnconfirmed(); }
+};
+}  // namespace mooncake
+
+// An unanswered COPY stays unconfirmed while its connection is open, even
+// when a new daemon epoch is up (the old daemon may still be draining it);
+// once the connection closed, a new epoch or an answer from the same daemon
+// confirms it, and a late reply confirms it at once.
+TEST(NvlinkProxyTransport, UnansweredCopyConfirmedOnlyAfterItsConnectionEnds) {
+    using Access = NvlinkProxyTransportTestAccess;
+    NvlinkProxyTransport proxy;
+    auto counter = std::make_shared<std::atomic<int64_t>>(0);
+
+    // A new daemon epoch while the old daemon still holds the connection.
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    Access::addUnansweredCopy(proxy, fds[0], 1, counter);
+    EXPECT_EQ(counter->load(), 1);
+    Access::setDaemon(proxy, 2, steadyNowNs());
+    Access::reap(proxy);
+    EXPECT_EQ(counter->load(), 1);
+    close(fds[1]);  // the old daemon exits
+    Access::reap(proxy);
+    EXPECT_EQ(counter->load(), 0);
+
+    // The same daemon closed it (no new epoch): confirmed only once that
+    // daemon answers after the close; never while no daemon answers.
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    Access::setDaemon(proxy, 3, steadyNowNs());
+    Access::addUnansweredCopy(proxy, fds[0], 3, counter);
+    close(fds[1]);
+    Access::reap(proxy);
+    EXPECT_EQ(counter->load(), 1);
+    Access::setDaemon(proxy, 0, 0);
+    Access::reap(proxy);
+    EXPECT_EQ(counter->load(), 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Access::setDaemon(proxy, 3, steadyNowNs());
+    Access::reap(proxy);
+    EXPECT_EQ(counter->load(), 0);
+
+    // The late reply.
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    Access::addUnansweredCopy(proxy, fds[0], 3, counter);
+    Access::reap(proxy);
+    EXPECT_EQ(counter->load(), 1);
+    const char reply = 1;
+    ASSERT_EQ(write(fds[1], &reply, 1), 1);
+    Access::reap(proxy);
+    EXPECT_EQ(counter->load(), 0);
+    close(fds[1]);
 }

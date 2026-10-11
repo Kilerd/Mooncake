@@ -257,8 +257,9 @@ TEST(NvlinkProxyPacedIssue, RateModelLearnsSlowdownsFast) {
     RateModel m;
     EXPECT_FALSE(m.warm());
     EXPECT_DOUBLE_EQ(m.psPerByte(), RateModel::kSeedPsPerByte);
-    m.observe(1024, 5000.0);  // below kMinSampleBytes: ignored
+    m.observe(1024, 5000.0);  // below kMinSampleBytes: pooled, not used yet
     EXPECT_FALSE(m.warm());
+    EXPECT_DOUBLE_EQ(m.psPerByte(), RateModel::kSeedPsPerByte);
     const uint64_t mib = 1ull << 20;
     m.observe(mib, 1000.0 + RateModel::kOverheadUs);  // ~1 GB/s
     ASSERT_TRUE(m.warm());
@@ -270,6 +271,26 @@ TEST(NvlinkProxyPacedIssue, RateModelLearnsSlowdownsFast) {
     m.observe(mib, 1000.0 + RateModel::kOverheadUs);  // faster: an eighth
     EXPECT_NEAR(m.psPerByte(), slow - (slow - base) / 8, 1.0);
     EXPECT_NEAR(predictUs(mib, base), RateModel::kOverheadUs + 1000.0, 1.0);
+}
+
+// A model that only ever sees chunks smaller than kMinSampleBytes still
+// warms up: the small samples are pooled into one (less their fixed costs).
+TEST(NvlinkProxyPacedIssue, RateModelWarmsFromSmallChunks) {
+    RateModel m;
+    const uint64_t small = 64ull << 10;
+    const size_t n = RateModel::kMinSampleBytes / small;
+    for (size_t i = 0; i + 1 < n; ++i) {
+        m.observe(small, 64.0 + RateModel::kOverheadUs);  // ~1 GB/s
+        EXPECT_FALSE(m.warm());
+    }
+    m.observe(small, 64.0 + RateModel::kOverheadUs);
+    ASSERT_TRUE(m.warm());
+    EXPECT_NEAR(m.psPerByte(), 64.0 * 1e6 / double(small), 1.0);
+    // Pooled samples that are all fixed cost count as their whole time.
+    RateModel f;
+    for (size_t i = 0; i < n; ++i) f.observe(small, 1.0);
+    ASSERT_TRUE(f.warm());
+    EXPECT_NEAR(f.psPerByte(), double(n) * 1e6 / double(n * small), 1e-6);
 }
 
 // Every chunk issued and landed when it returns; never more than the window
@@ -587,6 +608,26 @@ TEST(NvlinkProxyImports, RestartedEngineIsNeverServedFromAStaleMapping) {
     EXPECT_TRUE(fresh.opened);
     EXPECT_EQ(t.mappingsOf(old_engine), 0u);
     EXPECT_EQ(t.mappingsOf(new_engine), 1u);
+}
+
+// Two processes that report the same pid and node (the first process of
+// two containers of one pod) are told apart by their process tokens.
+TEST(NvlinkProxyImports, SamePidAndNodeOfTwoProcessesIsNotShared) {
+    FakeDriver drv;
+    Table t(DriverRef{&drv});
+    std::set<uint64_t> live = {0xA, 0xB, 0xC};
+    const Connected conn{&live};
+    const ImportOwner first{7, "node-1", 0x1234}, second{7, "node-1", 0x5678};
+    const auto h = handleOf("same-bytes");
+    ASSERT_EQ(t.acquire(0xA, first, 0, h.data(), conn).status,
+              Table::Status::kOk);
+    EXPECT_EQ(t.acquire(0xB, second, 0, h.data(), conn).status,
+              Table::Status::kConflict);
+    // Another engine of the first process still shares it.
+    auto c = t.acquire(0xC, first, 0, h.data(), conn);
+    ASSERT_EQ(c.status, Table::Status::kOk);
+    EXPECT_TRUE(c.shared);
+    EXPECT_EQ(drv.opens, 1);
 }
 
 TEST(NvlinkProxyImports, OpenErrorLeavesNothingBehind) {

@@ -1629,6 +1629,7 @@ struct Connection {
     uint64_t client_id = 0;
     uint32_t pid = 0;  // as reported by the client (its PID namespace)
     std::string node;
+    uint64_t token = 0;  // the client's process token (0: none sent)
     // Registrations created through this (control) connection.
     std::map<uint64_t, std::shared_ptr<Registration>> owned;
     // GPUs this connection registered blocks on (self-test trigger).
@@ -1725,7 +1726,15 @@ void handleConnection(int fd) {
                 }
                 c.client_id = req.client_id;
                 c.pid = req.pid;
-                c.node.assign(req.node_id, strnlen(req.node_id, kNodeIdSize));
+                const bool has_token = req.flags & kHelloFlagProcessToken;
+                c.node.assign(
+                    req.node_id,
+                    strnlen(req.node_id,
+                            has_token ? kHelloTokenOffset - 1 : kNodeIdSize));
+                c.token = 0;
+                if (has_token)
+                    memcpy(&c.token, req.node_id + kHelloTokenOffset,
+                           sizeof(c.token));
                 bool was_control = c.control;
                 c.control = c.control || (req.flags & kHelloFlagControl);
                 c.hello = true;
@@ -1834,6 +1843,7 @@ void handleConnection(int fd) {
                         reg->client_id = c.client_id;
                         reg->owner.pid = c.pid;
                         reg->owner.node = c.node;
+                        reg->owner.token = c.token;
                         reg->base = req.base;
                         reg->size = req.size;
                         reg->device = dev;

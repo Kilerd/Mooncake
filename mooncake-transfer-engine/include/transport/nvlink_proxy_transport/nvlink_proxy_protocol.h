@@ -107,6 +107,13 @@ inline const char *proxyStatusName(ProxyStatus s) {
 // HELLO flag: this connection owns registrations. The daemon drops every
 // registration made on it when the connection closes.
 constexpr uint32_t kHelloFlagControl = 1u << 0;
+// HELLO flag: node_id holds the node text (NUL-terminated, at most
+// kHelloTokenOffset - 1 bytes) and, at kHelloTokenOffset, a random 64-bit
+// token of the engine's process. The daemon tells processes apart by it:
+// pid and node alone repeat across PID namespaces (containers of a pod).
+// Daemons that do not know the flag read only the text.
+constexpr uint32_t kHelloFlagProcessToken = 1u << 1;
+constexpr size_t kHelloTokenOffset = 56;
 
 #pragma pack(push, 1)
 struct MsgHeader {
@@ -122,8 +129,10 @@ struct HelloReq {
     uint64_t client_id;
     uint32_t pid;
     uint32_t flags;
-    char node_id[kNodeIdSize];  // diagnostics only, NUL padded
+    char node_id[kNodeIdSize];  // NUL padded (see kHelloFlagProcessToken)
 };
+static_assert(kHelloTokenOffset + sizeof(uint64_t) <= kNodeIdSize,
+              "process token fits in node_id");
 
 struct HelloResp {
     uint64_t daemon_epoch;  // random per daemon start

@@ -71,7 +71,8 @@ class RateModel {
     static constexpr double kSeedPsPerByte = 1000.0;
     // Fixed cost of a chunk (submission, launch, completion) in microseconds.
     static constexpr double kOverheadUs = 20.0;
-    // Samples of fewer bytes are dominated by the fixed cost: not used.
+    // Samples of fewer bytes are dominated by the fixed cost: they are
+    // pooled until they add up to this much, then used as one.
     static constexpr uint64_t kMinSampleBytes = 256ull << 10;
 
     bool warm() const {
@@ -87,13 +88,32 @@ class RateModel {
 
     // |bytes| took |us| (from start to completion). The first sample replaces
     // the seed; later ones move the estimate by 1/2 when slower (a slowdown
-    // is followed at once) and by 1/8 when faster.
+    // is followed at once) and by 1/8 when faster. Small samples are pooled
+    // (so a model that only ever sees small chunks still warms up).
     void observe(uint64_t bytes, double us) {
-        if (bytes < kMinSampleBytes || us <= 0) return;
-        const double ps =
-            std::max(0.0, us - kOverheadUs) * 1e6 / static_cast<double>(bytes);
-        if (ps <= 0) return;
+        if (bytes == 0 || us <= 0) return;
         std::lock_guard<std::mutex> lock(mu_);
+        double ps;
+        if (bytes < kMinSampleBytes) {
+            pooled_bytes_ += bytes;
+            pooled_us_ += us;
+            ++pooled_count_;
+            if (pooled_bytes_ < kMinSampleBytes) return;
+            const double total_us = pooled_us_;
+            const double fixed_us = pooled_count_ * kOverheadUs;
+            const double pooled = static_cast<double>(pooled_bytes_);
+            pooled_bytes_ = 0;
+            pooled_us_ = 0;
+            pooled_count_ = 0;
+            // All of it fixed cost by the model: take the whole time (slower
+            // than any real rate, so on the safe side).
+            ps = (total_us > fixed_us ? total_us - fixed_us : total_us) * 1e6 /
+                 pooled;
+        } else {
+            ps = std::max(0.0, us - kOverheadUs) * 1e6 /
+                 static_cast<double>(bytes);
+            if (ps <= 0) return;
+        }
         if (!warm_) {
             ps_per_byte_ = ps;
             warm_ = true;
@@ -107,6 +127,9 @@ class RateModel {
     mutable std::mutex mu_;
     double ps_per_byte_ = kSeedPsPerByte;
     bool warm_ = false;
+    uint64_t pooled_bytes_ = 0;
+    double pooled_us_ = 0;
+    uint64_t pooled_count_ = 0;
 };
 
 // Predicted run time of |bytes| at |ps_per_byte|, in microseconds.

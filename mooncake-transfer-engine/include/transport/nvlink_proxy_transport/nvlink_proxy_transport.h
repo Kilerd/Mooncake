@@ -86,6 +86,8 @@ class NvlinkProxyTransport : public Transport {
     const char *getName() const override { return "nvlink_proxy"; }
 
    private:
+    friend struct NvlinkProxyTransportTestAccess;
+
     struct Block {
         uint64_t base = 0;
         uint64_t size = 0;
@@ -125,26 +127,42 @@ class NvlinkProxyTransport : public Transport {
     void releaseCopyConnection(Connection &conn, bool reusable);
     using UnconfirmedCounters =
         std::vector<std::shared_ptr<std::atomic<int64_t>>>;
+    // |deadline_ns|: the earliest batch deadline among the entries (0:
+    // none); the daemon gets a start budget that ends its copy before it.
     CopyOutcome copy(const std::vector<nvlink_proxy::CopyEntry> &entries,
                      size_t begin, size_t count, std::string &error,
-                     const UnconfirmedCounters &parents);
+                     const UnconfirmedCounters &parents, int64_t deadline_ns);
 
     // Attempts this transport cannot prove finished, counted in their
     // batches' unconfirmed (Transport::BatchControl) until the health
-    // thread confirms them: a COPY the daemon did not answer (confirmed by
-    // its late reply, or by a new daemon epoch: the old daemon is gone), and
-    // a fallback attempt abandoned before it was quiesced (confirmed once it
-    // is; then freed).
+    // thread confirms them: a COPY the daemon did not answer, and a fallback
+    // attempt abandoned before it was settled (confirmed once it is
+    // quiesced, then freed; one that settles unprovable is freed and stays
+    // counted). The daemon runs a COPY on its connection's thread and closes
+    // that connection only after the copy returned (drained) or when it
+    // exits, so an unanswered COPY is confirmed by its late reply, or once
+    // its connection closed and then either a new daemon epoch shows the
+    // old daemon gone or the same daemon answered a ping (it is alive, so
+    // the connection's thread had returned).
     struct Unconfirmed {
         int fd = -1;         // unanswered COPY connection (-1: closed)
         uint64_t epoch = 0;  // the daemon it was sent to
         Transport::BatchDesc *batch = nullptr;  // abandoned fallback attempt
         UnconfirmedCounters parents;
+        // When the connection was seen closed without a reply (0: not yet).
+        int64_t closed_ns = 0;
+        // The parents' unprovable counters: an abandoned attempt that
+        // settles with an unprovable transfer stays counted in |parents|
+        // and is counted here too (the caller's batches never quiesce).
+        UnconfirmedCounters parents_unprovable;
     };
     void addUnconfirmed(Unconfirmed u);
     void reapUnconfirmed();
+    // The unconfirmed (or, with |unprovable|, the unprovable) counters of
+    // the tasks' batches, each once, in task order.
     static UnconfirmedCounters countersOf(
-        const std::vector<TransferTask *> &tasks, size_t begin, size_t count);
+        const std::vector<TransferTask *> &tasks, size_t begin, size_t count,
+        bool unprovable = false);
 
     // Request translation: local address + remote buffer -> copy entry.
     enum class LocalBlockState { kNone, kUnregistered, kRegistered };
@@ -210,6 +228,8 @@ class NvlinkProxyTransport : public Transport {
     // time this client connected to the current daemon epoch.
     std::atomic<int64_t> outage_since_ns_{0};
     std::atomic<int64_t> epoch_since_ns_{0};
+    // Last time the daemon of epoch_ answered on the control connection.
+    std::atomic<int64_t> last_answer_ns_{0};
     std::mutex state_mu_;
     std::condition_variable state_cv_;  // signalled when healthy again
 
