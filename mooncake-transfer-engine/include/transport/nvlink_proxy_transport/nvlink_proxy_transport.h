@@ -217,7 +217,13 @@ class NvlinkProxyTransport : public Transport {
         std::atomic<uint64_t> retried_requests{0};  // re-sent to the daemon
         std::atomic<uint64_t> fallback_retries{0};  // re-sent to the base
         std::atomic<uint64_t> failed_requests{0};
+        // Blocks the daemon refused to register: their transfers use the
+        // base transport. not_visible: the daemon does not see the GPU.
+        std::atomic<uint64_t> register_refusals{0};
+        std::atomic<uint64_t> register_refusals_not_visible{0};
     } counters_;
+    std::atomic<int64_t> last_refusal_log_ns_{0};
+    std::atomic<uint64_t> suppressed_refusal_logs_{0};
     std::atomic<int64_t> last_fallback_log_ns_{0};
     std::atomic<uint64_t> suppressed_fallback_logs_{0};
     std::mutex stats_mu_;

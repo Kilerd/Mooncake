@@ -403,9 +403,17 @@ bool NvlinkProxyTransport::ensureControlLocked() {
     counters_.reconnects++;
     char ep[32];
     snprintf(ep, sizeof(ep), "%016" PRIx64, epoch);
-    LOG(INFO) << "nvlink_proxy: connected to daemon " << socket_path_
-              << " (epoch " << ep << "), registered " << ok << " block(s)"
-              << (failed ? ", " + std::to_string(failed) + " failed" : "");
+    if (failed) {
+        LOG(ERROR) << "nvlink_proxy: connected to daemon " << socket_path_
+                   << " (epoch " << ep << "), registered " << ok
+                   << " block(s); " << failed
+                   << " refused by the daemon: their transfers use the base "
+                      "transport (register_refusals="
+                   << counters_.register_refusals.load() << ")";
+    } else {
+        LOG(INFO) << "nvlink_proxy: connected to daemon " << socket_path_
+                  << " (epoch " << ep << "), registered " << ok << " block(s)";
+    }
     return true;
 }
 
@@ -428,11 +436,31 @@ bool NvlinkProxyTransport::registerBlockLocked(Block &block) {
         return false;
     }
     if (st != ProxyStatus::kOk) {
-        LOG(WARNING) << "nvlink_proxy: daemon refused block "
-                     << reinterpret_cast<void *>(block.base) << " ("
-                     << block.size << " bytes): " << proxyStatusName(st) << " "
-                     << reply
-                     << "; transfers from/to it use the base transport";
+        // Not silent: the block's transfers use the base transport from now
+        // on, typically because the daemon's container does not see this
+        // engine's GPU. Logged at most every 10 s, every refusal counted.
+        counters_.register_refusals++;
+        if (st == ProxyStatus::kUnknownDevice)
+            counters_.register_refusals_not_visible++;
+        const int64_t now = nowNs();
+        int64_t last = last_refusal_log_ns_.load();
+        if (now - last >= 10LL * 1000 * 1000 * 1000 &&
+            last_refusal_log_ns_.compare_exchange_strong(last, now)) {
+            const uint64_t more = suppressed_refusal_logs_.exchange(0);
+            LOG(ERROR)
+                << "nvlink_proxy: daemon refused block "
+                << reinterpret_cast<void *>(block.base) << " (" << block.size
+                << " bytes): " << proxyStatusName(st) << " " << reply
+                << (st == ProxyStatus::kUnknownDevice
+                        ? " (the daemon must see this engine's GPU: run it "
+                          "where every engine GPU is visible, e.g. "
+                          "NVIDIA_VISIBLE_DEVICES=all)"
+                        : "")
+                << "; transfers from/to it use the base transport"
+                << (more ? " [+" + std::to_string(more) + " similar]" : "");
+        } else {
+            suppressed_refusal_logs_++;
+        }
         return false;
     }
     block.registered_epoch = epoch_.load();
@@ -602,7 +630,8 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
         " daemon_error=%" PRIu64 " not_servable=%" PRIu64
         ") fallback_retries=%" PRIu64 " failed_requests=%" PRIu64
         " remote_node_requests=%" PRIu64
-        " registered_blocks=%zu/%zu connects=%" PRIu64,
+        " registered_blocks=%zu/%zu register_refusals=%" PRIu64
+        " (not_visible=%" PRIu64 ") connects=%" PRIu64,
         healthy_.load() ? 1 : 0, counters_.proxy_requests.load(),
         counters_.proxy_bytes.load(), batches,
         batches ? counters_.proxy_us_total.load() / batches : 0,
@@ -613,6 +642,8 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
         counters_.fallback_untranslatable.load(),
         counters_.fallback_retries.load(), counters_.failed_requests.load(),
         counters_.remote_node_requests.load(), registered, blocks,
+        counters_.register_refusals.load(),
+        counters_.register_refusals_not_visible.load(),
         counters_.reconnects.load());
     if (!force && last_stats_ == line) return;  // nothing changed
     last_stats_ = line;
