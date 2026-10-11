@@ -68,8 +68,11 @@
 #include <utility>
 #include <vector>
 
+#include "daemon_setup.h"
 #include "gather_copy.h"
+#include "ipc_imports.h"
 #include "p2p_policy.h"
+#include "paced_issue.h"
 #include "transport/nvlink_proxy_transport/nvlink_proxy_protocol.h"
 
 using namespace mooncake::nvlink_proxy;
@@ -236,6 +239,29 @@ bool isStickyCudaError(cudaError_t e) {
     _exit(70);
 }
 
+// ------------------------------------------------------------ IPC imports
+// Every legacy IPC handle the daemon opens, once per (GPU context, handle),
+// owned by one client and closed when its last registration is gone
+// (ipc_imports.h).
+struct CudaIpcOpener {
+    int open(int dev, const uint8_t *handle, void **ptr) {
+        cudaError_t e = cudaSetDevice(dev);
+        if (e != cudaSuccess) return static_cast<int>(e);
+        cudaIpcMemHandle_t h;
+        memcpy(&h, handle, sizeof(h));
+        e = cudaIpcOpenMemHandle(ptr, h, cudaIpcMemLazyEnablePeerAccess);
+        return static_cast<int>(e);
+    }
+    int close(int dev, void *ptr) {
+        cudaError_t e = cudaSetDevice(dev);
+        if (e == cudaSuccess) e = cudaIpcCloseMemHandle(ptr);
+        return static_cast<int>(e);
+    }
+};
+static_assert(kIpcHandleSize == kImportHandleBytes, "IPC handle size");
+using Imports = ImportTable<CudaIpcOpener>;
+Imports g_imports;
+
 // ----------------------------------------------------------- registrations
 struct Registration {
     uint64_t client_id = 0;
@@ -251,19 +277,32 @@ struct Registration {
     std::mutex mu;
     std::unordered_map<int, char *> mapped;  // pulling device -> mapped base
 
+    // The last reference is gone: the block was unregistered or replaced,
+    // or its engine's control connection closed, and no copy in flight uses
+    // it any more. Its mappings are closed now unless another registration
+    // of the same engine (a re-registration) still uses them.
     ~Registration() {
         for (auto &kv : mapped) {
-            cudaSetDevice(kv.first);
-            cudaError_t e = cudaIpcCloseMemHandle(kv.second);
-            if (e != cudaSuccess)
+            int err = 0;
+            const bool closed =
+                g_imports.release(client_id, kv.first, handle, &err);
+            if (err != 0)
                 LOGW("cudaIpcCloseMemHandle(client=%016" PRIx64
                      " base=%#" PRIx64 " dev=%d): %s",
-                     client_id, base, kv.first, cudaGetErrorString(e));
+                     client_id, base, kv.first,
+                     cudaGetErrorString(static_cast<cudaError_t>(err)));
+            if (closed)
+                LOGI("closed client=%016" PRIx64 " base=%#" PRIx64
+                     " (gpu %d) in gpu %d context",
+                     client_id, base, device, kv.first);
         }
     }
 
     // Map this block in |dev|'s context (the GPU that will pull/receive).
-    cudaError_t mapFor(int dev, char **out, bool *opened) {
+    // cudaErrorAlreadyMapped with *conflict set: the handle is mapped for
+    // another client (another engine process) and is not served from that
+    // mapping.
+    cudaError_t mapFor(int dev, char **out, bool *opened, uint64_t *conflict) {
         std::lock_guard<std::mutex> lock(mu);
         *opened = false;
         auto it = mapped.find(dev);
@@ -271,20 +310,21 @@ struct Registration {
             *out = it->second;
             return cudaSuccess;
         }
-        cudaError_t e = cudaSetDevice(dev);
-        if (e != cudaSuccess) return e;
-        cudaIpcMemHandle_t h;
-        memcpy(&h, handle, sizeof(h));
-        void *ptr = nullptr;
-        uint64_t t0 = nowUs();
-        e = cudaIpcOpenMemHandle(&ptr, h, cudaIpcMemLazyEnablePeerAccess);
-        if (e != cudaSuccess) return e;
-        LOGI("opened client=%016" PRIx64 " base=%#" PRIx64 " size=%" PRIu64
-             " (gpu %d) in gpu %d context in %.1f ms",
-             client_id, base, size, device, dev, (nowUs() - t0) / 1000.0);
-        mapped[dev] = static_cast<char *>(ptr);
-        *out = static_cast<char *>(ptr);
-        *opened = true;
+        const uint64_t t0 = nowUs();
+        const Imports::Acquired a = g_imports.acquire(client_id, dev, handle);
+        if (a.status == Imports::Status::kConflict) {
+            *conflict = a.other;
+            return cudaErrorAlreadyMapped;
+        }
+        if (a.status != Imports::Status::kOk)
+            return static_cast<cudaError_t>(a.error);
+        if (a.opened)
+            LOGI("opened client=%016" PRIx64 " base=%#" PRIx64 " size=%" PRIu64
+                 " (gpu %d) in gpu %d context in %.1f ms",
+                 client_id, base, size, device, dev, (nowUs() - t0) / 1000.0);
+        mapped[dev] = static_cast<char *>(a.ptr);
+        *out = static_cast<char *>(a.ptr);
+        *opened = a.opened;
         return cudaSuccess;
     }
 };
@@ -321,6 +361,11 @@ struct Stats {
     std::atomic<uint64_t> staged_copies{0};  // served through host memory
     std::atomic<uint64_t> staged_bytes{0};
     std::atomic<uint64_t> staged_failures{0};  // then refused (base transport)
+    // Copies stopped at their hard deadline (P2P or staged part): nothing
+    // more issued, the rest drained, refused.
+    std::atomic<uint64_t> deadline_aborts{0};
+    // REGISTER requests refused (GPU not visible, no context, bad range).
+    std::atomic<uint64_t> register_refusals{0};
 } g_stats;
 
 void updateMax(std::atomic<uint64_t> &m, uint64_t v) {
@@ -376,6 +421,13 @@ std::string statsText() {
     out += " staged_copies=" + std::to_string(g_stats.staged_copies.load()) +
            " staged_bytes=" + std::to_string(g_stats.staged_bytes.load()) +
            " staged_failures=" + std::to_string(g_stats.staged_failures.load());
+    out +=
+        " deadline_aborts=" + std::to_string(g_stats.deadline_aborts.load()) +
+        " register_refusals=" +
+        std::to_string(g_stats.register_refusals.load());
+    out += " ipc_mappings=" + std::to_string(g_imports.mappings()) +
+           " ipc_closes=" + std::to_string(g_imports.closes()) +
+           " ipc_conflicts=" + std::to_string(g_imports.conflicts());
     return out;
 }
 
@@ -391,7 +443,15 @@ struct CopyConfig {
     bool gather_on_src = false;
     // Merge consecutive entries that are contiguous in source and target.
     bool coalesce = true;
+    // Direct (P2P) work is issued in chunks of at most this many bytes, at
+    // most kPacedWindow in flight per GPU, the copy's hard deadline checked
+    // before each (paced_issue.h); bounds what is still in flight when the
+    // deadline passes.
+    uint64_t chunk_bytes = 32ull << 20;
 } g_cfg;
+
+// Entries per chunk (one cudaMemcpyBatchAsync call or kernel launch).
+constexpr size_t kChunkEntries = 8192;
 
 // Per connection-thread resources, one set per executing GPU.
 struct DeviceResources {
@@ -400,6 +460,8 @@ struct DeviceResources {
     GatherEntry *dev_table = nullptr;
     size_t capacity = 0;
     int grid_blocks = 0;
+    // Completion of the chunks in flight on |stream| (paced issue).
+    cudaEvent_t done[kPacedWindow] = {};
 };
 
 struct ThreadResources {
@@ -407,6 +469,8 @@ struct ThreadResources {
     ~ThreadResources() {
         for (auto &kv : devs) {
             cudaSetDevice(kv.first);
+            for (cudaEvent_t ev : kv.second.done)
+                if (ev) cudaEventDestroy(ev);
             if (kv.second.stream) cudaStreamDestroy(kv.second.stream);
             if (kv.second.dev_table) cudaFree(kv.second.dev_table);
             if (kv.second.host_table) cudaFreeHost(kv.second.host_table);
@@ -415,17 +479,27 @@ struct ThreadResources {
     cudaError_t get(int dev, DeviceResources **out) {
         auto &r = devs[dev];
         *out = &r;
-        if (r.stream) return cudaSuccess;
+        if (r.stream && r.done[kPacedWindow - 1]) return cudaSuccess;
         cudaError_t e = cudaSetDevice(dev);
         if (e != cudaSuccess) return e;
-        e = cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking);
-        if (e != cudaSuccess) {
-            r.stream = nullptr;
-            return e;
+        if (!r.stream) {
+            e = cudaStreamCreateWithFlags(&r.stream, cudaStreamNonBlocking);
+            if (e != cudaSuccess) {
+                r.stream = nullptr;
+                return e;
+            }
+            int sms = 0;
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+            r.grid_blocks = std::max(1, sms) * 16;
         }
-        int sms = 0;
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        r.grid_blocks = std::max(1, sms) * 16;
+        for (cudaEvent_t &ev : r.done) {
+            if (ev) continue;
+            e = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+            if (e != cudaSuccess) {
+                ev = nullptr;
+                return e;
+            }
+        }
         return cudaSuccess;
     }
     cudaError_t reserve(int dev, DeviceResources &r, size_t n) {
@@ -453,9 +527,8 @@ thread_local ThreadResources t_res;
 std::atomic<bool> g_batch_api_usable{true};
 std::atomic<bool> g_kernel_unusable[kMaxDevices];
 
-cudaError_t issueCopies(std::vector<void *> &dsts, std::vector<void *> &srcs,
-                        std::vector<size_t> &sizes, cudaStream_t stream) {
-    const size_t count = dsts.size();
+cudaError_t issueCopies(void **dsts, void **srcs, size_t *sizes, size_t count,
+                        cudaStream_t stream) {
     if (count == 0) return cudaSuccess;
 #if CUDART_VERSION >= 12080
     if (g_batch_api_usable.load(std::memory_order_relaxed)) {
@@ -464,19 +537,18 @@ cudaError_t issueCopies(std::vector<void *> &dsts, std::vector<void *> &srcs,
         cudaMemcpyAttributes attr{};
         attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
         size_t attr_idx = 0;
-        constexpr size_t kChunk = 8192;
-        for (size_t off = 0; off < count; off += kChunk) {
-            size_t n = std::min(kChunk, count - off);
+        for (size_t off = 0; off < count; off += kChunkEntries) {
+            size_t n = std::min(kChunkEntries, count - off);
 #if CUDART_VERSION >= 13000
             cudaError_t e = cudaMemcpyBatchAsync(
-                const_cast<const void **>(dsts.data() + off),
-                const_cast<const void **>(srcs.data() + off),
-                sizes.data() + off, n, &attr, &attr_idx, 1, stream);
+                const_cast<const void **>(dsts + off),
+                const_cast<const void **>(srcs + off), sizes + off, n, &attr,
+                &attr_idx, 1, stream);
 #else
             size_t fail_idx = n;
-            cudaError_t e = cudaMemcpyBatchAsync(
-                dsts.data() + off, srcs.data() + off, sizes.data() + off, n,
-                &attr, &attr_idx, 1, &fail_idx, stream);
+            cudaError_t e =
+                cudaMemcpyBatchAsync(dsts + off, srcs + off, sizes + off, n,
+                                     &attr, &attr_idx, 1, &fail_idx, stream);
 #endif
             if (e == cudaErrorNotSupported ||
                 e == cudaErrorCallRequiresNewerDriver) {
@@ -751,12 +823,14 @@ struct StagedItem {
 // Copies |items| from GPU |s| to GPU |d| through host memory. Waits for
 // staging slots until |wait_until_us|; stops issuing pieces once
 // |hard_deadline_us| has passed (the engine has given up on the copy by
-// then) and drains what is in flight before returning. False with *err set:
-// the caller refuses the copy (some pieces may have been written; the base
-// transport rewrites them all).
+// then) and drains what is in flight before returning. False with *err set
+// (and *deadline_hit when the hard deadline stopped it): the caller refuses
+// the copy (some pieces may have been written; the base transport rewrites
+// them all).
 bool stagedCopy(int s, int d, const std::vector<StagedItem> &items,
                 uint64_t wait_until_us, uint64_t hard_deadline_us,
-                std::string *err) {
+                std::string *err, bool *deadline_hit = nullptr) {
+    if (deadline_hit) *deadline_hit = false;
     StagingPool &pool = stagingPool(gpuNumaNode(s));
     char *slot[2] = {nullptr, nullptr};
     if (!pool.acquire(s, &slot[0], &slot[1],
@@ -904,6 +978,7 @@ bool stagedCopy(int s, int d, const std::vector<StagedItem> &items,
     }
     if (!why.empty()) {
         *err = why;
+        if (deadline_hit) *deadline_hit = true;
         return false;
     }
     return true;
@@ -974,15 +1049,39 @@ class MapResolver {
             }
         }
         bool opened = false;
-        cudaError_t e = reg->mapFor(dev, out, &opened);
+        cudaError_t e = reg->mapFor(dev, out, &opened, &conflict_);
         if (opened) g_stats.handle_opens++;
-        if (e != cudaSuccess) return e;
+        if (e != cudaSuccess) {
+            failed_ = reg;
+            return e;
+        }
         hot_[next_] = {reg, dev, *out};
         next_ = (next_ + 1) % kHot;
         return cudaSuccess;
     }
 
+    // Reply text for a failed map(): a CUDA error, or the handle is mapped
+    // for another client.
+    std::string error(cudaError_t e) const {
+        char m[320];
+        if (e == cudaErrorAlreadyMapped && conflict_ && failed_) {
+            snprintf(m, sizeof(m),
+                     "the IPC handle of block client=%016" PRIx64
+                     " base=%#" PRIx64 " is still mapped for client %016" PRIx64
+                     " (an earlier engine process whose copies have not "
+                     "finished); not served from that mapping",
+                     failed_->client_id, failed_->base, conflict_);
+        } else {
+            snprintf(m, sizeof(m), "cudaIpcOpenMemHandle: %s",
+                     cudaGetErrorString(e));
+        }
+        return m;
+    }
+
    private:
+    uint64_t conflict_ = 0;
+    const Registration *failed_ = nullptr;
+
     static constexpr int kHot = 4;
     struct Hot {
         Registration *reg = nullptr;
@@ -1085,6 +1184,13 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
     std::map<std::pair<int, int>, std::vector<StagedItem>> staged;
     uint64_t staged_bytes = 0;
     MapResolver maps;
+    // A block could not be mapped: refuse the copy (the engine uses its base
+    // transport for it).
+    auto mapFailed = [&](cudaError_t ce) {
+        if (isStickyCudaError(ce)) dieOnStickyError(ce, "IPC open");
+        cudaGetLastError();
+        return fail(ProxyStatus::kCudaError, count, maps.error(ce));
+    };
     // Maps both blocks in their own GPU's context and queues |it| for
     // host staging; the CUDA error otherwise.
     auto stage = [&](const Item &it) -> cudaError_t {
@@ -1101,13 +1207,7 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
         const Item &it = items[k];
         if (it.staged) {
             cudaError_t ce = stage(it);
-            if (ce != cudaSuccess) {
-                if (isStickyCudaError(ce)) dieOnStickyError(ce, "IPC open");
-                cudaGetLastError();
-                return fail(ProxyStatus::kCudaError, count,
-                            std::string("cudaIpcOpenMemHandle: ") +
-                                cudaGetErrorString(ce));
-            }
+            if (ce != cudaSuccess) return mapFailed(ce);
             continue;
         }
         const bool small = it.len < g_cfg.gather_threshold;
@@ -1122,11 +1222,7 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
             if (hostStageable(it.src->device, it.dst->device)) {
                 cudaError_t ce = stage(it);
                 if (ce == cudaSuccess) continue;
-                if (isStickyCudaError(ce)) dieOnStickyError(ce, "IPC open");
-                cudaGetLastError();
-                return fail(ProxyStatus::kCudaError, count,
-                            std::string("cudaIpcOpenMemHandle: ") +
-                                cudaGetErrorString(ce));
+                return mapFailed(ce);
             }
             char m[96];
             snprintf(m, sizeof(m), "gpu %d cannot access gpu %d (no P2P)", dev,
@@ -1136,13 +1232,7 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
         char *src_map = nullptr, *dst_map = nullptr;
         cudaError_t ce = maps.map(it.src, dev, &src_map);
         if (ce == cudaSuccess) ce = maps.map(it.dst, dev, &dst_map);
-        if (ce != cudaSuccess) {
-            if (isStickyCudaError(ce)) dieOnStickyError(ce, "IPC open");
-            cudaGetLastError();
-            return fail(
-                ProxyStatus::kCudaError, count,
-                std::string("cudaIpcOpenMemHandle: ") + cudaGetErrorString(ce));
-        }
+        if (ce != cudaSuccess) return mapFailed(ce);
         DevWork &w = work[dev];
         char *d = dst_map + it.dst_off;
         char *s = src_map + it.src_off;
@@ -1151,9 +1241,14 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
                                reinterpret_cast<uint64_t>(s), it.len});
             w.small_bytes += it.len;
         } else {
-            w.ce_dst.push_back(d);
-            w.ce_src.push_back(s);
-            w.ce_len.push_back(it.len);
+            // Pieces of at most one chunk, so that the work in flight at
+            // the deadline stays bounded.
+            for (uint64_t off = 0; off < it.len; off += g_cfg.chunk_bytes) {
+                const uint64_t n = std::min(it.len - off, g_cfg.chunk_bytes);
+                w.ce_dst.push_back(d + off);
+                w.ce_src.push_back(s + off);
+                w.ce_len.push_back(n);
+            }
             w.ce_bytes += it.len;
         }
     }
@@ -1169,9 +1264,11 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
     // The engine gives up on a copy after twice its start budget (its
     // request timeout; budget = timeout / 2) and rewrites it on its base
     // transport. Nothing of this copy may be written after that: no staged
-    // piece (at most one slot, a few ms) is issued past |hard_deadline| -- a
-    // tenth of the budget (at least 50 ms) before the engine gives up -- and
-    // whatever is in flight is drained before the refusal goes out.
+    // piece (at most one slot, a few ms) and no P2P chunk (at most
+    // --copy-chunk-mb, kPacedWindow of them in flight per GPU) is issued
+    // past |hard_deadline| -- a tenth of the budget (at least 50 ms) before
+    // the engine gives up -- and whatever is in flight is drained before the
+    // refusal goes out.
     const uint64_t margin_us =
         std::max<uint64_t>(uint64_t(budget_ms) * 100, 50000);
     const uint64_t hard_deadline =
@@ -1199,8 +1296,10 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
             } else {
                 const uint64_t wait_until =
                     nowUs() + uint64_t(g_host_staging_wait_ms) * 1000;
+                bool at_deadline = false;
                 ok = stagedCopy(sd, dd, kv.second, wait_until, hard_deadline,
-                                &why);
+                                &why, &at_deadline);
+                if (at_deadline) g_stats.deadline_aborts++;
             }
             if (!ok) {
                 g_stats.staged_failures++;
@@ -1232,81 +1331,165 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
                         "start budget exceeded before the P2P part was issued");
     }
 
-    // 3. Issue: one kernel launch (plus its table upload) and one batched
-    //    copy-engine submission per executing GPU, then wait for all.
-    std::vector<cudaStream_t> used;
-    auto drain = [&]() {
-        for (auto s : used) cudaStreamSynchronize(s);
+    // 3b. The direct (P2P) part, paced (paced_issue.h): per executing GPU
+    //     the gather-kernel rows and then the copy-engine entries, in chunks
+    //     of at most --copy-chunk-mb and kChunkEntries entries; at most
+    //     kPacedWindow chunks in flight per GPU; the hard deadline checked
+    //     before every chunk. Past the deadline nothing more is issued, what
+    //     is in flight is drained and the copy is refused, so no byte of it
+    //     lands after the reply (nor after the engine gave up on it).
+    struct Chunk {
+        int dev;
+        bool kernel;  // gather-kernel rows (w.small), else w.ce_*
+        size_t begin, end;
     };
+    std::map<int, std::vector<Chunk>> dev_chunks;
+    std::map<int, DeviceResources *> res_of;
     for (auto &kv : work) {
         const int dev = kv.first;
         DevWork &w = kv.second;
         DeviceResources *res = nullptr;
         cudaError_t ce = t_res.get(dev, &res);
-        if (ce == cudaSuccess) ce = cudaSetDevice(dev);
-        if (ce == cudaSuccess && !w.small.empty()) {
+        if (ce == cudaSuccess && !w.small.empty())
             ce = t_res.reserve(dev, *res, w.small.size());
-            if (ce == cudaSuccess) {
-                memcpy(res->host_table, w.small.data(),
-                       w.small.size() * sizeof(GatherEntry));
-                ce = cudaMemcpyAsync(res->dev_table, res->host_table,
-                                     w.small.size() * sizeof(GatherEntry),
-                                     cudaMemcpyHostToDevice, res->stream);
-            }
-            if (ce == cudaSuccess) {
-                ce = launchGatherCopy(res->dev_table,
-                                      static_cast<uint32_t>(w.small.size()),
-                                      res->grid_blocks, res->stream);
-                if (ce == cudaErrorNoKernelImageForDevice ||
-                    ce == cudaErrorInvalidDeviceFunction ||
-                    ce == cudaErrorUnsupportedPtxVersion) {
-                    // No usable kernel image for this GPU: use the copy
-                    // engines for this and all later batches.
-                    cudaGetLastError();
-                    g_kernel_unusable[dev] = true;
-                    LOGW(
-                        "gather kernel unavailable on gpu %d (%s); small "
-                        "copies use the copy engines",
-                        dev, cudaGetErrorString(ce));
-                    for (auto &g : w.small) {
-                        w.ce_dst.push_back(reinterpret_cast<void *>(g.dst));
-                        w.ce_src.push_back(reinterpret_cast<void *>(g.src));
-                        w.ce_len.push_back(g.length);
-                    }
-                    w.ce_bytes += w.small_bytes;
-                    w.small_bytes = 0;
-                    w.small.clear();
-                    ce = cudaSuccess;
-                }
-            }
-        }
-        if (ce == cudaSuccess)
-            ce = issueCopies(w.ce_dst, w.ce_src, w.ce_len, res->stream);
-        if (res && res->stream) used.push_back(res->stream);
         if (ce != cudaSuccess) {
-            if (isStickyCudaError(ce)) dieOnStickyError(ce, "copy submit");
+            if (isStickyCudaError(ce)) dieOnStickyError(ce, "copy setup");
             cudaGetLastError();
-            drain();  // nothing may still be running when we reply
             return fail(ProxyStatus::kCudaError, count,
-                        std::string("copy submit: ") + cudaGetErrorString(ce));
+                        std::string("copy setup: ") + cudaGetErrorString(ce));
         }
-        g_stats.kernel_entries += w.small.size();
-        g_stats.kernel_bytes += w.small_bytes;
-        g_stats.ce_entries += w.ce_len.size();
-        g_stats.ce_bytes += w.ce_bytes;
+        res_of[dev] = res;
+        std::vector<Chunk> &chunks = dev_chunks[dev];
+        std::vector<uint64_t> lens;
+        lens.reserve(w.small.size());
+        for (const GatherEntry &g : w.small) lens.push_back(g.length);
+        for (const ChunkSpan &c : planChunks(lens.data(), lens.size(),
+                                             kChunkEntries, g_cfg.chunk_bytes))
+            chunks.push_back({dev, true, c.begin, c.end});
+        lens.assign(w.ce_len.begin(), w.ce_len.end());
+        for (const ChunkSpan &c : planChunks(lens.data(), lens.size(),
+                                             kChunkEntries, g_cfg.chunk_bytes))
+            chunks.push_back({dev, false, c.begin, c.end});
     }
-    cudaError_t first_err = cudaSuccess;
-    for (auto s : used) {
-        cudaError_t ce = cudaStreamSynchronize(s);
-        if (ce != cudaSuccess && first_err == cudaSuccess) first_err = ce;
+    std::map<int, size_t> per_dev;
+    for (const auto &kv : dev_chunks) per_dev[kv.first] = kv.second.size();
+    std::vector<Chunk> order;
+    std::vector<int> lanes;
+    for (const auto &p : interleaveLanes(per_dev)) {
+        order.push_back(dev_chunks[p.first][p.second]);
+        lanes.push_back(p.first);
     }
+    std::set<int> table_uploaded;
+    uint64_t kernel_entries = 0, kernel_bytes = 0, ce_entries = 0, ce_bytes = 0;
+    auto issueChunk = [&](size_t k) -> int {
+        const Chunk &ch = order[k];
+        DevWork &w = work[ch.dev];
+        DeviceResources *res = res_of[ch.dev];
+        cudaError_t ce = cudaSetDevice(ch.dev);
+        if (ce != cudaSuccess) return static_cast<int>(ce);
+        const size_t n = ch.end - ch.begin;
+        uint64_t bytes = 0;
+        if (ch.kernel) {
+            for (size_t i = ch.begin; i < ch.end; ++i)
+                bytes += w.small[i].length;
+            if (!g_kernel_unusable[ch.dev].load(std::memory_order_relaxed)) {
+                if (table_uploaded.insert(ch.dev).second) {
+                    // The whole table once; each chunk launches on its rows.
+                    memcpy(res->host_table, w.small.data(),
+                           w.small.size() * sizeof(GatherEntry));
+                    ce = cudaMemcpyAsync(res->dev_table, res->host_table,
+                                         w.small.size() * sizeof(GatherEntry),
+                                         cudaMemcpyHostToDevice, res->stream);
+                    if (ce != cudaSuccess) return static_cast<int>(ce);
+                }
+                ce = launchGatherCopy(res->dev_table + ch.begin,
+                                      static_cast<uint32_t>(n),
+                                      res->grid_blocks, res->stream);
+                if (ce == cudaSuccess) {
+                    kernel_entries += n;
+                    kernel_bytes += bytes;
+                    return 0;
+                }
+                if (ce != cudaErrorNoKernelImageForDevice &&
+                    ce != cudaErrorInvalidDeviceFunction &&
+                    ce != cudaErrorUnsupportedPtxVersion)
+                    return static_cast<int>(ce);
+                // No usable kernel image for this GPU: the copy engines for
+                // these rows and every later batch.
+                cudaGetLastError();
+                g_kernel_unusable[ch.dev] = true;
+                LOGW(
+                    "gather kernel unavailable on gpu %d (%s); small copies "
+                    "use the copy engines",
+                    ch.dev, cudaGetErrorString(ce));
+            }
+            std::vector<void *> dsts, srcs;
+            std::vector<size_t> sizes;
+            for (size_t i = ch.begin; i < ch.end; ++i) {
+                dsts.push_back(reinterpret_cast<void *>(w.small[i].dst));
+                srcs.push_back(reinterpret_cast<void *>(w.small[i].src));
+                sizes.push_back(w.small[i].length);
+            }
+            ce = issueCopies(dsts.data(), srcs.data(), sizes.data(), n,
+                             res->stream);
+        } else {
+            for (size_t i = ch.begin; i < ch.end; ++i) bytes += w.ce_len[i];
+            ce = issueCopies(w.ce_dst.data() + ch.begin,
+                             w.ce_src.data() + ch.begin,
+                             w.ce_len.data() + ch.begin, n, res->stream);
+        }
+        if (ce == cudaSuccess) {
+            ce_entries += n;
+            ce_bytes += bytes;
+        }
+        return static_cast<int>(ce);
+    };
+    const PacedResult pr = issuePaced(
+        lanes, kPacedWindow, hard_deadline, nowUs, issueChunk,
+        [&](int dev, size_t slot) -> int {
+            DeviceResources *res = res_of[dev];
+            cudaError_t ce = cudaSetDevice(dev);
+            if (ce == cudaSuccess)
+                ce = cudaEventRecord(res->done[slot], res->stream);
+            return static_cast<int>(ce);
+        },
+        [&](int dev, size_t slot) -> int {
+            return static_cast<int>(
+                cudaEventSynchronize(res_of[dev]->done[slot]));
+        },
+        [&]() -> int {
+            // Nothing may still be running when the reply goes out.
+            cudaError_t first = cudaSuccess;
+            for (const auto &kv : res_of) {
+                const cudaError_t ce = cudaStreamSynchronize(kv.second->stream);
+                if (ce != cudaSuccess && first == cudaSuccess) first = ce;
+            }
+            return static_cast<int>(first);
+        });
+    g_stats.kernel_entries += kernel_entries;
+    g_stats.kernel_bytes += kernel_bytes;
+    g_stats.ce_entries += ce_entries;
+    g_stats.ce_bytes += ce_bytes;
     g_stats.exec_us_total += nowUs() - t_planned;
+    const cudaError_t first_err =
+        static_cast<cudaError_t>(pr.error ? pr.error : pr.drain_error);
     if (first_err != cudaSuccess) {
         if (isStickyCudaError(first_err))
-            dieOnStickyError(first_err, "copy completion");
+            dieOnStickyError(first_err,
+                             pr.error ? "copy submit" : "copy completion");
         cudaGetLastError();
         return fail(ProxyStatus::kCudaError, count,
-                    std::string("copy: ") + cudaGetErrorString(first_err));
+                    std::string(pr.error ? "copy submit: " : "copy: ") +
+                        cudaGetErrorString(first_err));
+    }
+    if (pr.deadline) {
+        g_stats.deadline_aborts++;
+        char m[160];
+        snprintf(m, sizeof(m),
+                 "deadline reached after %zu of %zu P2P chunks; the rest was "
+                 "not issued and nothing of the copy is in flight",
+                 pr.issued, order.size());
+        return fail(ProxyStatus::kDeadlineExceeded, count, m);
     }
     return r;
 }
@@ -1320,12 +1503,13 @@ struct Connection {
     bool hello = false;
     bool control = false;
     uint64_t client_id = 0;
-    uint32_t pid = 0;
+    uint32_t pid = 0;  // as reported by the client (its PID namespace)
     std::string node;
     // Registrations created through this (control) connection.
     std::map<uint64_t, std::shared_ptr<Registration>> owned;
     // GPUs this connection registered blocks on (self-test trigger).
     std::set<int> devices;
+    bool unknown_device_logged = false;
 };
 
 int findDevice(const uint8_t *uuid) {
@@ -1356,12 +1540,20 @@ void dropOwned(Connection &c) {
         }
     }
     g_stats.registrations -= dropped;
-    // Mappings are closed when the last in-flight copy releases them.
+    // The registrations' IPC mappings are closed here, or by the last copy
+    // in flight that still uses one of them (bounded by its deadline): an
+    // open mapping would keep the engine's GPU memory allocated after it
+    // exited.
     c.owned.clear();
+    const size_t held = g_imports.mappingsOf(c.client_id);
     LOGI("client %016" PRIx64
-         " (pid %u, node %s) disconnected; released %zu "
-         "registrations",
-         c.client_id, c.pid, c.node.c_str(), dropped);
+         " (pid %u, node %s) disconnected; released %zu registrations, %s",
+         c.client_id, c.pid, c.node.c_str(), dropped,
+         held == 0 ? "all of its IPC mappings are closed"
+                   : (std::to_string(held) +
+                      " IPC mapping(s) still used by copies in flight, closed "
+                      "when they finish")
+                         .c_str());
 }
 
 void handleConnection(int fd) {
@@ -1415,8 +1607,28 @@ void handleConnection(int fd) {
                 c.hello = true;
                 if (c.control && !was_control) {
                     g_stats.active_clients++;
-                    LOGI("client %016" PRIx64 " (pid %u, node %s) connected",
-                         c.client_id, c.pid, c.node.c_str());
+                    // Who is connected: the socket's permissions decide who
+                    // may; the pid as seen here is 0 when the engine runs in
+                    // another PID namespace (another container of the pod).
+                    const PeerCred pc = peerCred(fd);
+                    std::string cred;
+                    if (pc.known)
+                        cred = ", uid " + std::to_string(pc.uid) + " gid " +
+                               std::to_string(pc.gid) +
+                               (pc.pid ? ", pid here " + std::to_string(pc.pid)
+                                       : std::string(", other PID namespace"));
+                    LOGI("client %016" PRIx64 " (pid %u, node %s%s) connected",
+                         c.client_id, c.pid, c.node.c_str(), cred.c_str());
+                    if (pidValuesCollide(c.pid, uint32_t(getpid())))
+                        LOGE("client %016" PRIx64
+                             " reports pid %u, the daemon's own pid value: "
+                             "CUDA does not import an IPC handle exported by a "
+                             "process whose pid equals the importer's, even in "
+                             "another PID namespace, so copies from/to its "
+                             "memory fail and use the engine's base transport. "
+                             "Register the memory from a process other than "
+                             "its container's first one.",
+                             c.client_id, c.pid);
                 }
                 HelloResp resp{};
                 resp.daemon_epoch = g_epoch;
@@ -1441,12 +1653,28 @@ void handleConnection(int fd) {
                 memcpy(&req, payload.data(), sizeof(req));
                 int dev = findDevice(req.gpu_uuid);
                 if (dev < 0) {
+                    g_stats.register_refusals++;
+                    // The engine's GPU is not among the daemon's: a
+                    // container runtime that did not expose the node's GPUs
+                    // to the daemon (see --min-visible-gpus), or a daemon of
+                    // another node behind the socket.
+                    if (!c.unknown_device_logged) {
+                        c.unknown_device_logged = true;
+                        LOGE("client %016" PRIx64
+                             " (pid %u) registers memory of %s, a GPU not "
+                             "visible to the daemon (%zu GPU(s) visible): "
+                             "refused, its transfers use the engine's base "
+                             "transport",
+                             c.client_id, c.pid, hexUuid(req.gpu_uuid).c_str(),
+                             g_devices.size());
+                    }
                     replyError(fd, type, h.seq, ProxyStatus::kUnknownDevice,
                                hexUuid(req.gpu_uuid) +
                                    " is not visible to the daemon");
                     break;
                 }
                 if (!ensureDevice(dev)) {
+                    g_stats.register_refusals++;
                     replyError(fd, type, h.seq, ProxyStatus::kCudaError,
                                "daemon cannot create a context on " +
                                    hexUuid(req.gpu_uuid) +
@@ -1455,6 +1683,7 @@ void handleConnection(int fd) {
                     break;
                 }
                 if (req.size == 0 || req.base + req.size < req.base) {
+                    g_stats.register_refusals++;
                     replyError(fd, type, h.seq, ProxyStatus::kBadRequest,
                                "bad block range");
                     break;
@@ -1860,7 +2089,8 @@ cudaError_t runSelfTestPass(int exec, bool kernel, char *s, char *d,
             srcs.push_back(s + c.src_off);
             sizes.push_back(c.len);
         }
-        e = issueCopies(dsts, srcs, sizes, res->stream);
+        e = issueCopies(dsts.data(), srcs.data(), sizes.data(), dsts.size(),
+                        res->stream);
     }
     cudaError_t se = cudaStreamSynchronize(res->stream);
     if (e == cudaSuccess) e = se;
@@ -3149,7 +3379,21 @@ void usage(const char *argv0) {
         "  --socket <path>         unix socket to listen on (required; env\n"
         "                          MC_NVLINK_PROXY_SOCKET is used if unset)\n"
         "  --socket-mode <octal>   permissions of the socket file (default "
-        "0666)\n"
+        "0600:\n"
+        "                          only the daemon's user may connect; run "
+        "the\n"
+        "                          engines as that user, or use 0660 and a\n"
+        "                          group shared with the daemon). Whoever can\n"
+        "                          connect can copy between all registered\n"
+        "                          buffers\n"
+        "  --min-visible-gpus <n>  exit with an error (code 78) at start when\n"
+        "                          fewer than n GPUs are visible, e.g. "
+        "because\n"
+        "                          the container runtime ignored\n"
+        "                          NVIDIA_VISIBLE_DEVICES=all (default 0: no\n"
+        "                          check); otherwise engines whose GPU the\n"
+        "                          daemon cannot see are refused at\n"
+        "                          registration and use their base transport\n"
         "  --stats-interval <sec>  log a counters line every <sec> seconds\n"
         "                          when something changed (default 60, 0 = "
         "off)\n"
@@ -3170,6 +3414,12 @@ void usage(const char *argv0) {
         "                          the sending one (writes through it)\n"
         "  --no-coalesce           do not merge consecutive copies that are\n"
         "                          contiguous in source and destination\n"
+        "  --copy-chunk-mb <MB>    P2P work is issued in chunks of at most "
+        "this\n"
+        "                          size, two in flight per GPU, the copy's\n"
+        "                          deadline checked before each; past it the\n"
+        "                          rest is not issued and the copy is refused\n"
+        "                          once nothing is in flight (default 32)\n"
         "  --drain-timeout-ms <ms> on SIGTERM/SIGINT, wait up to this long "
         "for\n"
         "                          running copies to finish (default 10000)\n"
@@ -3234,7 +3484,10 @@ void usage(const char *argv0) {
         "ids), denied_copy_requests, untested_pairs and\n"
         "untested_host_paths (tests that could not run, waiting for a\n"
         "retry), staged_copies, staged_bytes, staged_failures (host-staged\n"
-        "copies).\n",
+        "copies), deadline_aborts (copies stopped at their deadline),\n"
+        "register_refusals, ipc_mappings (IPC handles open now), ipc_closes\n"
+        "and ipc_conflicts (copies refused because a handle was still mapped\n"
+        "for another engine).\n",
         argv0);
 }
 
@@ -3242,7 +3495,8 @@ void usage(const char *argv0) {
 
 int main(int argc, char **argv) {
     std::string socket_path;
-    mode_t socket_mode = 0666;
+    unsigned socket_mode = kDefaultSocketMode;
+    int min_visible_gpus = 0;
     int stats_interval = 60;
     bool do_stats = false, do_ping = false, eager = false;
     int drain_timeout_ms = 10000;
@@ -3264,8 +3518,34 @@ int main(int argc, char **argv) {
         } else if (a.rfind("--socket=", 0) == 0) {
             socket_path = a.substr(9);
         } else if (a == "--socket-mode") {
-            socket_mode =
-                static_cast<mode_t>(strtol(need("--socket-mode"), nullptr, 8));
+            const std::string v = need("--socket-mode");
+            if (!parseSocketMode(v, &socket_mode)) {
+                fprintf(stderr,
+                        "--socket-mode must be octal permission bits "
+                        "(e.g. 0600, 0660), got %s\n",
+                        v.c_str());
+                return 2;
+            }
+        } else if (a == "--min-visible-gpus") {
+            const std::string v = need("--min-visible-gpus");
+            char *end = nullptr;
+            const long n = strtol(v.c_str(), &end, 10);
+            if (v.empty() || *end || n < 0 || n > kMaxDevices) {
+                fprintf(stderr,
+                        "--min-visible-gpus must be a number from 0 to %d\n",
+                        kMaxDevices);
+                return 2;
+            }
+            min_visible_gpus = static_cast<int>(n);
+        } else if (a == "--copy-chunk-mb") {
+            const std::string v = need("--copy-chunk-mb");
+            char *end = nullptr;
+            const long mb = strtol(v.c_str(), &end, 10);
+            if (v.empty() || *end || mb < 1 || mb > 4096) {
+                fprintf(stderr, "--copy-chunk-mb must be 1..4096\n");
+                return 2;
+            }
+            g_cfg.chunk_bytes = uint64_t(mb) << 20;
         } else if (a == "--stats-interval") {
             stats_interval = atoi(need("--stats-interval"));
         } else if (a == "--stats") {
@@ -3403,11 +3683,20 @@ int main(int argc, char **argv) {
     LOGI("starting, protocol v%u, epoch %016" PRIx64
          ", gather kernel for copies < %" PRIu64
          " bytes on the %s GPU, "
-         "coalescing %s",
+         "coalescing %s, P2P chunks of %" PRIu64 " MiB, pid %d",
          kProtocolVersion, g_epoch, g_cfg.gather_threshold,
          g_cfg.gather_on_src ? "sending" : "receiving",
-         g_cfg.coalesce ? "on" : "off");
-    if (!initDevices()) return 1;
+         g_cfg.coalesce ? "on" : "off", g_cfg.chunk_bytes >> 20, int(getpid()));
+    const bool devices_ok = initDevices();
+    // A container runtime that ignored NVIDIA_VISIBLE_DEVICES=all shows
+    // here, not later as engines silently using their base transport.
+    const std::string shortfall =
+        visibleGpuShortfall(g_devices.size(), min_visible_gpus);
+    if (!shortfall.empty()) {
+        LOGE("%s; exiting", shortfall.c_str());
+        return 78;  // EX_CONFIG
+    }
+    if (!devices_ok) return 1;
     // Command-line denials, by PCI bus id (a DaemonSet may name GPUs that
     // some nodes do not have: those are ignored with a warning).
     auto findBus = [](const std::string &v) -> int {
@@ -3487,13 +3776,10 @@ int main(int argc, char **argv) {
             }
         }
     }
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    if (socket_path.size() >= sizeof(addr.sun_path)) {
+    if (socket_path.size() >= sizeof(sockaddr_un::sun_path)) {
         LOGE("socket path too long: %s", socket_path.c_str());
         return 2;
     }
-    memcpy(addr.sun_path, socket_path.c_str(), socket_path.size() + 1);
     struct stat st;
     if (lstat(socket_path.c_str(), &st) == 0) {
         if (!S_ISSOCK(st.st_mode)) {
@@ -3514,20 +3800,23 @@ int main(int argc, char **argv) {
             if (!ensureDevice(static_cast<int>(i))) return 1;
         }
     }
-    int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (lfd < 0 ||
-        bind(lfd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
-        listen(lfd, 128) != 0) {
-        LOGE("cannot listen on %s: %s", socket_path.c_str(), strerror(errno));
+    // Created with |socket_mode| (default 0600: the daemon's user only), never
+    // wider: whoever can connect can copy between every registered buffer.
+    std::string listen_err;
+    const int lfd =
+        listenUnixSocket(socket_path, socket_mode, 128, &listen_err);
+    if (lfd < 0) {
+        LOGE("cannot listen on %s: %s", socket_path.c_str(),
+             listen_err.c_str());
         return 1;
     }
-    chmod(socket_path.c_str(), socket_mode);
     g_socket_path = socket_path;
     struct sigaction sa{};
     sa.sa_handler = onSignal;
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGINT, &sa, nullptr);
-    LOGI("listening on %s", socket_path.c_str());
+    LOGI("listening on %s (mode %04o, uid %u, gid %u)", socket_path.c_str(),
+         socket_mode, unsigned(geteuid()), unsigned(getegid()));
 
     // P2P self-test, after the socket is up: engines connect and register
     // meanwhile; in enforce mode pairs not tested yet are refused (base

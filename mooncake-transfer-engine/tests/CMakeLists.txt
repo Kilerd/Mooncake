@@ -435,6 +435,16 @@ if(USE_NVLINK_PROXY)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../nvlink-proxy)
   target_link_libraries(nvlink_proxy_policy_test PUBLIC gtest gtest_main)
   add_test(NAME nvlink_proxy_policy_test COMMAND nvlink_proxy_policy_test)
+
+  # mooncake_nvlink_proxy's paced issue, IPC mapping table, socket and
+  # start-up checks (host only)
+  add_executable(nvlink_proxy_daemon_test
+                 ${WORKSPACE}/nvlink_proxy_daemon_test.cpp)
+  target_include_directories(nvlink_proxy_daemon_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../nvlink-proxy)
+  target_link_libraries(nvlink_proxy_daemon_test PUBLIC gtest gtest_main
+                                                        pthread)
+  add_test(NAME nvlink_proxy_daemon_test COMMAND nvlink_proxy_daemon_test)
 endif()
 
 add_executable(graceful_shutdown_test ${WORKSPACE}/graceful_shutdown_test.cpp)
