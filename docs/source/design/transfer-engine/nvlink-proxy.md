@@ -53,9 +53,22 @@ the wheel with the console entry point `mooncake_nvlink_proxy`. The workflow
    (`--eager-init` initializes all GPUs at start).
 
    The socket directory is shared with the engine containers, e.g. through a
-   `hostPath` volume. Access to the socket allows copying between registered
-   buffers, so treat the directory as a trust boundary. `--ping` exits 0 when
-   the daemon answers and can serve as a liveness probe.
+   `hostPath` volume, or an `emptyDir` when the daemon is a sidecar of the
+   engines' pod. Access to the socket allows copying between registered
+   buffers, so the daemon creates it with mode `0600` (`--socket-mode`,
+   octal; never wider than that, not even before `listen`): the engines must
+   run as the daemon's user, or use `--socket-mode 0660` and a group they
+   share with it. The daemon logs each engine's uid, gid and (when it shares
+   the PID namespace) pid when it connects. `--ping` exits 0 when the daemon
+   answers and can serve as a liveness probe.
+
+   `--min-visible-gpus N` makes the daemon exit (code 78) at start when it
+   sees fewer than N GPUs, e.g. because the container runtime ignored
+   `NVIDIA_VISIBLE_DEVICES=all` for an unprivileged container. Without it,
+   an engine whose GPU the daemon does not see is refused at registration
+   (`UNKNOWN_DEVICE`): both the daemon and the engine log that at error
+   level and the engine counts it (`register_refusals`), and the engine's
+   transfers use the base transport.
 
 2. Engines (all peers must run a build with `USE_NVLINK_PROXY=ON`):
 
@@ -123,10 +136,33 @@ together with the exact address range in which that set is unchanged.
   both published in the segment metadata, so peers' cached metadata stays
   valid across daemon restarts.
 - The daemon drops an engine's registrations when its control connection
-  closes; copies in flight keep the mappings alive until they finish. On
-  SIGTERM it stops accepting, lets running copies finish (up to
-  `--drain-timeout-ms`, default 10 s) and exits; on an unrecoverable CUDA error
-  it exits so that it can be restarted.
+  closes (the engine exited or its container restarted) and closes every
+  IPC mapping it had opened of that engine's memory, in every GPU context:
+  at once, or when the last copy in flight that uses one finishes (bounded
+  by the copy's deadline). An open mapping would keep the exporting
+  engine's GPU memory allocated after it exited, so its successor could not
+  allocate the same memory. The log says which:
+  `released N registrations, all of its IPC mappings are closed` or
+  `M IPC mapping(s) still used by copies in flight`.
+- Mappings are opened once per (GPU context, handle) and shared by the
+  registrations of the same engine that use them (a re-registration after a
+  reconnect), closed when the last of them is gone: the driver keeps one
+  mapping per context and handle, and one close unmaps it for everybody.
+  They belong to one engine identity, the random client id: a restarted
+  engine registers under a new id (peers still naming the old one get
+  `UNKNOWN_SOURCE` and use the base transport for that request), and a
+  handle whose bytes equal one still mapped for another engine is never
+  served from that mapping -- the copy is refused (`ipc_conflicts`) until
+  the old mapping is closed. Nothing is cached by address alone.
+- The daemon often runs as PID 1 of its container. A legacy IPC handle
+  cannot be imported by a process whose pid value equals the exporter's,
+  even across PID namespaces; the daemon logs an error when an engine
+  reports its own pid value (an engine registering memory from its
+  container's first process), whose copies would fail and use the base
+  transport.
+- On SIGTERM the daemon stops accepting, lets running copies finish (up to
+  `--drain-timeout-ms`, default 10 s) and exits; on an unrecoverable CUDA
+  error it exits so that it can be restarted.
 
 ## P2P integrity self-test
 
@@ -245,7 +281,14 @@ daemon.
   staged piece (one slot, a few milliseconds of transfer) past a hard
   deadline a tenth of the budget (at least 50 ms) before the engine gives
   up; at that point it drains what is in flight on both GPUs and refuses
-  the copy. No byte of a copy is written after its refusal reply.
+  the copy. No byte of a copy is written after its refusal reply. The P2P
+  part is bounded the same way: it is issued in chunks of at most
+  `--copy-chunk-mb` (default 32 MiB; larger copy-engine entries are split)
+  and 8192 entries, at most two in flight per GPU, the hard deadline checked
+  before each chunk; past it the rest is not issued, what is in flight is
+  drained and the copy is refused with `DEADLINE_EXCEEDED`
+  (`deadline_aborts`). A late P2P write can therefore not land after the
+  engine's base transport rewrote the data.
 - Any other error on the host path refuses the request like a denied pair,
   so the engine falls back to its base transport, which rewrites every byte;
   TCP stays the last resort.
@@ -281,7 +324,7 @@ nvlink_proxy stats: healthy=1 proxied_requests=... proxied_bytes=... proxied_bat
   avg_batch_us=... max_batch_us=... held_requests=... max_hold_ms=... retried_requests=...
   fallback_requests=... (daemon_unavailable=... daemon_error=... not_servable=...)
   fallback_retries=... failed_requests=... remote_node_requests=...
-  registered_blocks=N/M connects=...
+  registered_blocks=N/M register_refusals=... (not_visible=...) connects=...
 ```
 
 - `proxied_*`: requests, bytes and daemon round trips served by the proxy;
@@ -295,6 +338,9 @@ nvlink_proxy stats: healthy=1 proxied_requests=... proxied_bytes=... proxied_bat
   within the request budget.
 - `remote_node_requests`: requests to buffers on another node (normal base
   transport traffic).
+- `register_refusals`: blocks the daemon refused to register (their
+  transfers use the base transport), `not_visible` of them because the
+  daemon does not see the GPU; also logged at error level.
 
 Daemon side, logged every `--stats-interval` seconds when they changed, or on
 demand with `mooncake_nvlink_proxy --socket <path> --stats`: active clients,
@@ -308,8 +354,12 @@ GPU pair counts twice -- followed by their bus ids) and
 counted as failures), `untested_pairs` / `untested_host_paths` /
 `untested_staged_pairs` (GPU pairs, per-GPU host paths and pairs' host-staged
 copies whose last test could not run, waiting for a retry; worth an alert
-when they stay above 0) and
-`staged_copies` / `staged_bytes` / `staged_failures` (host-staged copies).
+when they stay above 0),
+`staged_copies` / `staged_bytes` / `staged_failures` (host-staged copies),
+`deadline_aborts` (copies stopped at their hard deadline), `register_refusals`,
+`ipc_mappings` (IPC handles open now; falls back when engines exit),
+`ipc_closes` and `ipc_conflicts` (copies refused because a handle was still
+mapped for another engine).
 
 ## Wire protocol
 
@@ -329,4 +379,14 @@ verifies large and paged writes, reads, sub-allocated buffers, guard regions
 and host memory byte by byte. `nvlink_proxy_transport_test` covers the
 protocol helpers and the no-daemon path without GPUs;
 `nvlink_proxy_policy_test` the self-test plans, the verifier, bus id parsing
-and the deny matrix.
+and the deny matrix; `nvlink_proxy_daemon_test` the paced issue against the
+deadline, the IPC mapping table, the socket and the start-up checks.
+`nvlink_proxy_cpu_test.py` runs the daemon itself without GPUs, linked
+against a CPU stand-in for the CUDA runtime
+(`nvlink_proxy_mock_cudart.cpp`: shared memory as GPU memory, asynchronous
+streams, the driver's one mapping per context and handle), and plays
+engines over its socket: copies stopped at their deadline with no write
+after the refusal, chunked copies byte-exact, host staging, socket
+permissions, mappings closed when an engine disconnects or restarts,
+`--min-visible-gpus` (CMake target `mooncake_nvlink_proxy_cpu`, CTest
+`nvlink_proxy_cpu_test`).
