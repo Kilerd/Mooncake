@@ -375,14 +375,30 @@ bool NvlinkProxyTransport::ensureControlLocked() {
         errno = saved;
     }
     if (fd < 0) {
+        const int err = errno;
         static std::atomic<int64_t> last_log{0};
         int64_t now = nowNs();
         if (now - last_log.load() > 30LL * 1000 * 1000 * 1000) {
             last_log = now;
-            LOG(WARNING) << "nvlink_proxy: daemon not reachable at "
-                         << socket_path_ << " (" << strerror(errno)
-                         << "); same-node transfers use the base transport";
+            if (err == EACCES || err == EPERM) {
+                // Not a daemon that is down or restarting: this engine may
+                // not use the socket at all, and never will by retrying.
+                LOG(ERROR) << "nvlink_proxy: no permission to connect to the "
+                              "daemon at "
+                           << socket_path_ << " (" << strerror(err)
+                           << "): the daemon creates its socket owner-only "
+                              "(0600) by default; run this engine as the "
+                              "daemon's user, or give both a shared group "
+                              "and start the daemon with --socket-mode 0660. "
+                              "Same-node transfers use the base transport";
+            } else {
+                LOG(WARNING) << "nvlink_proxy: daemon not reachable at "
+                             << socket_path_ << " (" << strerror(err)
+                             << "); same-node transfers use the base "
+                                "transport";
+            }
         }
+        errno = err;
         return false;
     }
     control_fd_ = fd;
