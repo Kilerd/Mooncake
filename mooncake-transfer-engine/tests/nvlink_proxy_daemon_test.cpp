@@ -34,6 +34,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -110,19 +111,21 @@ struct FakeEvent {
     uint64_t recorded = 0, done = 0;
 };
 
-// Two lanes ("GPUs"), each chunk writes its index into its own slot of
-// |dst| after |chunk_ms|; records when every write landed.
+// Two lanes ("GPUs"); chunk k writes its index into its own slot of |dst|
+// after |chunk_ms| and records when it was issued and when it landed.
 struct PacedRig {
     std::map<int, std::unique_ptr<FakeStream>> streams;
     std::map<int, std::vector<std::unique_ptr<FakeEvent>>> events;
     std::vector<std::atomic<int>> dst;
     std::vector<uint64_t> landed_us;
+    std::vector<uint64_t> issued_us;
     std::mutex landed_mu;
     std::atomic<size_t> max_outstanding{0};
     std::map<int, std::atomic<size_t>> outstanding;
     int chunk_ms;
 
-    PacedRig(size_t chunks, int chunk_ms_) : dst(chunks), chunk_ms(chunk_ms_) {
+    PacedRig(size_t chunks, int chunk_ms_)
+        : dst(chunks), issued_us(chunks, 0), chunk_ms(chunk_ms_) {
         for (auto &d : dst) d = -1;
         for (int lane : {0, 1}) {
             streams[lane].reset(new FakeStream());
@@ -132,18 +135,19 @@ struct PacedRig {
         }
     }
 
-    PacedResult run(const std::vector<int> &lanes, uint64_t deadline_us,
+    PacedResult run(const std::vector<PacedChunk> &chunks, uint64_t deadline_us,
                     int fail_at = -1) {
         return issuePaced(
-            lanes, kPacedWindow, deadline_us, nowUs,
-            [&](size_t k) -> int {
+            chunks, kPacedWindow, deadline_us, nowUs,
+            [&](size_t k, size_t slot) -> int {
                 if (int(k) == fail_at) return 700;
-                const int lane = lanes[k];
+                const int lane = chunks[k].lane;
                 const size_t now_out = ++outstanding[lane];
                 size_t seen = max_outstanding.load();
                 while (now_out > seen &&
                        !max_outstanding.compare_exchange_weak(seen, now_out)) {
                 }
+                issued_us[k] = nowUs();
                 streams[lane]->push([this, k, lane]() {
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(chunk_ms));
@@ -154,9 +158,6 @@ struct PacedRig {
                     }
                     --outstanding[lane];
                 });
-                return 0;
-            },
-            [&](int lane, size_t slot) -> int {
                 FakeEvent *ev = events[lane][slot].get();
                 uint64_t gen;
                 {
@@ -179,8 +180,8 @@ struct PacedRig {
                 ev->cv.wait(l, [&]() { return ev->done >= gen; });
                 return 0;
             },
-            [&]() -> int {
-                for (auto &kv : streams) kv.second->sync();
+            [&](int lane) -> int {
+                streams[lane]->sync();
                 return 0;
             });
     }
@@ -190,7 +191,26 @@ struct PacedRig {
         for (auto &d : dst) out.push_back(d.load());
         return out;
     }
+    uint64_t lastLanded() {
+        std::lock_guard<std::mutex> l(landed_mu);
+        uint64_t t = 0;
+        for (uint64_t x : landed_us) t = std::max(t, x);
+        return t;
+    }
 };
+
+// A model that has already measured |ms| per chunk of |bytes|.
+void warmUp(RateModel &m, uint64_t bytes, int ms) {
+    m.observe(bytes, ms * 1000.0 + RateModel::kOverheadUs);
+}
+
+std::vector<PacedChunk> uniform(size_t n, uint64_t bytes, RateModel *m,
+                                bool two_lanes = false) {
+    std::vector<PacedChunk> out;
+    for (size_t k = 0; k < n; ++k)
+        out.push_back({two_lanes ? int(k % 2) : 0, bytes, m});
+    return out;
+}
 
 }  // namespace
 
@@ -210,6 +230,15 @@ TEST(NvlinkProxyPacedIssue, PlanChunksByEntriesAndBytes) {
     EXPECT_EQ(c[4].bytes, 10u);
     EXPECT_TRUE(planChunks(len.data(), 0, 3, 40).empty());
     EXPECT_EQ(planChunks(len.data(), len.size(), 0, 0).size(), 1u);
+    // Bytes only (gather-kernel rows): 20k rows of 2 KiB are one launch.
+    const std::vector<uint64_t> rows(20000, 2048);
+    EXPECT_EQ(planChunks(rows.data(), rows.size(), 0, 128ull << 20).size(), 1u);
+    // A probe first: the first span at most 15 bytes, then the normal cap.
+    c = planChunks(len.data(), len.size(), 0, 40, 15);
+    ASSERT_GE(c.size(), 2u);
+    EXPECT_EQ(c[0].end, 1u);
+    EXPECT_EQ(c[1].begin, 1u);
+    EXPECT_EQ(c[1].end, 3u);
     EXPECT_EQ(splitLength(100, 0), 1u);
     EXPECT_EQ(splitLength(100, 100), 1u);
     EXPECT_EQ(splitLength(101, 100), 2u);
@@ -224,14 +253,34 @@ TEST(NvlinkProxyPacedIssue, InterleavesLanes) {
     EXPECT_EQ(o, want);
 }
 
-// No deadline: every chunk is issued and has landed when issuePaced
-// returns; never more than the window per lane in flight.
+TEST(NvlinkProxyPacedIssue, RateModelLearnsSlowdownsFast) {
+    RateModel m;
+    EXPECT_FALSE(m.warm());
+    EXPECT_DOUBLE_EQ(m.psPerByte(), RateModel::kSeedPsPerByte);
+    m.observe(1024, 5000.0);  // below kMinSampleBytes: ignored
+    EXPECT_FALSE(m.warm());
+    const uint64_t mib = 1ull << 20;
+    m.observe(mib, 1000.0 + RateModel::kOverheadUs);  // ~1 GB/s
+    ASSERT_TRUE(m.warm());
+    const double base = m.psPerByte();
+    EXPECT_NEAR(base, 1e9 / double(mib), 1.0);
+    m.observe(mib, 3000.0 + RateModel::kOverheadUs);  // 3x slower: half way
+    EXPECT_NEAR(m.psPerByte(), base * 2, 1.0);
+    const double slow = m.psPerByte();
+    m.observe(mib, 1000.0 + RateModel::kOverheadUs);  // faster: an eighth
+    EXPECT_NEAR(m.psPerByte(), slow - (slow - base) / 8, 1.0);
+    EXPECT_NEAR(predictUs(mib, base), RateModel::kOverheadUs + 1000.0, 1.0);
+}
+
+// Every chunk issued and landed when it returns; never more than the window
+// per lane in flight.
 TEST(NvlinkProxyPacedIssue, IssuesEverythingWithinTheWindow) {
     constexpr size_t kChunks = 12;
     PacedRig rig(kChunks, 5);
-    std::vector<int> lanes;
-    for (size_t k = 0; k < kChunks; ++k) lanes.push_back(int(k % 2));
-    const PacedResult r = rig.run(lanes, UINT64_MAX);
+    RateModel m;
+    warmUp(m, 1 << 20, 5);
+    const PacedResult r =
+        rig.run(uniform(kChunks, 1 << 20, &m, true), UINT64_MAX);
     EXPECT_EQ(r.issued, kChunks);
     EXPECT_FALSE(r.deadline);
     EXPECT_EQ(r.error, 0);
@@ -239,25 +288,27 @@ TEST(NvlinkProxyPacedIssue, IssuesEverythingWithinTheWindow) {
     EXPECT_LE(rig.max_outstanding.load(), kPacedWindow);
 }
 
-// The deadline passes mid-copy: nothing more is issued, what is in flight
-// lands before issuePaced returns (the reply), and nothing lands after it.
-TEST(NvlinkProxyPacedIssue, NoWriteLandsAfterTheDeadlineRefusal) {
+// The deadline approaches mid-copy: a chunk is issued only if it and the one
+// ahead of it finish in time at the measured rate; what is in flight lands
+// before issuePaced returns (the reply), and nothing lands after the reply
+// or the deadline.
+TEST(NvlinkProxyPacedIssue, NoWriteLandsAfterTheDeadlineOrTheReply) {
     constexpr size_t kChunks = 40;
     constexpr int kChunkMs = 10;
     PacedRig rig(kChunks, kChunkMs);
-    const std::vector<int> lanes(kChunks, 0);  // one GPU: 400 ms of work
-    const uint64_t start = nowUs();
-    const uint64_t deadline = start + 100 * 1000;
-    const PacedResult r = rig.run(lanes, deadline);
+    RateModel m;
+    warmUp(m, 1 << 20, kChunkMs);
+    const uint64_t deadline = nowUs() + 100 * 1000;
+    const PacedResult r = rig.run(uniform(kChunks, 1 << 20, &m), deadline);
     const uint64_t reply = nowUs();
     EXPECT_TRUE(r.deadline);
     EXPECT_EQ(r.error, 0);
     EXPECT_LT(r.issued, kChunks);
     EXPECT_GE(r.issued, 5u);
-    // Drained: the reply leaves at most the window's chunks after the
-    // deadline (plus scheduling slack).
-    EXPECT_LE(reply - deadline, uint64_t(kPacedWindow * kChunkMs + 40) * 1000);
     EXPECT_EQ(rig.streams[0]->queued(), 0u);
+    EXPECT_LE(rig.lastLanded(), deadline + 3000)
+        << "a write landed after the deadline";
+    EXPECT_LE(reply, deadline + 3000);
     const std::vector<int> at_reply = rig.snapshot();
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     EXPECT_EQ(rig.snapshot(), at_reply) << "a write landed after the reply";
@@ -266,17 +317,68 @@ TEST(NvlinkProxyPacedIssue, NoWriteLandsAfterTheDeadlineRefusal) {
         ASSERT_EQ(rig.landed_us.size(), r.issued);
         for (uint64_t t : rig.landed_us) EXPECT_LE(t, reply);
     }
-    // Exactly the issued prefix was written.
     for (size_t k = 0; k < kChunks; ++k)
         EXPECT_EQ(at_reply[k], k < r.issued ? int(k) : -1) << k;
+}
+
+// A slow link with few long chunks (what a fixed margin misses): the
+// measured rate keeps the second chunk from being issued at all.
+TEST(NvlinkProxyPacedIssue, SlowChunksAreNotIssuedPastTheDeadline) {
+    PacedRig rig(2, 80);  // two chunks of 80 ms
+    RateModel m;
+    warmUp(m, 64 << 20, 80);
+    const uint64_t deadline = nowUs() + 120 * 1000;
+    const PacedResult r = rig.run(uniform(2, 64 << 20, &m), deadline);
+    EXPECT_TRUE(r.deadline);
+    EXPECT_EQ(r.issued, 1u);  // 80 ms fits, 80 + 80 ms does not
+    EXPECT_LE(rig.lastLanded(), deadline);
+    // A copy that cannot finish is not started (a fresh model: the run
+    // above has measured its chunk again).
+    RateModel m2;
+    warmUp(m2, 64 << 20, 80);
+    PacedRig none(1, 80);
+    const PacedResult n =
+        none.run(uniform(1, 64 << 20, &m2), nowUs() + 50 * 1000);
+    EXPECT_TRUE(n.deadline);
+    EXPECT_EQ(n.issued, 0u);
+    EXPECT_NEAR(n.predicted_us, 80000.0 + RateModel::kOverheadUs, 3000.0);
+}
+
+// A lane whose rate is not measured yet runs its first chunk alone; once
+// that chunk has measured the rate, the window opens.
+TEST(NvlinkProxyPacedIssue, ColdModelProbesAlone) {
+    constexpr size_t kChunks = 6;
+    PacedRig rig(kChunks, 20);
+    RateModel m;  // cold, seed 1 GB/s: a 1 MiB chunk predicted ~1 ms
+    const PacedResult r = rig.run(uniform(kChunks, 1 << 20, &m), UINT64_MAX);
+    EXPECT_EQ(r.issued, kChunks);
+    ASSERT_TRUE(m.warm());
+    EXPECT_GT(m.psPerByte(), 10 * RateModel::kSeedPsPerByte);  // 20 ms/MiB
+    EXPECT_GE(rig.issued_us[1], rig.issued_us[0] + 15 * 1000);
+    EXPECT_LT(rig.issued_us[3], rig.issued_us[2] + 10 * 1000);
+    EXPECT_LE(rig.max_outstanding.load(), kPacedWindow);
+}
+
+// The rate this copy actually achieves on a lane is a floor, even while the
+// shared model (from earlier copies) is still optimistic.
+TEST(NvlinkProxyPacedIssue, ThisCopysProgressOverridesAStaleModel) {
+    constexpr size_t kChunks = 30;
+    PacedRig rig(kChunks, 10);
+    RateModel fast;
+    warmUp(fast, 64 << 20, 1);  // measured 1 ms before; now 10 ms
+    const uint64_t deadline = nowUs() + 100 * 1000;
+    const PacedResult r = rig.run(uniform(kChunks, 64 << 20, &fast), deadline);
+    EXPECT_TRUE(r.deadline);
+    EXPECT_LE(rig.lastLanded(), deadline + 3000);
 }
 
 TEST(NvlinkProxyPacedIssue, ErrorStopsIssueAndStillDrains) {
     constexpr size_t kChunks = 10;
     PacedRig rig(kChunks, 5);
-    std::vector<int> lanes;
-    for (size_t k = 0; k < kChunks; ++k) lanes.push_back(int(k % 2));
-    const PacedResult r = rig.run(lanes, UINT64_MAX, 6);
+    RateModel m;
+    warmUp(m, 1 << 20, 5);
+    const PacedResult r =
+        rig.run(uniform(kChunks, 1 << 20, &m, true), UINT64_MAX, 6);
     EXPECT_EQ(r.error, 700);
     EXPECT_EQ(r.issued, 6u);
     EXPECT_EQ(rig.streams[0]->queued() + rig.streams[1]->queued(), 0u);
@@ -286,18 +388,20 @@ TEST(NvlinkProxyPacedIssue, ErrorStopsIssueAndStillDrains) {
 
 TEST(NvlinkProxyPacedIssue, DeadlineAlreadyPassedIssuesNothing) {
     PacedRig rig(4, 1);
-    const PacedResult r = rig.run({0, 1, 0, 1}, 0);
+    RateModel m;
+    const PacedResult r = rig.run(uniform(4, 1 << 20, &m, true), 0);
     EXPECT_TRUE(r.deadline);
     EXPECT_EQ(r.issued, 0u);
 }
 
 namespace {
 
-// Behaves like the driver: one mapping per (context, handle); opening it
-// again where it is open returns the same mapping; one close unmaps it for
-// every user (|live| says which mappings still exist).
+// Behaves like the driver (CUDA runtime API reference): opening a handle
+// already open in a context returns the same pointer and counts the open;
+// a close unmaps once every open was closed (|live| says which mappings
+// still exist).
 struct FakeDriver {
-    std::map<std::pair<int, std::string>, uintptr_t> open_maps;
+    std::map<std::pair<int, std::string>, std::pair<uintptr_t, int>> open_maps;
     std::map<uintptr_t, bool> live;
     uintptr_t next = 0x1000;
     int opens = 0, closes = 0;
@@ -310,21 +414,27 @@ struct FakeDriver {
                              kImportHandleBytes));
         auto it = open_maps.find(key);
         if (it == open_maps.end()) {
-            it = open_maps.emplace(key, next).first;
+            it = open_maps.emplace(key, std::make_pair(next, 0)).first;
             live[next] = true;
             next += 0x1000;
         }
+        ++it->second.second;
         ++opens;
-        *ptr = reinterpret_cast<void *>(it->second);
+        *ptr = reinterpret_cast<void *>(it->second.first);
         return 0;
     }
     int close(int, void *ptr) {
         const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
         if (!live[p]) return 400;
-        live[p] = false;
-        for (auto it = open_maps.begin(); it != open_maps.end();)
-            it = it->second == p ? open_maps.erase(it) : std::next(it);
         ++closes;
+        for (auto it = open_maps.begin(); it != open_maps.end(); ++it) {
+            if (it->second.first != p) continue;
+            if (--it->second.second == 0) {
+                live[p] = false;
+                open_maps.erase(it);
+            }
+            break;
+        }
         return 0;
     }
 };
@@ -341,27 +451,39 @@ std::vector<uint8_t> handleOf(const std::string &tag) {
     return h;
 }
 
+using Table = ImportTable<DriverRef>;
+const ImportOwner kProcA{101, "node-1"}, kProcB{202, "node-1"};
+
+// Which clients still have a control connection.
+struct Connected {
+    std::set<uint64_t> *live;
+    bool operator()(uint64_t c) const { return live->count(c) != 0; }
+};
+
 }  // namespace
 
 // An engine disconnects: once its registrations are gone, every mapping it
 // had (in every GPU context) is closed and nothing of it stays open.
 TEST(NvlinkProxyImports, DisconnectClosesEveryMappingOfTheEngine) {
     FakeDriver drv;
-    ImportTable<DriverRef> t(DriverRef{&drv});
+    Table t(DriverRef{&drv});
+    std::set<uint64_t> live = {0xA, 0xB};
+    const Connected conn{&live};
     const uint64_t engine = 0xA, other = 0xB;
     const auto h1 = handleOf("kv-pool-1"), h2 = handleOf("kv-pool-2"),
                hb = handleOf("other-engine");
     // Two blocks, each mapped in its own GPU's context and the peer's.
     for (int dev : {0, 1}) {
-        ASSERT_EQ(t.acquire(engine, dev, h1.data()).status,
-                  ImportTable<DriverRef>::Status::kOk);
-        ASSERT_EQ(t.acquire(engine, dev, h2.data()).status,
-                  ImportTable<DriverRef>::Status::kOk);
+        ASSERT_EQ(t.acquire(engine, kProcA, dev, h1.data(), conn).status,
+                  Table::Status::kOk);
+        ASSERT_EQ(t.acquire(engine, kProcA, dev, h2.data(), conn).status,
+                  Table::Status::kOk);
     }
-    ASSERT_EQ(t.acquire(other, 1, hb.data()).status,
-              ImportTable<DriverRef>::Status::kOk);
+    ASSERT_EQ(t.acquire(other, kProcB, 1, hb.data(), conn).status,
+              Table::Status::kOk);
     EXPECT_EQ(t.mappingsOf(engine), 4u);
     EXPECT_EQ(t.mappings(), 5u);
+    live.erase(engine);
     for (int dev : {0, 1}) {
         EXPECT_TRUE(t.release(engine, dev, h1.data()));
         EXPECT_TRUE(t.release(engine, dev, h2.data()));
@@ -369,20 +491,22 @@ TEST(NvlinkProxyImports, DisconnectClosesEveryMappingOfTheEngine) {
     EXPECT_EQ(t.mappingsOf(engine), 0u);
     EXPECT_EQ(t.mappings(), 1u);  // the other engine's stays
     EXPECT_EQ(drv.closes, 4);
+    EXPECT_EQ(drv.open_maps.size(), 1u);  // unmapped in the driver too
     EXPECT_EQ(t.opens(), 5u);
     EXPECT_EQ(t.closes(), 4u);
 }
 
 // The same engine registers a block again (reconnect) while a copy still
-// holds the old registration: both share one mapping, which stays usable
-// until the last of them is gone (the driver would unmap it for both).
+// holds the old registration: one mapping, open until both are gone.
 TEST(NvlinkProxyImports, ReRegistrationSharesTheMapping) {
     FakeDriver drv;
-    ImportTable<DriverRef> t(DriverRef{&drv});
+    Table t(DriverRef{&drv});
+    std::set<uint64_t> live = {0xA};
+    const Connected conn{&live};
     const auto h = handleOf("kv-pool");
-    auto a = t.acquire(0xA, 0, h.data());
-    auto b = t.acquire(0xA, 0, h.data());
-    ASSERT_EQ(b.status, ImportTable<DriverRef>::Status::kOk);
+    auto a = t.acquire(0xA, kProcA, 0, h.data(), conn);
+    auto b = t.acquire(0xA, kProcA, 0, h.data(), conn);
+    ASSERT_EQ(b.status, Table::Status::kOk);
     EXPECT_TRUE(a.opened);
     EXPECT_FALSE(b.opened);
     EXPECT_EQ(a.ptr, b.ptr);
@@ -394,41 +518,85 @@ TEST(NvlinkProxyImports, ReRegistrationSharesTheMapping) {
     EXPECT_FALSE(t.release(0xA, 0, h.data()));  // nothing left
 }
 
-// A restarted engine (new client id) whose handle bytes repeat its
-// predecessor's while a copy of the predecessor still holds that mapping:
-// never served from the old mapping; served once it is closed.
+// Two engines of one process (two client ids, same pid and node) register
+// the same allocation: while the first is connected, the second shares its
+// mapping; it stays open until both released it.
+TEST(NvlinkProxyImports, SameProcessSharesWhileAHolderIsConnected) {
+    FakeDriver drv;
+    Table t(DriverRef{&drv});
+    std::set<uint64_t> live = {0xA, 0xC};
+    const Connected conn{&live};
+    const auto h = handleOf("one-allocation");
+    auto a = t.acquire(0xA, kProcA, 0, h.data(), conn);
+    auto c = t.acquire(0xC, kProcA, 0, h.data(), conn);
+    ASSERT_EQ(c.status, Table::Status::kOk);
+    EXPECT_TRUE(c.shared);
+    EXPECT_EQ(c.ptr, a.ptr);
+    EXPECT_EQ(t.shares(), 1u);
+    EXPECT_EQ(t.mappingsOf(0xC), 1u);
+    live.erase(0xA);
+    EXPECT_FALSE(t.release(0xA, 0, h.data()));  // 0xC still uses it
+    EXPECT_TRUE(drv.live[reinterpret_cast<uintptr_t>(a.ptr)]);
+    EXPECT_TRUE(t.release(0xC, 0, h.data()));
+    EXPECT_FALSE(drv.live[reinterpret_cast<uintptr_t>(a.ptr)]);
+}
+
+// Another process -- even a connected one -- is never served from the
+// mapping (its equal bytes cannot be told apart from another allocation).
+TEST(NvlinkProxyImports, AnotherProcessIsRefusedEvenWhileConnected) {
+    FakeDriver drv;
+    Table t(DriverRef{&drv});
+    std::set<uint64_t> live = {0xA, 0xB};
+    const Connected conn{&live};
+    const auto h = handleOf("same-bytes");
+    ASSERT_EQ(t.acquire(0xA, kProcA, 0, h.data(), conn).status,
+              Table::Status::kOk);
+    auto b = t.acquire(0xB, kProcB, 0, h.data(), conn);
+    EXPECT_EQ(b.status, Table::Status::kConflict);
+    EXPECT_EQ(b.other, 0xAu);
+    EXPECT_EQ(b.other_owner.pid, kProcA.pid);
+    EXPECT_TRUE(b.other_connected);
+    EXPECT_EQ(drv.opens, 1);
+}
+
+// A restarted engine (new client id, even reporting the same pid) whose
+// handle bytes repeat its predecessor's while a copy of the disconnected
+// predecessor still holds that mapping: never served from the old mapping;
+// served from a fresh one once it is closed.
 TEST(NvlinkProxyImports, RestartedEngineIsNeverServedFromAStaleMapping) {
     FakeDriver drv;
-    ImportTable<DriverRef> t(DriverRef{&drv});
+    Table t(DriverRef{&drv});
+    std::set<uint64_t> live = {0x1111};
+    const Connected conn{&live};
     const auto h = handleOf("same-bytes");
     const uint64_t old_engine = 0x1111, new_engine = 0x2222;
-    auto old_map = t.acquire(old_engine, 0, h.data());
-    ASSERT_EQ(old_map.status, ImportTable<DriverRef>::Status::kOk);
-    auto c = t.acquire(new_engine, 0, h.data());
-    EXPECT_EQ(c.status, ImportTable<DriverRef>::Status::kConflict);
+    auto old_map = t.acquire(old_engine, kProcA, 0, h.data(), conn);
+    ASSERT_EQ(old_map.status, Table::Status::kOk);
+    live = {new_engine};  // the old engine's connection closed
+    auto c = t.acquire(new_engine, kProcA, 0, h.data(), conn);
+    EXPECT_EQ(c.status, Table::Status::kConflict);
     EXPECT_EQ(c.other, old_engine);
+    EXPECT_FALSE(c.other_connected);
     EXPECT_EQ(c.ptr, nullptr);
     EXPECT_EQ(t.conflicts(), 1u);
-    EXPECT_EQ(drv.opens, 1);  // not even opened (the driver would dedupe)
+    EXPECT_EQ(drv.opens, 1);  // not opened: the driver would return the old
     // The old engine's last copy finishes.
     EXPECT_TRUE(t.release(old_engine, 0, h.data()));
-    auto fresh = t.acquire(new_engine, 0, h.data());
-    ASSERT_EQ(fresh.status, ImportTable<DriverRef>::Status::kOk);
+    auto fresh = t.acquire(new_engine, kProcA, 0, h.data(), conn);
+    ASSERT_EQ(fresh.status, Table::Status::kOk);
     EXPECT_TRUE(fresh.opened);
     EXPECT_EQ(t.mappingsOf(old_engine), 0u);
     EXPECT_EQ(t.mappingsOf(new_engine), 1u);
-    // Another context is a separate mapping, owned by whoever opened it.
-    EXPECT_EQ(t.acquire(old_engine, 1, h.data()).status,
-              ImportTable<DriverRef>::Status::kOk);
 }
 
 TEST(NvlinkProxyImports, OpenErrorLeavesNothingBehind) {
     FakeDriver drv;
     drv.fail_with = 201;
-    ImportTable<DriverRef> t(DriverRef{&drv});
+    Table t(DriverRef{&drv});
+    std::set<uint64_t> live = {0xA};
     const auto h = handleOf("pid-collision");
-    auto a = t.acquire(0xA, 0, h.data());
-    EXPECT_EQ(a.status, ImportTable<DriverRef>::Status::kError);
+    auto a = t.acquire(0xA, kProcA, 0, h.data(), Connected{&live});
+    EXPECT_EQ(a.status, Table::Status::kError);
     EXPECT_EQ(a.error, 201);
     EXPECT_EQ(t.mappings(), 0u);
     EXPECT_FALSE(t.release(0xA, 0, h.data()));
@@ -440,10 +608,14 @@ TEST(NvlinkProxyDaemonSetup, SocketModeParsing) {
     EXPECT_EQ(m, 0600u);
     EXPECT_TRUE(parseSocketMode("0660", &m));
     EXPECT_EQ(m, 0660u);
-    EXPECT_TRUE(parseSocketMode("0", &m));
-    EXPECT_EQ(m, 0u);
-    for (const char *bad : {"", "0888", "1777", "77777", "rw", "-600", "0x1"})
+    EXPECT_TRUE(parseSocketMode("0644", &m));
+    EXPECT_EQ(m, 0644u);
+    // Malformed, or without read and write for the owner (the daemon's own
+    // --ping / --stats connect as the owner).
+    for (const char *bad : {"", "0888", "1777", "77777", "rw", "-600", "0x1",
+                            "0", "000", "0060", "0400", "0200", "0066"})
         EXPECT_FALSE(parseSocketMode(bad, &m)) << bad;
+
     EXPECT_EQ(kDefaultSocketMode, 0600u);
 }
 

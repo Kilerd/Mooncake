@@ -21,18 +21,19 @@
 //   waits and stream-waits-event behave like CUDA's.
 // - IPC handles name POSIX shared memory segments ("GPU memory" exported by
 //   the test's engines): "MOCKSHM\0", int32 GPU, NUL-terminated name (at most
-//   43 bytes), uint32 exporter pid at byte 56. As the driver does, a process
-//   gets one mapping per (GPU context, handle): opening a handle that is
-//   already open there returns the same mapping (MOCK_IPC_REOPEN=error makes
-//   it fail instead), and a close unmaps it for every user. An exporter pid
+//   43 bytes), uint32 exporter pid at byte 56. As the CUDA runtime API
+//   reference describes it, opening a handle already open in the current
+//   context returns the same pointer and increments a reference count;
+//   cudaIpcCloseMemHandle decrements it and unmaps at 0. An exporter pid
 //   equal to the importer's fails the open (error 201).
 // - Copies between two GPUs follow MOCK_P2P: ok (default), drop (writes
 //   lost) or corrupt (one byte per KiB flipped); MOCK_BAD_PAIRS="a>b,..."
 //   limits that to these ordered pairs; MOCK_NOPEER="a>b,..." reports no
 //   peer access.
 // - MOCK_COPY_DELAY_MS: each copy that touches IPC-imported memory takes
-//   this long (on its stream). MOCK_HOST_DELAY_MS: each copy of more than
-//   64 KiB from/to pinned host memory takes this long.
+//   this long (on its stream); MOCK_COPY_MBPS: such copies run at this many
+//   MB/s. MOCK_HOST_DELAY_MS: each copy of more than 64 KiB from/to pinned
+//   host memory takes this long.
 // - MOCK_WRITE_LOG=<file>: one line per copy into IPC-imported memory,
 //   "<CLOCK_MONOTONIC us> <segment name> <offset> <length>", written when
 //   the copy lands.
@@ -70,8 +71,9 @@ std::map<uintptr_t, std::string> imported;           // base -> segment name
 std::set<std::pair<int, int>> peers;                 // (dev, peer)
 std::map<uintptr_t, size_t> pinned;                  // cudaHostAlloc ranges
 std::map<uintptr_t, size_t> registered;              // cudaHostRegister ranges
-// (dev, handle bytes) -> mapping base: one mapping per context and handle.
-std::map<std::pair<int, std::string>, uintptr_t> ipc_open;
+// (dev, handle bytes) -> (mapping base, opens): one mapping per context and
+// handle, reference counted.
+std::map<std::pair<int, std::string>, std::pair<uintptr_t, int>> ipc_open;
 thread_local int cur = 0;
 
 int envInt(const char *n, int d) {
@@ -156,6 +158,9 @@ cudaError_t copyNow(void *dst, const void *src, size_t n) {
         usleep(host_delay * 1000);
     const int delay = envInt("MOCK_COPY_DELAY_MS", 0);
     if (delay && (!seg_s.empty() || !seg_d.empty())) usleep(delay * 1000);
+    const int mbps = envInt("MOCK_COPY_MBPS", 0);
+    if (mbps > 0 && (!seg_s.empty() || !seg_d.empty()))
+        usleep(static_cast<useconds_t>(n / static_cast<size_t>(mbps)));
     if (sd >= 0 && dd >= 0 && sd != dd && badPair(sd, dd)) {
         const char *mode = getenv("MOCK_P2P");
         const std::string m = mode ? mode : "ok";
@@ -488,10 +493,8 @@ cudaError_t cudaIpcOpenMemHandle(void **p, cudaIpcMemHandle_t h, unsigned int) {
         std::lock_guard<std::mutex> l(mu);
         auto it = ipc_open.find(key);
         if (it != ipc_open.end()) {
-            const char *mode = getenv("MOCK_IPC_REOPEN");
-            if (mode && std::string(mode) == "error")
-                return cudaErrorAlreadyMapped;
-            *p = reinterpret_cast<void *>(it->second);
+            ++it->second.second;
+            *p = reinterpret_cast<void *>(it->second.first);
             return cudaSuccess;
         }
     }
@@ -506,7 +509,7 @@ cudaError_t cudaIpcOpenMemHandle(void **p, cudaIpcMemHandle_t h, unsigned int) {
     std::lock_guard<std::mutex> l(mu);
     allocs[reinterpret_cast<uintptr_t>(m)] = {size_t(st.st_size), dev};
     imported[reinterpret_cast<uintptr_t>(m)] = name;
-    ipc_open[key] = reinterpret_cast<uintptr_t>(m);
+    ipc_open[key] = {reinterpret_cast<uintptr_t>(m), 1};
     *p = m;
     return cudaSuccess;
 }
@@ -517,11 +520,15 @@ cudaError_t cudaIpcCloseMemHandle(void *p) {
     auto it = allocs.find(a);
     if (it == allocs.end() || !imported.count(a))
         return cudaErrorInvalidResourceHandle;
-    munmap(p, it->second.first);  // for every user of the mapping
+    for (auto o = ipc_open.begin(); o != ipc_open.end(); ++o) {
+        if (o->second.first != a) continue;
+        if (--o->second.second > 0) return cudaSuccess;  // still opened
+        ipc_open.erase(o);
+        break;
+    }
+    munmap(p, it->second.first);
     allocs.erase(it);
     imported.erase(a);
-    for (auto o = ipc_open.begin(); o != ipc_open.end();)
-        o = o->second == a ? ipc_open.erase(o) : std::next(o);
     return cudaSuccess;
 }
 

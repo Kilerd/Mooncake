@@ -262,9 +262,34 @@ static_assert(kIpcHandleSize == kImportHandleBytes, "IPC handle size");
 using Imports = ImportTable<CudaIpcOpener>;
 Imports g_imports;
 
+// Clients with an open control connection (client id -> connections): a
+// mapping is shared with another client of the same process only while one
+// of its holders is still connected.
+std::mutex g_live_mu;
+std::map<uint64_t, int> g_live_clients;
+
+bool clientConnected(uint64_t client) {
+    std::lock_guard<std::mutex> lock(g_live_mu);
+    auto it = g_live_clients.find(client);
+    return it != g_live_clients.end() && it->second > 0;
+}
+
+void noteClientConnected(uint64_t client, int delta) {
+    std::lock_guard<std::mutex> lock(g_live_mu);
+    int &n = g_live_clients[client];
+    n += delta;
+    if (n <= 0) g_live_clients.erase(client);
+}
+
+// Measured rates (paced_issue.h): per GPU running the work, copy engines [0]
+// and gather kernel [1]; per host-staged pair, sending -> receiving GPU.
+RateModel g_rate[kMaxDevices][2];
+RateModel g_stage_rate[kMaxDevices][kMaxDevices];
+
 // ----------------------------------------------------------- registrations
 struct Registration {
     uint64_t client_id = 0;
+    ImportOwner owner;  // the engine's process, as it reported it (HELLO)
     uint64_t base = 0;
     uint64_t size = 0;
     int device = -1;  // daemon ordinal of the GPU that owns the memory
@@ -299,10 +324,11 @@ struct Registration {
     }
 
     // Map this block in |dev|'s context (the GPU that will pull/receive).
-    // cudaErrorAlreadyMapped with *conflict set: the handle is mapped for
-    // another client (another engine process) and is not served from that
-    // mapping.
-    cudaError_t mapFor(int dev, char **out, bool *opened, uint64_t *conflict) {
+    // cudaErrorAlreadyMapped with *conflict filled in: the handle is mapped
+    // for a client of another process, or for one that disconnected, and is
+    // not served from that mapping (ipc_imports.h).
+    cudaError_t mapFor(int dev, char **out, bool *opened,
+                       Imports::Acquired *conflict) {
         std::lock_guard<std::mutex> lock(mu);
         *opened = false;
         auto it = mapped.find(dev);
@@ -311,9 +337,10 @@ struct Registration {
             return cudaSuccess;
         }
         const uint64_t t0 = nowUs();
-        const Imports::Acquired a = g_imports.acquire(client_id, dev, handle);
+        const Imports::Acquired a =
+            g_imports.acquire(client_id, owner, dev, handle, clientConnected);
         if (a.status == Imports::Status::kConflict) {
-            *conflict = a.other;
+            *conflict = a;
             return cudaErrorAlreadyMapped;
         }
         if (a.status != Imports::Status::kOk)
@@ -322,6 +349,11 @@ struct Registration {
             LOGI("opened client=%016" PRIx64 " base=%#" PRIx64 " size=%" PRIu64
                  " (gpu %d) in gpu %d context in %.1f ms",
                  client_id, base, size, device, dev, (nowUs() - t0) / 1000.0);
+        else if (a.shared)
+            LOGI("client=%016" PRIx64 " base=%#" PRIx64
+                 " (gpu %d) shares the mapping in gpu %d context of another "
+                 "client of its process (pid %u)",
+                 client_id, base, device, dev, owner.pid);
         mapped[dev] = static_cast<char *>(a.ptr);
         *out = static_cast<char *>(a.ptr);
         *opened = a.opened;
@@ -428,6 +460,26 @@ std::string statsText() {
     out += " ipc_mappings=" + std::to_string(g_imports.mappings()) +
            " ipc_closes=" + std::to_string(g_imports.closes()) +
            " ipc_conflicts=" + std::to_string(g_imports.conflicts());
+    // Measured rates of the work served so far (GB/s): gpu.ce, gpu.kernel,
+    // and src>dst for host-staged pairs.
+    std::string rates;
+    char one[48];
+    for (size_t i = 0; i < g_devices.size(); ++i) {
+        for (int kind = 0; kind < 2; ++kind) {
+            if (!g_rate[i][kind].warm()) continue;
+            snprintf(one, sizeof(one), "%s%zu.%s:%.1f",
+                     rates.empty() ? "" : ",", i, kind ? "kernel" : "ce",
+                     g_rate[i][kind].gbps());
+            rates += one;
+        }
+        for (size_t j = 0; j < g_devices.size(); ++j) {
+            if (!g_stage_rate[i][j].warm()) continue;
+            snprintf(one, sizeof(one), "%s%zu>%zu.staged:%.1f",
+                     rates.empty() ? "" : ",", i, j, g_stage_rate[i][j].gbps());
+            rates += one;
+        }
+    }
+    out += " rate_gbps=" + (rates.empty() ? std::string("-") : rates);
     return out;
 }
 
@@ -444,13 +496,14 @@ struct CopyConfig {
     // Merge consecutive entries that are contiguous in source and target.
     bool coalesce = true;
     // Direct (P2P) work is issued in chunks of at most this many bytes, at
-    // most kPacedWindow in flight per GPU, the copy's hard deadline checked
-    // before each (paced_issue.h); bounds what is still in flight when the
-    // deadline passes.
-    uint64_t chunk_bytes = 32ull << 20;
+    // most kPacedWindow in flight per stream of the serving thread, each
+    // issued only if it is predicted to finish before the copy's hard
+    // deadline (paced_issue.h).
+    uint64_t chunk_bytes = 128ull << 20;
 } g_cfg;
 
-// Entries per chunk (one cudaMemcpyBatchAsync call or kernel launch).
+// Entries per copy-engine chunk (one cudaMemcpyBatchAsync call). Gather
+// kernel chunks are bounded by bytes only (one launch).
 constexpr size_t kChunkEntries = 8192;
 
 // Per connection-thread resources, one set per executing GPU.
@@ -934,18 +987,47 @@ bool stagedCopy(int s, int d, const std::vector<StagedItem> &items,
         }
         return r;
     };
-    bool slot_used[2] = {false, false};
+    // Pieces in flight per slot (issued, completion not observed yet), with
+    // their issue time and size: each completion feeds the pair's rate
+    // model, and a piece is issued only if it and the piece ahead of it are
+    // predicted to finish before |hard_deadline_us| (paced_issue.h).
+    RateModel &rate = g_stage_rate[s][d];
+    bool in_flight[2] = {false, false};
+    uint64_t issued_us[2] = {0, 0}, piece_bytes[2] = {0, 0};
+    uint64_t last_done_us = 0;
+    auto settle = [&](int sl) -> cudaError_t {
+        const cudaError_t r = cudaEventSynchronize(freed[sl]);
+        if (r != cudaSuccess) return r;
+        const uint64_t t = nowUs();
+        rate.observe(piece_bytes[sl],
+                     double(t - std::max(issued_us[sl], last_done_us)));
+        last_done_us = t;
+        in_flight[sl] = false;
+        return cudaSuccess;
+    };
     for (size_t k = 0; k < chunks.size() && e == cudaSuccess; ++k) {
-        if (nowUs() >= hard_deadline_us) {
-            why = "deadline reached after " + std::to_string(k) + " of " +
-                  std::to_string(chunks.size()) + " pieces";
+        const int sl = int(k % 2), other = 1 - sl;
+        // The slot (and the table regions of its parity) are free again once
+        // the receiving GPU has copied piece k-2 out of it; a pair not
+        // measured yet runs one piece at a time.
+        if (in_flight[sl]) e = settle(sl);
+        if (e == cudaSuccess && in_flight[other] && !rate.warm())
+            e = settle(other);
+        if (e != cudaSuccess) break;
+        uint64_t bytes = 0;
+        for (const Piece &p : chunks[k]) bytes += p.len;
+        const double ps = rate.psPerByte();
+        double us = predictUs(bytes, ps);
+        if (in_flight[other]) us += predictUs(piece_bytes[other], ps);
+        if (double(nowUs()) + us > double(hard_deadline_us)) {
+            why = "deadline: piece " + std::to_string(k + 1) + " of " +
+                  std::to_string(chunks.size()) +
+                  " would not finish in time at the measured rate";
             break;
         }
-        const int sl = int(k % 2);
-        // The slot (and the table regions of its parity) are free again once
-        // the receiving GPU has copied piece k-2 out of it.
-        if (slot_used[sl]) e = cudaEventSynchronize(freed[sl]);
-        if (e == cudaSuccess) e = side(s, rs, sl, chunks[k], slot[sl], true);
+        issued_us[sl] = nowUs();
+        piece_bytes[sl] = bytes;
+        e = side(s, rs, sl, chunks[k], slot[sl], true);
         if (e == cudaSuccess) e = cudaEventRecord(filled[sl], rs->stream);
         if (e == cudaSuccess && nowUs() >= hard_deadline_us) {
             // Nothing of piece k reaches the destination.
@@ -958,13 +1040,24 @@ bool stagedCopy(int s, int d, const std::vector<StagedItem> &items,
             e = cudaStreamWaitEvent(rd->stream, filled[sl], 0);
         if (e == cudaSuccess) e = side(d, rd, sl, chunks[k], slot[sl], false);
         if (e == cudaSuccess) e = cudaEventRecord(freed[sl], rd->stream);
-        slot_used[sl] = true;
+        in_flight[sl] = e == cudaSuccess;
     }
     // Nothing may still run when the slots go back or the reply goes out.
     cudaError_t se = rd ? cudaStreamSynchronize(rd->stream) : cudaSuccess;
     if (e == cudaSuccess) e = se;
     se = rs ? cudaStreamSynchronize(rs->stream) : cudaSuccess;
     if (e == cudaSuccess) e = se;
+    if (e == cudaSuccess && (in_flight[0] || in_flight[1])) {
+        // The last pieces ran back to back: one sample for them.
+        const uint64_t t = nowUs();
+        uint64_t start = UINT64_MAX, bytes = 0;
+        for (int sl = 0; sl < 2; ++sl) {
+            if (!in_flight[sl]) continue;
+            start = std::min(start, issued_us[sl]);
+            bytes += piece_bytes[sl];
+        }
+        rate.observe(bytes, double(t - std::max(start, last_done_us)));
+    }
     for (int k = 0; k < 2; ++k) {
         if (filled[k]) cudaEventDestroy(filled[k]);
         if (freed[k]) cudaEventDestroy(freed[k]);
@@ -1051,6 +1144,7 @@ class MapResolver {
         bool opened = false;
         cudaError_t e = reg->mapFor(dev, out, &opened, &conflict_);
         if (opened) g_stats.handle_opens++;
+        if (e == cudaErrorAlreadyMapped) have_conflict_ = true;
         if (e != cudaSuccess) {
             failed_ = reg;
             return e;
@@ -1063,14 +1157,27 @@ class MapResolver {
     // Reply text for a failed map(): a CUDA error, or the handle is mapped
     // for another client.
     std::string error(cudaError_t e) const {
-        char m[320];
-        if (e == cudaErrorAlreadyMapped && conflict_ && failed_) {
-            snprintf(m, sizeof(m),
-                     "the IPC handle of block client=%016" PRIx64
-                     " base=%#" PRIx64 " is still mapped for client %016" PRIx64
-                     " (an earlier engine process whose copies have not "
-                     "finished); not served from that mapping",
-                     failed_->client_id, failed_->base, conflict_);
+        char m[384];
+        if (e == cudaErrorAlreadyMapped && have_conflict_ && failed_) {
+            const Imports::Acquired &c = conflict_;
+            if (!(c.other_owner == failed_->owner))
+                snprintf(m, sizeof(m),
+                         "the IPC handle of block client=%016" PRIx64
+                         " base=%#" PRIx64
+                         " (pid %u) is already mapped for client %016" PRIx64
+                         " of another process (pid %u, node %s); not served "
+                         "from that mapping",
+                         failed_->client_id, failed_->base, failed_->owner.pid,
+                         c.other, c.other_owner.pid,
+                         c.other_owner.node.c_str());
+            else
+                snprintf(m, sizeof(m),
+                         "the IPC handle of block client=%016" PRIx64
+                         " base=%#" PRIx64
+                         " is still mapped for client %016" PRIx64
+                         ", which has disconnected (copies in flight still "
+                         "use the mapping); not served from that mapping",
+                         failed_->client_id, failed_->base, c.other);
         } else {
             snprintf(m, sizeof(m), "cudaIpcOpenMemHandle: %s",
                      cudaGetErrorString(e));
@@ -1079,7 +1186,8 @@ class MapResolver {
     }
 
    private:
-    uint64_t conflict_ = 0;
+    Imports::Acquired conflict_;
+    bool have_conflict_ = false;
     const Registration *failed_ = nullptr;
 
     static constexpr int kHot = 4;
@@ -1263,12 +1371,12 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
 
     // The engine gives up on a copy after twice its start budget (its
     // request timeout; budget = timeout / 2) and rewrites it on its base
-    // transport. Nothing of this copy may be written after that: no staged
-    // piece (at most one slot, a few ms) and no P2P chunk (at most
-    // --copy-chunk-mb, kPacedWindow of them in flight per GPU) is issued
-    // past |hard_deadline| -- a tenth of the budget (at least 50 ms) before
-    // the engine gives up -- and whatever is in flight is drained before the
-    // refusal goes out.
+    // transport. Nothing of this copy should be written after that: a staged
+    // piece or a P2P chunk is issued only if, at the measured rate, it and
+    // the work ahead of it finish before |hard_deadline| -- a tenth of the
+    // budget (at least 50 ms) before the engine gives up -- and whatever is
+    // in flight is drained before the refusal goes out, so nothing lands
+    // after the reply (paced_issue.h states what that guarantees).
     const uint64_t margin_us =
         std::max<uint64_t>(uint64_t(budget_ms) * 100, 50000);
     const uint64_t hard_deadline =
@@ -1290,13 +1398,13 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
         for (const auto &kv : staged) {
             const int sd = kv.first.first, dd = kv.first.second;
             std::string why;
-            bool ok = false;
+            bool ok = false, at_deadline = false;
             if (started_too_late()) {
                 why = "start budget exceeded";
+                at_deadline = true;
             } else {
                 const uint64_t wait_until =
                     nowUs() + uint64_t(g_host_staging_wait_ms) * 1000;
-                bool at_deadline = false;
                 ok = stagedCopy(sd, dd, kv.second, wait_until, hard_deadline,
                                 &why, &at_deadline);
                 if (at_deadline) g_stats.deadline_aborts++;
@@ -1320,6 +1428,9 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
                     "%s",
                     sd, g_devices[sd].pci.c_str(), dd,
                     g_devices[dd].pci.c_str(), why.c_str());
+                // Out of time is a deadline, not a pair the daemon refuses.
+                if (at_deadline)
+                    return fail(ProxyStatus::kDeadlineExceeded, count, m);
                 r.denied = true;
                 return fail(ProxyStatus::kNoPeerAccess, count, m);
             }
@@ -1333,15 +1444,19 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
 
     // 3b. The direct (P2P) part, paced (paced_issue.h): per executing GPU
     //     the gather-kernel rows and then the copy-engine entries, in chunks
-    //     of at most --copy-chunk-mb and kChunkEntries entries; at most
-    //     kPacedWindow chunks in flight per GPU; the hard deadline checked
-    //     before every chunk. Past the deadline nothing more is issued, what
-    //     is in flight is drained and the copy is refused, so no byte of it
-    //     lands after the reply (nor after the engine gave up on it).
+    //     of at most --copy-chunk-mb (copy-engine chunks also at most
+    //     kChunkEntries entries); at most kPacedWindow chunks in flight on
+    //     this thread's stream of the GPU; a chunk is issued only if it is
+    //     predicted to finish before the hard deadline at the GPU's measured
+    //     rate. Otherwise nothing more is issued, what is in flight is
+    //     drained and the copy is refused; no byte of it lands after the
+    //     reply. A GPU whose rate is not measured yet starts with a probe
+    //     chunk of at most kProbeBytes, issued alone.
     struct Chunk {
         int dev;
         bool kernel;  // gather-kernel rows (w.small), else w.ce_*
         size_t begin, end;
+        uint64_t bytes;
     };
     std::map<int, std::vector<Chunk>> dev_chunks;
     std::map<int, DeviceResources *> res_of;
@@ -1359,39 +1474,53 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
                         std::string("copy setup: ") + cudaGetErrorString(ce));
         }
         res_of[dev] = res;
+        const bool ce_warm = g_rate[dev][0].warm();
+        const bool kernel_warm = g_rate[dev][1].warm();
+        if (!ce_warm && !w.ce_len.empty() && w.ce_len[0] > kProbeBytes) {
+            // The probe: the first kProbeBytes of the first entry.
+            w.ce_dst.insert(w.ce_dst.begin() + 1,
+                            static_cast<char *>(w.ce_dst[0]) + kProbeBytes);
+            w.ce_src.insert(w.ce_src.begin() + 1,
+                            static_cast<char *>(w.ce_src[0]) + kProbeBytes);
+            w.ce_len.insert(w.ce_len.begin() + 1, w.ce_len[0] - kProbeBytes);
+            w.ce_len[0] = kProbeBytes;
+        }
         std::vector<Chunk> &chunks = dev_chunks[dev];
         std::vector<uint64_t> lens;
         lens.reserve(w.small.size());
         for (const GatherEntry &g : w.small) lens.push_back(g.length);
-        for (const ChunkSpan &c : planChunks(lens.data(), lens.size(),
-                                             kChunkEntries, g_cfg.chunk_bytes))
-            chunks.push_back({dev, true, c.begin, c.end});
+        for (const ChunkSpan &c :
+             planChunks(lens.data(), lens.size(), 0, g_cfg.chunk_bytes,
+                        kernel_warm ? 0 : kProbeBytes))
+            chunks.push_back({dev, true, c.begin, c.end, c.bytes});
         lens.assign(w.ce_len.begin(), w.ce_len.end());
-        for (const ChunkSpan &c : planChunks(lens.data(), lens.size(),
-                                             kChunkEntries, g_cfg.chunk_bytes))
-            chunks.push_back({dev, false, c.begin, c.end});
+        for (const ChunkSpan &c :
+             planChunks(lens.data(), lens.size(), kChunkEntries,
+                        g_cfg.chunk_bytes, ce_warm ? 0 : kProbeBytes))
+            chunks.push_back({dev, false, c.begin, c.end, c.bytes});
     }
     std::map<int, size_t> per_dev;
     for (const auto &kv : dev_chunks) per_dev[kv.first] = kv.second.size();
     std::vector<Chunk> order;
-    std::vector<int> lanes;
+    std::vector<PacedChunk> paced;
     for (const auto &p : interleaveLanes(per_dev)) {
-        order.push_back(dev_chunks[p.first][p.second]);
-        lanes.push_back(p.first);
+        const Chunk &ch = dev_chunks[p.first][p.second];
+        order.push_back(ch);
+        // The kernel's rate is measured per GPU; once the kernel has no
+        // image there its rows go through the copy engines.
+        const bool kernel = ch.kernel && !g_kernel_unusable[ch.dev].load();
+        paced.push_back({ch.dev, ch.bytes, &g_rate[ch.dev][kernel ? 1 : 0]});
     }
     std::set<int> table_uploaded;
     uint64_t kernel_entries = 0, kernel_bytes = 0, ce_entries = 0, ce_bytes = 0;
-    auto issueChunk = [&](size_t k) -> int {
+    auto issueChunk = [&](size_t k) -> cudaError_t {
         const Chunk &ch = order[k];
         DevWork &w = work[ch.dev];
         DeviceResources *res = res_of[ch.dev];
         cudaError_t ce = cudaSetDevice(ch.dev);
-        if (ce != cudaSuccess) return static_cast<int>(ce);
+        if (ce != cudaSuccess) return ce;
         const size_t n = ch.end - ch.begin;
-        uint64_t bytes = 0;
         if (ch.kernel) {
-            for (size_t i = ch.begin; i < ch.end; ++i)
-                bytes += w.small[i].length;
             if (!g_kernel_unusable[ch.dev].load(std::memory_order_relaxed)) {
                 if (table_uploaded.insert(ch.dev).second) {
                     // The whole table once; each chunk launches on its rows.
@@ -1400,20 +1529,20 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
                     ce = cudaMemcpyAsync(res->dev_table, res->host_table,
                                          w.small.size() * sizeof(GatherEntry),
                                          cudaMemcpyHostToDevice, res->stream);
-                    if (ce != cudaSuccess) return static_cast<int>(ce);
+                    if (ce != cudaSuccess) return ce;
                 }
                 ce = launchGatherCopy(res->dev_table + ch.begin,
                                       static_cast<uint32_t>(n),
                                       res->grid_blocks, res->stream);
                 if (ce == cudaSuccess) {
                     kernel_entries += n;
-                    kernel_bytes += bytes;
-                    return 0;
+                    kernel_bytes += ch.bytes;
+                    return ce;
                 }
                 if (ce != cudaErrorNoKernelImageForDevice &&
                     ce != cudaErrorInvalidDeviceFunction &&
                     ce != cudaErrorUnsupportedPtxVersion)
-                    return static_cast<int>(ce);
+                    return ce;
                 // No usable kernel image for this GPU: the copy engines for
                 // these rows and every later batch.
                 cudaGetLastError();
@@ -1433,38 +1562,32 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
             ce = issueCopies(dsts.data(), srcs.data(), sizes.data(), n,
                              res->stream);
         } else {
-            for (size_t i = ch.begin; i < ch.end; ++i) bytes += w.ce_len[i];
             ce = issueCopies(w.ce_dst.data() + ch.begin,
                              w.ce_src.data() + ch.begin,
                              w.ce_len.data() + ch.begin, n, res->stream);
         }
         if (ce == cudaSuccess) {
             ce_entries += n;
-            ce_bytes += bytes;
+            ce_bytes += ch.bytes;
         }
-        return static_cast<int>(ce);
+        return ce;
     };
     const PacedResult pr = issuePaced(
-        lanes, kPacedWindow, hard_deadline, nowUs, issueChunk,
-        [&](int dev, size_t slot) -> int {
-            DeviceResources *res = res_of[dev];
-            cudaError_t ce = cudaSetDevice(dev);
+        paced, kPacedWindow, hard_deadline, nowUs,
+        [&](size_t k, size_t slot) -> int {
+            cudaError_t ce = issueChunk(k);
             if (ce == cudaSuccess)
-                ce = cudaEventRecord(res->done[slot], res->stream);
+                ce = cudaEventRecord(res_of[order[k].dev]->done[slot],
+                                     res_of[order[k].dev]->stream);
             return static_cast<int>(ce);
         },
         [&](int dev, size_t slot) -> int {
             return static_cast<int>(
                 cudaEventSynchronize(res_of[dev]->done[slot]));
         },
-        [&]() -> int {
+        [&](int dev) -> int {
             // Nothing may still be running when the reply goes out.
-            cudaError_t first = cudaSuccess;
-            for (const auto &kv : res_of) {
-                const cudaError_t ce = cudaStreamSynchronize(kv.second->stream);
-                if (ce != cudaSuccess && first == cudaSuccess) first = ce;
-            }
-            return static_cast<int>(first);
+            return static_cast<int>(cudaStreamSynchronize(res_of[dev]->stream));
         });
     g_stats.kernel_entries += kernel_entries;
     g_stats.kernel_bytes += kernel_bytes;
@@ -1484,11 +1607,12 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
     }
     if (pr.deadline) {
         g_stats.deadline_aborts++;
-        char m[160];
+        char m[224];
         snprintf(m, sizeof(m),
-                 "deadline reached after %zu of %zu P2P chunks; the rest was "
-                 "not issued and nothing of the copy is in flight",
-                 pr.issued, order.size());
+                 "deadline: P2P chunk %zu of %zu would not finish in time "
+                 "(%.1f ms of work predicted at the measured rate); the rest "
+                 "was not issued and nothing of the copy is in flight",
+                 pr.issued + 1, order.size(), pr.predicted_us / 1000.0);
         return fail(ProxyStatus::kDeadlineExceeded, count, m);
     }
     return r;
@@ -1607,6 +1731,7 @@ void handleConnection(int fd) {
                 c.hello = true;
                 if (c.control && !was_control) {
                     g_stats.active_clients++;
+                    noteClientConnected(c.client_id, +1);
                     // Who is connected: the socket's permissions decide who
                     // may; the pid as seen here is 0 when the engine runs in
                     // another PID namespace (another container of the pod).
@@ -1707,6 +1832,8 @@ void handleConnection(int fd) {
                     if (!same) {
                         auto reg = std::make_shared<Registration>();
                         reg->client_id = c.client_id;
+                        reg->owner.pid = c.pid;
+                        reg->owner.node = c.node;
                         reg->base = req.base;
                         reg->size = req.size;
                         reg->device = dev;
@@ -1869,6 +1996,8 @@ void handleConnection(int fd) {
         if (!ok) break;
     }
     if (c.control) {
+        // Not connected any more: its mappings are shared no further.
+        noteClientConnected(c.client_id, -1);
         dropOwned(c);
         g_stats.active_clients--;
     }
@@ -3383,7 +3512,8 @@ void usage(const char *argv0) {
         "                          only the daemon's user may connect; run "
         "the\n"
         "                          engines as that user, or use 0660 and a\n"
-        "                          group shared with the daemon). Whoever can\n"
+        "                          group shared with the daemon; the owner\n"
+        "                          needs read and write). Whoever can\n"
         "                          connect can copy between all registered\n"
         "                          buffers\n"
         "  --min-visible-gpus <n>  exit with an error (code 78) at start when\n"
@@ -3416,10 +3546,14 @@ void usage(const char *argv0) {
         "                          contiguous in source and destination\n"
         "  --copy-chunk-mb <MB>    P2P work is issued in chunks of at most "
         "this\n"
-        "                          size, two in flight per GPU, the copy's\n"
-        "                          deadline checked before each; past it the\n"
-        "                          rest is not issued and the copy is refused\n"
-        "                          once nothing is in flight (default 32)\n"
+        "                          size, two in flight on each GPU stream of\n"
+        "                          the connection thread serving the copy\n"
+        "                          (other connections' copies run on their\n"
+        "                          own streams); a chunk is issued only if it\n"
+        "                          is predicted to finish before the copy's\n"
+        "                          deadline at the GPU's measured rate,\n"
+        "                          otherwise the copy is refused once nothing\n"
+        "                          of it is in flight (default 128)\n"
         "  --drain-timeout-ms <ms> on SIGTERM/SIGINT, wait up to this long "
         "for\n"
         "                          running copies to finish (default 10000)\n"
@@ -3485,6 +3619,7 @@ void usage(const char *argv0) {
         "untested_host_paths (tests that could not run, waiting for a\n"
         "retry), staged_copies, staged_bytes, staged_failures (host-staged\n"
         "copies), deadline_aborts (copies stopped at their deadline),\n"
+        "rate_gbps (measured rates the deadline predictions use),\n"
         "register_refusals, ipc_mappings (IPC handles open now), ipc_closes\n"
         "and ipc_conflicts (copies refused because a handle was still mapped\n"
         "for another engine).\n",
@@ -3522,7 +3657,8 @@ int main(int argc, char **argv) {
             if (!parseSocketMode(v, &socket_mode)) {
                 fprintf(stderr,
                         "--socket-mode must be octal permission bits "
-                        "(e.g. 0600, 0660), got %s\n",
+                        "with read and write for the owner (e.g. 0600, "
+                        "0660), got %s\n",
                         v.c_str());
                 return 2;
             }

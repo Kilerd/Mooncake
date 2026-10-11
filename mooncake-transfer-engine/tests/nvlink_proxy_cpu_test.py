@@ -18,8 +18,12 @@ Runs the daemon built against a CPU stand-in for the CUDA runtime
 (nvlink_proxy_mock_cudart.cpp: "GPU memory" is POSIX shared memory, streams
 are worker threads) and plays engines over its socket:
 
-  p2p_deadline       a slow P2P copy stops at its hard deadline; the refusal
-                     leaves before the engine gives up, no byte lands after it
+  p2p_deadline       a slow P2P copy stops before its hard deadline; the
+                     refusal leaves before the engine gives up, no byte lands
+                     after it
+  slow_link          a ~100 MB/s link at the default chunk size: the probe
+                     measures it and the copy is refused in time; once
+                     measured, a copy that cannot finish is not started
   p2p_exact          chunked P2P copies (large runs split, kernel rows) are
                      byte-exact, gather kernel on either GPU
   staged             host-staged copies, also stopped at their deadline
@@ -29,6 +33,8 @@ are worker threads) and plays engines over its socket:
   restart            a restarted engine (new client id, same addresses, even
                      byte-identical handles) is never served from a stale
                      mapping; a re-registering engine shares its mapping
+  share              two engines of one process share a mapping while one is
+                     connected; another process is refused
   gpus               --min-visible-gpus, REGISTER of a GPU the daemon cannot
                      see, a client pid equal to the daemon's
 
@@ -302,6 +308,10 @@ def p2p_deadline():
             f"({(reply_us - (last or 0)) / 1000:.1f} ms before)",
         )
         check(last is None or last < give_up_us, "no write after the engine gave up")
+        check(
+            last is None or last <= int((t0 + 0.55) * 1e6),
+            "no write after the hard deadline (550 ms)",
+        )
         snap = bytes(dst.m[: 128 * MiB])
         time.sleep(1.0)
         check(
@@ -322,6 +332,65 @@ def p2p_deadline():
             st == OK and dst.m[: 128 * MiB] == src.m[: 128 * MiB],
             f"without a deadline: OK and byte-exact ({t*1000:.0f} ms)",
         )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+
+def write_count(d):
+    if not os.path.exists(d.writes):
+        return 0
+    with open(d.writes) as f:
+        return sum(1 for _ in f)
+
+
+def slow_link():
+    print("== slow_link: P2P at ~100 MB/s, 300 ms budget, default chunk size")
+    d = Daemon([], {"MOCK_COPY_MBPS": "100"})
+    try:
+        src = Segment("nvlp-src", 128 * MiB, 8)
+        dst = Segment("nvlp-dst", 128 * MiB)
+        ca, cb = pair(d, src, dst)
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        # 64 x 1 MiB (one 64 MiB run): ~670 ms at 100 MB/s, the engine gives
+        # up at 600 ms. Cold rate: an 8 MiB probe measures the link first.
+        st, msg, t0, t = copy(d.sock, runs(64, MiB), budget_ms=300)
+        reply_us = int((t0 + t) * 1e6)
+        last = d.last_write_us("nvlp-dst")
+        print(f"  status {st} after {t * 1000:.0f} ms: {msg[:110]}")
+        check(st == DEADLINE_EXCEEDED, "refused with DEADLINE_EXCEEDED")
+        check(t < 0.6, f"refused before the engine gives up ({t*1000:.0f} ms)")
+        check(
+            last is None or last <= reply_us,
+            "the last write landed before the reply",
+        )
+        check(
+            last is None or last <= int((t0 + 0.55) * 1e6),
+            "no write after the hard deadline (550 ms)",
+        )
+        snap = bytes(dst.m[: 64 * MiB])
+        time.sleep(0.8)
+        check(bytes(dst.m[: 64 * MiB]) == snap, "nothing changed after the reply")
+        # Measured now: the same copy is refused before anything is issued.
+        before = write_count(d)
+        st, msg, _, t = copy(d.sock, runs(64, MiB, dst_off=64 * MiB), budget_ms=300)
+        check(
+            st == DEADLINE_EXCEEDED and t < 0.05 and write_count(d) == before,
+            f"measured rate: refused at once, nothing written ({t*1000:.0f} ms,"
+            f" {msg[:70]})",
+        )
+        # A copy that fits still completes: 16 MiB, ~170 ms.
+        st, _, _, t = copy(
+            d.sock, runs(16, MiB, src_off=32 * MiB, dst_off=96 * MiB), budget_ms=300
+        )
+        check(
+            st == OK and dst.m[96 * MiB : 112 * MiB] == src.m[32 * MiB : 48 * MiB],
+            f"a copy that fits completes ({t*1000:.0f} ms)",
+        )
+        rates = stats(d.sock)["rate_gbps"]
+        check(rates.startswith("1.ce:0.1"), f"measured rate_gbps={rates}")
         ca.close()
         cb.close()
     finally:
@@ -432,7 +501,7 @@ def staged():
         snap = bytes(dst.m[8 * MiB : 108 * MiB])
         time.sleep(1.0)
         check(
-            st == NO_PEER_ACCESS and t < 0.6,
+            st == DEADLINE_EXCEEDED and t < 0.6,
             f"slow staged copy refused after {t*1000:.0f} ms ({msg[:80]})",
         )
         check(
@@ -485,12 +554,13 @@ def socket_mode():
         check(mode == 0o660, f"--socket-mode 0660 -> {oct(mode)}")
     finally:
         d.stop()
-    d = Daemon(["--socket-mode", "0888"], wait=False)
-    rc = d.proc.wait(10)
-    check(
-        rc == 2 and "--socket-mode must be octal" in d.text(),
-        f"--socket-mode 0888 rejected (exit {rc})",
-    )
+    for bad in ("0888", "0", "0060"):
+        d = Daemon(["--socket-mode", bad], wait=False)
+        rc = d.proc.wait(10)
+        check(
+            rc == 2 and "--socket-mode must be octal" in d.text(),
+            f"--socket-mode {bad} rejected (exit {rc})",
+        )
 
 
 def mapped(d, name):
@@ -701,6 +771,50 @@ def restart():
         unlink_segments("nvlp-old", "nvlp-new", "nvlp-s1", "nvlp-s2", "nvlp-b")
 
 
+def share():
+    print("== share: two engines of one process register one allocation")
+    d = Daemon()
+    try:
+        sh = Segment("nvlp-sh", 8 * MiB, 41)
+        b = Segment("nvlp-b", 16 * MiB)
+        ca = Conn(d.sock, 0xA, True)  # same pid (ours) and node
+        cc = Conn(d.sock, 0xC, True)
+        cb = Conn(d.sock, 0xB, True)
+        assert register(ca, 0x10000000, sh, 0)[0] == OK
+        assert register(cc, 0x50000000, sh, 0)[0] == OK
+        assert register(cb, 0x20000000, b, 1)[0] == OK
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        st, _, _, _ = copy(d.sock, runs(1, MiB))
+        check(st == OK, "first engine served")
+        st, msg, _, _ = copy(d.sock, runs(1, MiB, a=0xC, sbase=0x50000000, dst_off=MiB))
+        check(
+            st == OK and b.m[MiB : 2 * MiB] == sh.m[:MiB],
+            f"second engine of the process served ({msg[:60]})",
+        )
+        check(d.wait_log("shares the mapping", 2), "logged: shares the mapping")
+        print("== share: another process exports the same handle bytes")
+        cx = Conn(d.sock, 0xD, True, pid=os.getpid() + 100000)
+        assert register(cx, 0x60000000, sh, 0)[0] == OK
+        st, msg, _, _ = copy(
+            d.sock, runs(1, MiB, a=0xD, sbase=0x60000000, dst_off=2 * MiB)
+        )
+        check(
+            st == CUDA_ERROR and "of another process" in msg,
+            f"refused although its holders are connected ({msg[:90]})",
+        )
+        check(b.m[2 * MiB : 3 * MiB] == bytes(MiB), "nothing copied for it")
+        ca.close()  # the first holder goes; the second still uses it
+        time.sleep(0.2)
+        st, _, _, _ = copy(d.sock, runs(1, MiB, a=0xC, sbase=0x50000000))
+        check(st == OK and mapped(d, "nvlp-sh"), "second engine still served")
+        cc.close()
+        cx.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-sh", "nvlp-b")
+
+
 def gpus():
     print("== gpus: --min-visible-gpus")
     for n, need, expect in ((1, 2, 78), (0, 1, 78)):
@@ -739,11 +853,13 @@ def gpus():
 
 SCENARIOS = {
     "p2p_deadline": p2p_deadline,
+    "slow_link": slow_link,
     "p2p_exact": p2p_exact,
     "staged": staged,
     "socket": socket_mode,
     "disconnect": disconnect,
     "restart": restart,
+    "share": share,
     "gpus": gpus,
 }
 

@@ -40,7 +40,9 @@ namespace nvlink_proxy {
 // group they share with it).
 constexpr unsigned kDefaultSocketMode = 0600;
 
-// --socket-mode: octal permission bits, at most 0777 (e.g. "600", "0660").
+// --socket-mode: octal permission bits, at most 0777, that keep read and
+// write for the owner (the daemon's own --ping / --stats connect as it), e.g.
+// "600", "0660"; "0" or "0060" are refused.
 inline bool parseSocketMode(const std::string &s, unsigned *mode) {
     if (s.empty() || s.size() > 4) return false;
     unsigned v = 0;
@@ -48,7 +50,7 @@ inline bool parseSocketMode(const std::string &s, unsigned *mode) {
         if (c < '0' || c > '7') return false;
         v = v * 8 + unsigned(c - '0');
     }
-    if (v > 0777) return false;
+    if (v > 0777 || (v & 0600) != 0600) return false;
     *mode = v;
     return true;
 }
