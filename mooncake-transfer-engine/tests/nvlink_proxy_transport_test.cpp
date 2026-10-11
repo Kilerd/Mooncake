@@ -329,3 +329,159 @@ TEST(NvlinkProxyTransport, MultiProtocolRouteCacheIsExact) {
     unsetenv("MC_FORCE_TCP");
 }
 #endif
+
+namespace {
+
+// A base transport whose transfers end only when the test says so (or on
+// cancel, if it honours cancel), and that can leave a cut transfer
+// unconfirmed for a while.
+class ScriptedTransport : public Transport {
+   public:
+    bool honour_cancel = true;
+    int confirm_after_ms = 0;  // after a cancel; < 0: never
+    std::atomic<int> cancels{0};
+    std::vector<Slice *> slices;
+    std::mutex mu;
+
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest> &) override {
+        return Status::NotImplemented("scripted");
+    }
+    Status submitTransferTask(
+        const std::vector<TransferTask *> &task_list) override {
+        std::lock_guard<std::mutex> lock(mu);
+        for (auto *task : task_list) {
+            Slice *slice = getSliceCache().allocate();
+            slice->task = task;
+            slice->length = task->request->length;
+            slice->status = Slice::PENDING;
+            task->slice_list.push_back(slice);
+            __sync_fetch_and_add(&task->slice_count, 1);
+            slices.push_back(slice);
+        }
+        return Status::OK();
+    }
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus &status) override {
+        auto &task = toBatchDesc(batch_id).task_list[task_id];
+        const uint64_t ok = task.success_slice_count,
+                       bad = task.failed_slice_count;
+        status.s = ok + bad < task.slice_count ? TransferStatusEnum::WAITING
+                   : bad                       ? TransferStatusEnum::FAILED
+                                               : TransferStatusEnum::COMPLETED;
+        return Status::OK();
+    }
+    void onBatchCanceled(BatchID batch_id) override {
+        ++cancels;
+        if (!honour_cancel) return;
+        auto counter = toBatchDesc(batch_id).control.unconfirmed();
+        std::lock_guard<std::mutex> lock(mu);
+        for (auto *slice : slices) {
+            if (slice->status != Slice::PENDING) continue;
+            if (slice->task->batch_id != batch_id) continue;
+            // A cut write: unconfirmed until its "receiver" answers.
+            counter->fetch_add(1);
+            slice->markFailed();
+            if (confirm_after_ms >= 0) {
+                std::thread([counter, ms = confirm_after_ms] {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+                    counter->fetch_sub(1);
+                }).detach();
+            }
+        }
+    }
+    void completeAll() {
+        std::lock_guard<std::mutex> lock(mu);
+        for (auto *slice : slices)
+            if (slice->status == Slice::PENDING) slice->markSuccess();
+    }
+
+   private:
+    int registerLocalMemory(void *, size_t, const std::string &, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void *, bool) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry> &,
+                                 const std::string &) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void *> &) override {
+        return 0;
+    }
+    const char *getName() const override { return "scripted"; }
+};
+
+int64_t steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+}  // namespace
+
+// A fallback attempt that outlives its deadline is canceled and then waited
+// for until quiesced -- also for the cut transfers its "receiver" confirms
+// late -- instead of being abandoned, and its requests are not retried.
+TEST(NvlinkProxyTransport, BoundedSubmitterCancelsAndWaitsForQuiescence) {
+    ScriptedTransport base;
+    base.confirm_after_ms = 150;
+    std::vector<Transport::TransferRequest> reqs(4);
+    std::vector<const Transport::TransferRequest *> ptrs;
+    for (auto &r : reqs) {
+        r.length = 64;
+        ptrs.push_back(&r);
+    }
+    BoundedSubmitter submitter(16, 16);
+    const int64_t t0 = steadyNowNs();
+    std::atomic<int> failed{0}, abandoned_batches{0};
+    auto res = submitter.run(
+        &base, ptrs, t0 + 50LL * 1000 * 1000, t0 + 10LL * 1000 * 1000 * 1000,
+        [&](size_t, bool ok) { failed += !ok; },
+        [&](Transport::BatchDesc *) { ++abandoned_batches; });
+    const int64_t took_ms = (steadyNowNs() - t0) / 1000000;
+    EXPECT_EQ(base.cancels.load(), 1);
+    EXPECT_EQ(abandoned_batches.load(), 0);
+    EXPECT_EQ(res.abandoned, 0u);
+    EXPECT_EQ(failed.load(), 4);
+    EXPECT_EQ(res.retried, 0u);
+    // Canceled about 1 s after the deadline, then 150 ms to confirm.
+    EXPECT_GE(took_ms, 1150);
+    EXPECT_LT(took_ms, 5000);
+}
+
+// An attempt that is not quiesced by the abandon time is handed over (its
+// caller then counts it unconfirmed) before its requests are reported
+// failed; it is freed only once quiesced.
+TEST(NvlinkProxyTransport, BoundedSubmitterHandsOverAnUnquiescedAttempt) {
+    ScriptedTransport base;
+    base.honour_cancel = false;
+    std::vector<Transport::TransferRequest> reqs(3);
+    std::vector<const Transport::TransferRequest *> ptrs;
+    for (auto &r : reqs) {
+        r.length = 64;
+        ptrs.push_back(&r);
+    }
+    BoundedSubmitter submitter(16, 16);
+    const int64_t t0 = steadyNowNs();
+    Transport::BatchDesc *handed = nullptr;
+    bool handed_before_failure = true;
+    int failed = 0;
+    auto res = submitter.run(
+        &base, ptrs, t0 + 20LL * 1000 * 1000, t0 + 200LL * 1000 * 1000,
+        [&](size_t, bool ok) {
+            if (!ok) {
+                ++failed;
+                if (!handed) handed_before_failure = false;
+            }
+        },
+        [&](Transport::BatchDesc *batch) { handed = batch; });
+    ASSERT_NE(handed, nullptr);
+    EXPECT_TRUE(handed_before_failure);
+    EXPECT_EQ(failed, 3);
+    EXPECT_EQ(res.abandoned, 3u);
+    EXPECT_FALSE(BoundedSubmitter::quiesced(*handed));
+    base.completeAll();
+    EXPECT_TRUE(BoundedSubmitter::quiesced(*handed));
+    delete handed;
+}

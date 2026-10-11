@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 #include <errno.h>
 #include <glog/logging.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
@@ -174,9 +175,17 @@ NvlinkProxyTransport::~NvlinkProxyTransport() {
         std::lock_guard<std::mutex> lock(control_mu_);
         closeControlLocked();
     }
-    std::lock_guard<std::mutex> lock(pool_mu_);
-    for (auto &c : idle_) close(c.fd);
-    idle_.clear();
+    {
+        std::lock_guard<std::mutex> lock(pool_mu_);
+        for (auto &c : idle_) close(c.fd);
+        idle_.clear();
+    }
+    // Unconfirmed attempts stay counted (their batches never quiesce);
+    // abandoned fallback batches are leaked: the base transport may still
+    // reference them.
+    std::lock_guard<std::mutex> lock(unconfirmed_mu_);
+    for (auto &u : unconfirmed_)
+        if (u.fd >= 0) close(u.fd);
 }
 
 int NvlinkProxyTransport::install(std::string &local_server_name,
@@ -280,7 +289,7 @@ int NvlinkProxyTransport::connectSocket(int timeout_ms) {
 
 bool NvlinkProxyTransport::rpc(int fd, MsgType type, const void *payload,
                                size_t len, ProxyStatus &status,
-                               std::string &reply) {
+                               std::string &reply, bool *sent) {
     static std::atomic<uint64_t> seq{1};
     MsgHeader h{};
     h.magic = kMagic;
@@ -288,8 +297,10 @@ bool NvlinkProxyTransport::rpc(int fd, MsgType type, const void *payload,
     h.type = static_cast<uint16_t>(type);
     h.payload_len = static_cast<uint32_t>(len);
     h.seq = seq++;
+    if (sent) *sent = false;
     if (!writeAll(fd, &h, sizeof(h))) return false;
     if (len && !writeAll(fd, payload, len)) return false;
+    if (sent) *sent = true;
     MsgHeader r;
     if (!readAll(fd, &r, sizeof(r))) return false;
     if (r.magic != kMagic || r.seq != h.seq || r.type != h.type ||
@@ -520,7 +531,7 @@ void NvlinkProxyTransport::releaseCopyConnection(Connection &conn,
 
 NvlinkProxyTransport::CopyOutcome NvlinkProxyTransport::copy(
     const std::vector<CopyEntry> &entries, size_t begin, size_t count,
-    std::string &error) {
+    std::string &error, const UnconfirmedCounters &parents) {
     Connection conn;
     if (!acquireCopyConnection(conn)) {
         error = std::string("cannot reach daemon: ") + strerror(errno);
@@ -539,12 +550,22 @@ NvlinkProxyTransport::CopyOutcome NvlinkProxyTransport::copy(
                    count * sizeof(CopyEntry));
     ProxyStatus st;
     std::string reply;
-    if (!rpc(conn.fd, MsgType::kCopy, payload.data(), payload.size(), st,
-             reply)) {
+    bool sent = false;
+    if (!rpc(conn.fd, MsgType::kCopy, payload.data(), payload.size(), st, reply,
+             &sent)) {
         error = std::string("daemon connection error: ") +
                 (errno == EAGAIN || errno == EWOULDBLOCK ? "timed out"
                                                          : strerror(errno));
-        releaseCopyConnection(conn, false);
+        if (sent && !parents.empty()) {
+            // The daemon got the copy but did not answer: it may still be
+            // running it. Its batches stay unquiesced until the late reply
+            // arrives on this connection, or a new daemon epoch shows the
+            // old daemon gone.
+            addUnconfirmed(Unconfirmed{conn.fd, conn.epoch, nullptr, parents});
+            conn.fd = -1;
+        } else {
+            releaseCopyConnection(conn, false);
+        }
         requestRecheck();
         return CopyOutcome::kNoDaemon;
     }
@@ -614,6 +635,7 @@ void NvlinkProxyTransport::healthLoop() {
         // Requests may be waiting for the daemon: retry the connection
         // often (a failed connect on a unix socket is cheap).
         backoff_ms = ok ? 100 : std::min(backoff_ms * 2, 400);
+        reapUnconfirmed();
         maybeLogStats(false);
     }
 }
@@ -866,11 +888,32 @@ void NvlinkProxyTransport::fallback(const std::vector<TransferTask *> &tasks,
     }
     std::vector<const TransferRequest *> requests(tasks.size());
     for (size_t i = 0; i < tasks.size(); ++i) requests[i] = tasks[i]->request;
+    // The caller's batch deadline bounds the fallback too.
+    for (auto *task : tasks) {
+        if (!task->batch_id) continue;
+        const int64_t d =
+            Transport::toBatchDesc(task->batch_id).control.deadlineNs();
+        if (d != 0 && d < deadline_ns) deadline_ns = d;
+    }
     const int64_t abandon_ns =
         deadline_ns + std::max<int64_t>(timeout_ms_, 10000) * 1000000LL;
+    const UnconfirmedCounters parents = countersOf(tasks, 0, tasks.size());
     auto res = fallback_submitter_->run(
-        fallback_, requests, deadline_ns, abandon_ns, [&](size_t i, bool ok) {
+        fallback_, requests, deadline_ns, abandon_ns,
+        [&](size_t i, bool ok) {
             ok ? completeTask(tasks[i]) : failTask(tasks[i]);
+        },
+        [this, &parents](Transport::BatchDesc *batch) {
+            // Not quiesced yet: the caller's batches stay unquiesced until
+            // it is (the health thread frees it then).
+            addUnconfirmed(Unconfirmed{-1, 0, batch, parents});
+        },
+        [&tasks]() {
+            for (auto *task : tasks)
+                if (task->batch_id &&
+                    Transport::toBatchDesc(task->batch_id).control.canceled())
+                    return true;
+            return false;
         });
     counters_.fallback_retries += res.retried;
     if (res.failed) {
@@ -895,6 +938,24 @@ Status NvlinkProxyTransport::submitTransferTask(
     bool held = false;
     int round = 0;
     while (!pending.empty()) {
+        // The caller's batch was canceled or ran out of time: nothing more
+        // of it is sent (neither to the daemon nor to the base transport).
+        {
+            const int64_t now_ns = nowNs();
+            std::vector<TransferTask *> live;
+            live.reserve(pending.size());
+            for (auto *task : pending) {
+                if (task->batch_id && Transport::toBatchDesc(task->batch_id)
+                                          .control.expired(now_ns)) {
+                    failTask(task);
+                    counters_.failed_requests++;
+                } else {
+                    live.push_back(task);
+                }
+            }
+            pending.swap(live);
+            if (pending.empty()) break;
+        }
         if (!healthy_) {
             if (!held) {
                 held = true;
@@ -946,7 +1007,8 @@ Status NvlinkProxyTransport::submitTransferTask(
                 std::min(kMaxEntriesPerCopy, proxied.size() - begin);
             const int64_t t0 = nowNs();
             std::string err;
-            const CopyOutcome outcome = copy(entries, begin, count, err);
+            const CopyOutcome outcome = copy(entries, begin, count, err,
+                                             countersOf(proxied, begin, count));
             if (outcome != CopyOutcome::kOk) {
                 auto &dst = outcome == CopyOutcome::kFailed ? failed : retry;
                 dst.insert(dst.end(), proxied.begin() + begin,
@@ -1004,6 +1066,67 @@ Status NvlinkProxyTransport::submitTransferTask(
              "target or source not registered with the proxy", deadline);
     fallback(failed, FallbackReason::kDaemonError, error, deadline);
     return Status::OK();
+}
+
+NvlinkProxyTransport::UnconfirmedCounters NvlinkProxyTransport::countersOf(
+    const std::vector<TransferTask *> &tasks, size_t begin, size_t count) {
+    UnconfirmedCounters out;
+    for (size_t i = begin; i < begin + count && i < tasks.size(); ++i) {
+        if (!tasks[i] || !tasks[i]->batch_id) continue;
+        auto counter =
+            Transport::toBatchDesc(tasks[i]->batch_id).control.unconfirmed();
+        if (std::find(out.begin(), out.end(), counter) == out.end())
+            out.push_back(counter);
+    }
+    return out;
+}
+
+void NvlinkProxyTransport::addUnconfirmed(Unconfirmed u) {
+    // Counted before the tasks turn terminal (the caller completes them
+    // after this returns), so a batch never looks quiesced in between.
+    for (auto &counter : u.parents)
+        counter->fetch_add(1, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> lock(unconfirmed_mu_);
+    unconfirmed_.push_back(std::move(u));
+}
+
+void NvlinkProxyTransport::reapUnconfirmed() {
+    std::lock_guard<std::mutex> lock(unconfirmed_mu_);
+    const uint64_t epoch = epoch_.load();
+    for (auto it = unconfirmed_.begin(); it != unconfirmed_.end();) {
+        bool confirmed = false;
+        if (it->batch) {
+            confirmed = BoundedSubmitter::quiesced(*it->batch);
+            if (confirmed) {
+                delete it->batch;
+                it->batch = nullptr;
+            }
+        } else {
+            if (it->fd >= 0) {
+                pollfd p{it->fd, POLLIN, 0};
+                if (poll(&p, 1, 0) > 0) {
+                    char c;
+                    const ssize_t n = recv(it->fd, &c, 1, MSG_PEEK);
+                    // The late reply: the copy finished. End of stream or
+                    // an error: the daemon dropped the connection; wait for
+                    // a new epoch.
+                    confirmed = n > 0;
+                    close(it->fd);
+                    it->fd = -1;
+                }
+            }
+            if (!confirmed && epoch != 0 && epoch != it->epoch)
+                confirmed = true;  // a new daemon: the old one is gone
+        }
+        if (!confirmed) {
+            ++it;
+            continue;
+        }
+        if (it->fd >= 0) close(it->fd);
+        for (auto &counter : it->parents)
+            counter->fetch_sub(1, std::memory_order_acq_rel);
+        it = unconfirmed_.erase(it);
+    }
 }
 
 Status NvlinkProxyTransport::submitTransfer(

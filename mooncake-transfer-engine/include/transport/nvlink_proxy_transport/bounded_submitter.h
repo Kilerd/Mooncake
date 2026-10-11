@@ -43,15 +43,33 @@ class BoundedSubmitter {
 
     BoundedSubmitter(size_t max_inflight, size_t chunk);
 
+    // A private attempt batch that was not quiesced by |abandon_ns| (a task
+    // still in flight, or a cut transfer its receiver has not confirmed).
+    // The callee owns |batch| from now on: it frees it once quiesced.
+    using OnAbandon = std::function<void(Transport::BatchDesc *batch)>;
+
     // Blocks until every request succeeded or failed for good; calls
     // |on_done(index, ok)| exactly once per request. |deadline_ns| is in the
-    // steady_clock domain (nanoseconds since its epoch). A request still in
-    // flight on |transport| when |abandon_ns| passes is reported as failed and
-    // its bookkeeping is leaked rather than freed under the transport.
+    // steady_clock domain (nanoseconds since its epoch) and is the deadline
+    // of every attempt batch: a transport that honours batch deadlines (TCP)
+    // stops the work there; work still running a second later is canceled.
+    // An attempt is waited for until it is quiesced -- every task terminal
+    // and no unconfirmed cut transfer -- before its failed requests are
+    // retried. One that is not quiesced when |abandon_ns| passes reports its
+    // unfinished requests as failed and is handed to |on_abandon| (or, when
+    // that is empty, leaked rather than freed under the transport).
+    // |canceled| (optional): the caller's batch was canceled; the attempt
+    // in flight is canceled then too.
     Result run(Transport *transport,
                const std::vector<const Transport::TransferRequest *> &requests,
                int64_t deadline_ns, int64_t abandon_ns,
-               const std::function<void(size_t, bool)> &on_done);
+               const std::function<void(size_t, bool)> &on_done,
+               const OnAbandon &on_abandon = nullptr,
+               const std::function<bool()> &canceled = nullptr);
+
+    // Every task of |batch| is terminal and its control has no unconfirmed
+    // attempt left.
+    static bool quiesced(Transport::BatchDesc &batch);
 
     size_t inflight() const;
 

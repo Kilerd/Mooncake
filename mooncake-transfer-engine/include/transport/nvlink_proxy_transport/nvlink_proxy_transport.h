@@ -112,16 +112,39 @@ class NvlinkProxyTransport : public Transport {
 
     // Daemon I/O.
     int connectSocket(int timeout_ms);
+    // |sent| (optional): the request was written in full, so a failure was
+    // in waiting for the reply.
     bool rpc(int fd, nvlink_proxy::MsgType type, const void *payload,
-             size_t len, nvlink_proxy::ProxyStatus &status, std::string &reply);
+             size_t len, nvlink_proxy::ProxyStatus &status, std::string &reply,
+             bool *sent = nullptr);
     bool hello(int fd, bool control, uint64_t &epoch);
     bool ensureControlLocked();
     void closeControlLocked();
     bool registerBlockLocked(Block &block);
     bool acquireCopyConnection(Connection &conn);
     void releaseCopyConnection(Connection &conn, bool reusable);
+    using UnconfirmedCounters =
+        std::vector<std::shared_ptr<std::atomic<int64_t>>>;
     CopyOutcome copy(const std::vector<nvlink_proxy::CopyEntry> &entries,
-                     size_t begin, size_t count, std::string &error);
+                     size_t begin, size_t count, std::string &error,
+                     const UnconfirmedCounters &parents);
+
+    // Attempts this transport cannot prove finished, counted in their
+    // batches' unconfirmed (Transport::BatchControl) until the health
+    // thread confirms them: a COPY the daemon did not answer (confirmed by
+    // its late reply, or by a new daemon epoch: the old daemon is gone), and
+    // a fallback attempt abandoned before it was quiesced (confirmed once it
+    // is; then freed).
+    struct Unconfirmed {
+        int fd = -1;         // unanswered COPY connection (-1: closed)
+        uint64_t epoch = 0;  // the daemon it was sent to
+        Transport::BatchDesc *batch = nullptr;  // abandoned fallback attempt
+        UnconfirmedCounters parents;
+    };
+    void addUnconfirmed(Unconfirmed u);
+    void reapUnconfirmed();
+    static UnconfirmedCounters countersOf(
+        const std::vector<TransferTask *> &tasks, size_t begin, size_t count);
 
     // Request translation: local address + remote buffer -> copy entry.
     enum class LocalBlockState { kNone, kUnregistered, kRegistered };
@@ -193,6 +216,9 @@ class NvlinkProxyTransport : public Transport {
     // Pool of copy connections (one in-flight COPY each).
     std::mutex pool_mu_;
     std::vector<Connection> idle_;
+
+    std::mutex unconfirmed_mu_;
+    std::vector<Unconfirmed> unconfirmed_;
 
     std::thread health_thread_;
     std::mutex health_mu_;

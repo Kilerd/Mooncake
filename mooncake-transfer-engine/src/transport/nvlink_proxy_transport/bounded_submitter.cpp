@@ -53,11 +53,24 @@ void BoundedSubmitter::release(size_t n) {
     cv_.notify_all();
 }
 
+bool BoundedSubmitter::quiesced(Transport::BatchDesc &batch) {
+    for (auto &task : batch.task_list) {
+        const uint64_t slices =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t done =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE) +
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        if (slices != 0 && done != slices) return false;
+    }
+    return batch.control.unconfirmed()->load(std::memory_order_acquire) <= 0;
+}
+
 BoundedSubmitter::Result BoundedSubmitter::run(
     Transport *transport,
     const std::vector<const Transport::TransferRequest *> &requests,
     int64_t deadline_ns, int64_t abandon_ns,
-    const std::function<void(size_t, bool)> &on_done) {
+    const std::function<void(size_t, bool)> &on_done,
+    const OnAbandon &on_abandon, const std::function<bool()> &canceled_by) {
     using TransferStatusEnum = Transport::TransferStatusEnum;
     Result result;
     std::vector<size_t> pending(requests.size());
@@ -74,6 +87,8 @@ BoundedSubmitter::Result BoundedSubmitter::run(
             batch->id = reinterpret_cast<Transport::BatchID>(batch);
             batch->batch_size = n;
             batch->context = nullptr;
+            // The attempt ends at the deadline (the transport stops it).
+            batch->control.setDeadlineNs(deadline_ns);
             batch->task_list.resize(n);
             std::vector<Transport::TransferTask *> tasks(n);
             for (size_t k = 0; k < n; ++k) {
@@ -97,7 +112,12 @@ BoundedSubmitter::Result BoundedSubmitter::run(
             }
             int spins = 0;
             bool abandoned = false;
-            while (open > 0) {
+            bool canceled = false;
+            // Until every task is terminal, and then until the attempt is
+            // quiesced (no cut transfer its receiver has not confirmed): a
+            // failed request is not retried while an earlier attempt of it
+            // may still be applied.
+            while (open > 0 || !quiesced(*batch)) {
                 for (size_t k = 0; k < n; ++k) {
                     if (state[k]) continue;
                     Transport::TransferStatus st;
@@ -112,8 +132,18 @@ BoundedSubmitter::Result BoundedSubmitter::run(
                         --open;
                     }
                 }
-                if (open == 0) break;
-                if (nowNs() > abandon_ns) {
+                if (open == 0 && quiesced(*batch)) break;
+                const int64_t now = nowNs();
+                if (!canceled && open > 0 &&
+                    (now > deadline_ns + 1000LL * 1000 * 1000 ||
+                     (canceled_by && canceled_by()))) {
+                    // The caller canceled, or a transport that did not stop
+                    // at the deadline itself.
+                    canceled = true;
+                    batch->control.cancel();
+                    transport->onBatchCanceled(batch->id);
+                }
+                if (now > abandon_ns) {
                     abandoned = true;
                     break;
                 }
@@ -125,31 +155,41 @@ BoundedSubmitter::Result BoundedSubmitter::run(
                 }
             }
             release(n);
+            if (abandoned) {
+                // The transport may still touch these tasks. Handed over
+                // first: the caller counts the attempt unconfirmed before
+                // its requests are reported failed below.
+                if (on_abandon) on_abandon(batch);  // else leaked
+            }
+            size_t abandoned_now = 0;
             for (size_t k = 0; k < n; ++k) {
                 const size_t idx = pending[begin + k];
                 if (state[k] == 1) {
                     ++result.succeeded;
                     on_done(idx, true);
-                } else if (state[k] == 2) {
+                } else if (state[k] == 2 && !abandoned) {
                     failed.push_back(idx);
                 } else {
+                    // Still running, or failed in an attempt that is not
+                    // quiesced: never retried, failed for good.
+                    ++abandoned_now;
                     ++result.abandoned;
                     ++result.failed;
                     on_done(idx, false);
                 }
             }
             if (abandoned) {
-                // The transport may still touch these tasks; leak them.
-                LOG(ERROR) << "nvlink_proxy: " << result.abandoned
+                LOG(ERROR) << "nvlink_proxy: " << abandoned_now
                            << " fallback request(s) still unresolved long "
-                              "after their deadline; reporting them failed";
+                              "after their deadline; reporting them failed "
+                              "(their batch stays unquiesced until they end)";
             } else {
                 delete batch;
             }
         }
         if (failed.empty()) break;
         const int64_t now = nowNs();
-        if (now >= deadline_ns) {
+        if (now >= deadline_ns || (canceled_by && canceled_by())) {
             for (size_t idx : failed) {
                 ++result.failed;
                 on_done(idx, false);
