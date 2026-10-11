@@ -204,6 +204,36 @@ static void testServerChunkDelay() {
 
 struct ServerSession;
 
+// Streams for copying received TCP payload into device memory, one per
+// device, created on first use and owned by the transport. They are
+// non-blocking: these copies neither wait for nor hold up work the process
+// queued on the legacy default stream.
+class TcpDeviceStreams {
+   public:
+#ifdef USE_CUDA
+    ~TcpDeviceStreams() {
+        for (auto& kv : streams_) cudaStreamDestroy(kv.second);
+    }
+    // |device|'s stream (the caller made |device| current); nullptr when
+    // none could be created.
+    cudaStream_t get(int device) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = streams_.find(device);
+        if (it != streams_.end()) return it->second;
+        cudaStream_t stream = nullptr;
+        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) !=
+            cudaSuccess)
+            return nullptr;
+        streams_.emplace(device, stream);
+        return stream;
+    }
+
+   private:
+    std::mutex mu_;
+    std::unordered_map<int, cudaStream_t> streams_;
+#endif
+};
+
 // v3 requests a server has seen, for cancellation by request id. Finished
 // requests (and ids canceled before their header arrived) are remembered
 // for a while so a late cancel still gets the final status.
@@ -287,10 +317,12 @@ static int maxTcpProto() {
 struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     explicit ServerSession(
         std::shared_ptr<tcpsocket> socket, ValidateAddrFn validate_addr,
-        std::shared_ptr<ServerRequestRegistry> registry = nullptr)
+        std::shared_ptr<ServerRequestRegistry> registry = nullptr,
+        std::shared_ptr<TcpDeviceStreams> device_streams = nullptr)
         : socket_(std::move(socket)),
           validate_addr_(std::move(validate_addr)),
-          registry_(std::move(registry)) {}
+          registry_(std::move(registry)),
+          device_streams_(std::move(device_streams)) {}
 
     ~ServerSession() {
         // A v3 request this session never finished (connection lost, or
@@ -302,6 +334,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     std::shared_ptr<tcpsocket> socket_;
     ValidateAddrFn validate_addr_;
     std::shared_ptr<ServerRequestRegistry> registry_;
+    std::shared_ptr<TcpDeviceStreams> device_streams_;
     SessionHeader header_;
     uint64_t total_transferred_bytes_;
     char* local_buffer_;
@@ -318,9 +351,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     uint64_t drop_status_ = 0;  // kStatusDeadline/kStatusCanceled once dropping
     std::vector<char> bounce_;
     CancelReply cancel_reply_{};
-    // Device whose last copy from the (pageable) bounce buffer may still be
-    // in flight: cudaMemcpy can return once the source is staged.
-    int pending_device_ = -1;
 
     void start() {
         total_transferred_bytes_ = 0;
@@ -341,7 +371,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     void cancelByPeer(uint64_t id) {
         if (!request_open_ || request_id_ != id) return;
         canceled_ = true;
-        syncDeviceWrites();
         request_open_ = false;
         if (registry_) registry_->finish(request_id_, kStatusCanceled);
         if (socket_ && socket_->is_open()) {
@@ -352,22 +381,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     }
 
    private:
-    // Waits for the last bounce-buffer copy to the device, before any status
-    // reports the request as applied or as no longer being applied (and
-    // before the session ends).
-    void syncDeviceWrites() {
-#ifdef USE_CUDA
-        if (pending_device_ < 0) return;
-        cudaSetDevice(pending_device_);
-        const cudaError_t status = cudaStreamSynchronize(0);
-        if (status != cudaSuccess)
-            LOG(ERROR) << "ServerSession: waiting for a copy to CUDA memory "
-                          "failed. Error: "
-                       << cudaGetErrorString(status);
-        pending_device_ = -1;
-#endif
-    }
-
     // Send an 8-byte status frame, then run `next` (or end the session —
     // closing the connection — when `next` is empty or the send fails).
     void sendStatus(uint64_t status, std::function<void()> next) {
@@ -629,6 +642,17 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             cudaSetDevice(cuda_device);
 #ifdef USE_MACA
             cudaError_t cuda_status = copyTcpCudaMemory(dst, src, n);
+#elif defined(USE_CUDA)
+            // On the transport's own stream, waited for here: the chunk has
+            // landed before the bounce buffer is reused and before any
+            // status reports the request applied, canceled or dropped.
+            cudaStream_t stream =
+                device_streams_ ? device_streams_->get(cuda_device) : nullptr;
+            cudaError_t cuda_status =
+                stream ? cudaMemcpyAsync(dst, src, n, cudaMemcpyDefault, stream)
+                       : cudaErrorInvalidResourceHandle;
+            if (cuda_status == cudaSuccess)
+                cuda_status = cudaStreamSynchronize(stream);
 #else
             cudaError_t cuda_status =
                 cudaMemcpy(dst, src, n, cudaMemcpyDefault);
@@ -639,9 +663,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                            << "Error: " << cudaGetErrorString(cuda_status);
                 return false;
             }
-#ifndef USE_MACA
-            pending_device_ = cuda_device;
-#endif
             return true;
         }
 #endif
@@ -658,7 +679,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            syncDeviceWrites();
             // Destination memory now holds the complete payload. Under v2,
             // acknowledge before accepting the next request — this is what
             // makes the initiator's COMPLETED mean "applied at the
@@ -700,7 +720,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             [this, addr, dram_buffer, cuda_device, bounce, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 if (ec) {
-                    syncDeviceWrites();
                     // If client closed connection (EOF), this is normal - don't
                     // log; nor after a cancel closed it from this side.
                     if (ec.value() != asio::error::eof &&
@@ -724,10 +743,8 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                 if (bounce && !(v3_ && dropNow())) {
                     if (!applyChunk(addr + total_transferred_bytes_,
                                     dram_buffer, transferred_bytes,
-                                    cuda_device)) {
-                        syncDeviceWrites();
+                                    cuda_device))
                         return;  // Connection will be closed
-                    }
                 }
                 total_transferred_bytes_ += transferred_bytes;
                 readBody();
@@ -1532,7 +1549,7 @@ struct TcpContext {
                 auto socket_ptr =
                     std::make_shared<tcpsocket>(std::move(socket));
                 auto session = std::make_shared<ServerSession>(
-                    socket_ptr, validate_addr_, registry);
+                    socket_ptr, validate_addr_, registry, device_streams);
                 try {
                     asio::post(socket_ptr->get_executor(),
                                [session] { session->start(); });
@@ -1555,4 +1572,6 @@ struct TcpContext {
     // v3 requests seen by this server, for cancellation by request id.
     std::shared_ptr<ServerRequestRegistry> registry =
         std::make_shared<ServerRequestRegistry>();
+    std::shared_ptr<TcpDeviceStreams> device_streams =
+        std::make_shared<TcpDeviceStreams>();
 };

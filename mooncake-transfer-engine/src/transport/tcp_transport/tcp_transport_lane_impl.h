@@ -1038,15 +1038,21 @@ void TcpTransport::noteUnconfirmed(TcpWorkItem& work, uint64_t request_id,
         // A v1/v2 receiver cannot confirm a cut write: never quiesced.
         if (work.unprovable)
             work.unprovable->fetch_add(1, std::memory_order_acq_rel);
-        static std::atomic<int64_t> last_log_ns{0};
-        const int64_t now = steadyNowNs();
-        int64_t last = last_log_ns.load();
-        if (now - last > 10LL * 1000 * 1000 * 1000 &&
-            last_log_ns.compare_exchange_strong(last, now))
-            LOG(WARNING) << "TCP write to " << key.host << ":" << key.port
-                         << " cannot be confirmed by its receiver (cut "
-                            "mid-body under protocol v2, or protocol v1): "
-                            "its batch will not quiesce";
+        // Once per peer (a v1 receiver makes every write unprovable).
+        static std::mutex logged_mu;
+        static std::unordered_set<std::string> logged;
+        bool first = false;
+        try {
+            std::lock_guard<std::mutex> lock(logged_mu);
+            const std::string peer = key.host + ":" + std::to_string(key.port);
+            if (logged.size() < 4096) first = logged.insert(peer).second;
+        } catch (...) {
+        }
+        if (first)
+            LOG(WARNING) << "TCP writes to " << key.host << ":" << key.port
+                         << " cannot be confirmed by that receiver (protocol "
+                            "v1, or a v2 write cut mid-body): their batches "
+                            "will not quiesce (logged once per peer)";
         return;
     }
     confirmByCancel(executor, key, request_id, work.unconfirmed);
