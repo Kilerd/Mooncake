@@ -56,9 +56,11 @@ the wheel with the console entry point `mooncake_nvlink_proxy`. The workflow
    `hostPath` volume, or an `emptyDir` when the daemon is a sidecar of the
    engines' pod. Access to the socket allows copying between registered
    buffers, so the daemon creates it with mode `0600` (`--socket-mode`,
-   octal; never wider than that, not even before `listen`): the engines must
-   run as the daemon's user, or use `--socket-mode 0660` and a group they
-   share with it. The daemon logs each engine's uid, gid and (when it shares
+   octal, must keep read and write for the owner -- the daemon's own
+   `--ping` / `--stats` connect as it; never wider than that, not even
+   before `listen`): the engines must run as the daemon's user, or use
+   `--socket-mode 0660` and a group they share with it. An engine refused
+   by the socket's permissions logs it at error level. The daemon logs each engine's uid, gid and (when it shares
    the PID namespace) pid when it connects. `--ping` exits 0 when the daemon
    answers and can serve as a liveness probe.
 
@@ -145,15 +147,22 @@ together with the exact address range in which that set is unchanged.
   `released N registrations, all of its IPC mappings are closed` or
   `M IPC mapping(s) still used by copies in flight`.
 - Mappings are opened once per (GPU context, handle) and shared by the
-  registrations of the same engine that use them (a re-registration after a
-  reconnect), closed when the last of them is gone: the driver keeps one
-  mapping per context and handle, and one close unmaps it for everybody.
-  They belong to one engine identity, the random client id: a restarted
+  registrations that use them, closed when the last of them is gone. (The
+  driver itself reference-counts opens of a handle in a context: opening it
+  again returns the same pointer, and `cudaIpcCloseMemHandle` unmaps when
+  the count reaches 0; the daemon keeps its own count to know who holds a
+  mapping.) A mapping belongs to the engines that registered it, told apart
+  by their random client id and the (pid, node) they report. A restarted
   engine registers under a new id (peers still naming the old one get
-  `UNKNOWN_SOURCE` and use the base transport for that request), and a
-  handle whose bytes equal one still mapped for another engine is never
-  served from that mapping -- the copy is refused (`ipc_conflicts`) until
-  the old mapping is closed. Nothing is cached by address alone.
+  `UNKNOWN_SOURCE` and use the base transport for that request). A handle
+  whose bytes equal one already mapped is served from that mapping only to
+  another engine of the same process, (pid, node), while a holder is still
+  connected (one allocation registered twice). For another process, or
+  while the holder has disconnected and its copies are still in flight
+  (e.g. a restarted engine whose handle bytes repeat its predecessor's: the
+  driver would return the old mapping), the copy is refused
+  (`ipc_conflicts`) until the old mapping is closed. Nothing is cached by
+  address alone.
 - The daemon often runs as PID 1 of its container. A legacy IPC handle
   cannot be imported by a process whose pid value equals the exporter's,
   even across PID namespaces; the daemon logs an error when an engine
@@ -277,18 +286,32 @@ daemon.
   and the engine uses its base transport.
 - Deadlines: the engine gives up on a copy after twice the start budget it
   sends (its request timeout) and rewrites it over its base transport. The
-  daemon therefore issues nothing of a copy after the start budget, and no
-  staged piece (one slot, a few milliseconds of transfer) past a hard
-  deadline a tenth of the budget (at least 50 ms) before the engine gives
-  up; at that point it drains what is in flight on both GPUs and refuses
-  the copy. No byte of a copy is written after its refusal reply. The P2P
-  part is bounded the same way: it is issued in chunks of at most
-  `--copy-chunk-mb` (default 32 MiB; larger copy-engine entries are split)
-  and 8192 entries, at most two in flight per GPU, the hard deadline checked
-  before each chunk; past it the rest is not issued, what is in flight is
-  drained and the copy is refused with `DEADLINE_EXCEEDED`
-  (`deadline_aborts`). A late P2P write can therefore not land after the
-  engine's base transport rewrote the data.
+  daemon issues nothing of a copy after the start budget, and works against
+  a hard deadline a tenth of the budget (at least 50 ms) before the engine
+  gives up:
+  - The P2P part is issued in chunks of at most `--copy-chunk-mb` (default
+    128 MiB; larger copy-engine entries are split; copy-engine chunks also
+    at most 8192 entries, gather-kernel chunks bounded by bytes only), at
+    most two in flight on each GPU stream of the connection thread serving
+    the copy (copies on other connections use their own streams). Staged
+    copies move one slot per piece, two pieces in flight.
+  - Before it issues a chunk or piece, the daemon predicts when it would
+    complete: the work still in flight ahead of it plus the chunk itself, at
+    the measured rate of that GPU's copy engines or gather kernel (or of
+    the staged pair) -- an average over completed chunks that follows a
+    slowdown at once, kept across copies (`rate_gbps`), and never faster
+    than this copy's own progress. Until a rate is measured it is assumed to
+    be 1 GB/s and the first chunk is at most 8 MiB and runs alone (a probe).
+    A chunk predicted to finish after the hard deadline is not issued: what
+    is in flight is drained and the copy is refused with
+    `DEADLINE_EXCEEDED` (`deadline_aborts`), also for host-staged copies.
+  - Guarantees: no byte of a copy is written after the daemon's reply to it.
+    A byte lands after the hard deadline only if the work in flight (at most
+    two chunks or pieces per stream) runs slower than predicted, and after
+    the engine gave up only if it runs slower by more than the margin -- a
+    link that slows down abruptly within those chunks, or a link slower
+    than 1 GB/s during its first probe. The KV checksum of the engines
+    covers that case.
 - Any other error on the host path refuses the request like a denied pair,
   so the engine falls back to its base transport, which rewrites every byte;
   TCP stays the last resort.
@@ -356,10 +379,12 @@ counted as failures), `untested_pairs` / `untested_host_paths` /
 copies whose last test could not run, waiting for a retry; worth an alert
 when they stay above 0),
 `staged_copies` / `staged_bytes` / `staged_failures` (host-staged copies),
-`deadline_aborts` (copies stopped at their hard deadline), `register_refusals`,
+`deadline_aborts` (copies stopped at their hard deadline), `rate_gbps` (the
+measured rates the deadline predictions use: `<gpu>.ce`, `<gpu>.kernel`,
+`<src>><dst>.staged`), `register_refusals`,
 `ipc_mappings` (IPC handles open now; falls back when engines exit),
-`ipc_closes` and `ipc_conflicts` (copies refused because a handle was still
-mapped for another engine).
+`ipc_closes` and `ipc_conflicts` (copies refused because a handle was mapped
+for another process or a disconnected engine).
 
 ## Wire protocol
 
@@ -384,9 +409,11 @@ deadline, the IPC mapping table, the socket and the start-up checks.
 `nvlink_proxy_cpu_test.py` runs the daemon itself without GPUs, linked
 against a CPU stand-in for the CUDA runtime
 (`nvlink_proxy_mock_cudart.cpp`: shared memory as GPU memory, asynchronous
-streams, the driver's one mapping per context and handle), and plays
-engines over its socket: copies stopped at their deadline with no write
-after the refusal, chunked copies byte-exact, host staging, socket
+streams, reference-counted IPC opens as the driver documents them, a
+configurable link rate), and plays engines over its socket: copies stopped
+before their deadline with no write after the refusal, a slow link at the
+default chunk size, chunked copies byte-exact, host staging, socket
 permissions, mappings closed when an engine disconnects or restarts,
+mappings shared within a process and refused to another,
 `--min-visible-gpus` (CMake target `mooncake_nvlink_proxy_cpu`, CTest
 `nvlink_proxy_cpu_test`).
