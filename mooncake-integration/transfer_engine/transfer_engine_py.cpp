@@ -535,12 +535,14 @@ int TransferEnginePy::runSync(
     const char* target_hostname, Transport::SegmentHandle handle,
     const std::shared_ptr<std::vector<TransferRequest>>& entries,
     int max_attempts, int64_t timeout_ns, TransferNotify* notify) {
+    reapLeftBatches();
     SyncOptions opt;
     opt.max_attempts = max_attempts;
     opt.start_ns = batchQuiesceNowNs();
     opt.timeout_ns = timeout_ns;
     opt.quiesce_wait_ms = quiesce_wait_ms_;
     const std::string target = target_hostname;
+    Transport::BatchID left = 0;
     const SyncOutcome outcome = runSyncWithRetries(
         *engine_, entries->size(), opt,
         [&](Transport::BatchID batch_id, int attempt) {
@@ -562,7 +564,8 @@ int TransferEnginePy::runSync(
                 engine_->getMetadata()->removeSegmentDesc(target);
                 handle_map_.erase(target);
             }
-        });
+        },
+        &left);
     switch (outcome) {
         case SyncOutcome::kCompleted:
             return 0;
@@ -571,14 +574,28 @@ int TransferEnginePy::runSync(
         case SyncOutcome::kUnquiesced:
             break;
     }
-    // Its batch stays allocated and references these requests.
+    // The batch stays allocated (it references these requests) until it is
+    // settled; later calls free it then.
     {
         std::lock_guard<std::mutex> guard(batches_mu_);
-        unquiesced_requests_.push_back(entries);
+        left_batches_.push_back(LeftBatch{left, entries});
     }
     LOG(ERROR) << "Sync transfer to " << target
                << " failed and is not quiesced: writes may still land";
     return -2;
+}
+
+void TransferEnginePy::reapLeftBatches() {
+    std::lock_guard<std::mutex> guard(batches_mu_);
+    for (auto it = left_batches_.begin(); it != left_batches_.end();) {
+        Transport::BatchProgress p;
+        if (it->batch && engine_->getBatchProgress(it->batch, p).ok() &&
+            batchSettled(p) && engine_->freeBatchID(it->batch).ok()) {
+            it = left_batches_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 int TransferEnginePy::batchTransferSync(
@@ -633,6 +650,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     const std::vector<size_t>& lengths, TransferOpcode opcode,
     const std::string& transport_hint, int64_t deadline_ms) {
     pybind11::gil_scoped_release release;
+    reapLeftBatches();
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -669,141 +687,282 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         entry.transport_hint = parseTransportHint(transport_hint);
         entries->push_back(entry);
     }
-
-    batch_id_t batch_id = engine_->allocateBatchID(entries->size());
-    auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
-    const int64_t start_ts = getCurrentTimeInNano();
-    batch_desc->start_timestamp = start_ts;
-    if (deadline_ms > 0)
-        engine_->setBatchDeadline(
-            batch_id, batchQuiesceNowNs() + deadline_ms * 1000000LL);
-    {
-        std::lock_guard<std::mutex> guard(batches_mu_);
-        live_batches_[batch_id] = entries;
-    }
-    Status s = engine_->submitTransfer(batch_id, *entries);
-    if (!s.ok()) {
-        // Part of it may have started: freed only once quiesced.
-        engine_->cancelBatch(batch_id);
-        if (waitBatchQuiesced(*engine_, batch_id, quiesce_wait_ms_))
-            freeBatch(batch_id);
-        return 0;
-    }
-    return batch_id;
+    return submitAsync(entries, deadline_ms);
 }
 
-int TransferEnginePy::freeBatch(batch_id_t batch_id) {
-    Transport::BatchProgress p;
-    if (!engine_->getBatchProgress(batch_id, p).ok() || !p.quiesced) return -1;
-    if (!engine_->freeBatchID(batch_id).ok()) return -1;
+batch_id_t TransferEnginePy::submitAsync(
+    const std::shared_ptr<std::vector<TransferRequest>>& entries,
+    int64_t deadline_ms) {
+    const Transport::BatchID batch = engine_->allocateBatchID(entries->size());
+    if (deadline_ms > 0)
+        engine_->setBatchDeadline(
+            batch, batchQuiesceNowNs() + deadline_ms * 1000000LL);
+    const batch_id_t id = addBatch(batch, entries);  // holds a use of it
+    Status s = engine_->submitTransfer(batch, *entries);
+    if (!s.ok()) {
+        // Part of it may have started: freed only once settled (a batch
+        // that does not settle in time stays known under |id|, which is
+        // not returned; it is freed with the binding's other leftovers).
+        engine_->cancelBatch(batch);
+        waitBatchSettled(*engine_, batch, quiesce_wait_ms_);
+        if (freeBatch(id, 1) != 0) {
+            std::lock_guard<std::mutex> guard(batches_mu_);
+            auto it = live_batches_.find(id);
+            if (it != live_batches_.end()) {
+                left_batches_.push_back(LeftBatch{batch, it->second.entries});
+                live_batches_.erase(it);
+            }
+        }
+        return 0;
+    }
+    releaseBatch(id);
+    return id;
+}
+
+batch_id_t TransferEnginePy::addBatch(
+    Transport::BatchID batch,
+    const std::shared_ptr<std::vector<TransferRequest>>& entries) {
     std::lock_guard<std::mutex> guard(batches_mu_);
-    live_batches_.erase(batch_id);
+    const batch_id_t id = next_batch_id_++;
+    LiveBatch& live = live_batches_[id];
+    live.batch = batch;
+    live.entries = entries;
+    live.start_ns = batchQuiesceNowNs();
+    live.uses = 1;
+    return id;
+}
+
+bool TransferEnginePy::acquireBatch(batch_id_t id, Transport::BatchID* batch,
+                                    LiveBatch* copy) {
+    std::lock_guard<std::mutex> guard(batches_mu_);
+    auto it = live_batches_.find(id);
+    if (it == live_batches_.end()) return false;
+    ++it->second.uses;
+    *batch = it->second.batch;
+    if (copy) *copy = it->second;
+    return true;
+}
+
+void TransferEnginePy::releaseBatch(batch_id_t id) {
+    std::lock_guard<std::mutex> guard(batches_mu_);
+    auto it = live_batches_.find(id);
+    if (it != live_batches_.end()) --it->second.uses;
+}
+
+int TransferEnginePy::freeBatch(batch_id_t id, int own_uses) {
+    std::lock_guard<std::mutex> guard(batches_mu_);
+    auto it = live_batches_.find(id);
+    if (it == live_batches_.end()) return -1;
+    // Another call still uses it (e.g. waits for it): kept.
+    if (it->second.uses != own_uses) return -1;
+    Transport::BatchProgress p;
+    if (!engine_->getBatchProgress(it->second.batch, p).ok() ||
+        !batchSettled(p))
+        return -1;
+    // Under batches_mu_ and with no other use: nothing can reach the batch
+    // between these two steps, and its id is never handed out again.
+    if (!engine_->freeBatchID(it->second.batch).ok()) return -1;
+    live_batches_.erase(it);
     return 0;
 }
 
-bool TransferEnginePy::knownBatch(batch_id_t batch_id) {
-    std::lock_guard<std::mutex> guard(batches_mu_);
-    return live_batches_.count(batch_id) != 0;
-}
+namespace {
+// A use of a batch of the async APIs for the duration of one call.
+class BatchUse {
+   public:
+    using Release = std::function<void()>;
+    BatchUse() = default;
+    explicit BatchUse(Release release) : release_(std::move(release)) {}
+    BatchUse(const BatchUse&) = delete;
+    BatchUse& operator=(const BatchUse&) = delete;
+    ~BatchUse() {
+        if (release_) release_();
+    }
+    // The use is handed to the caller (e.g. freed with it).
+    void keep() { release_ = nullptr; }
+
+   private:
+    Release release_;
+};
+}  // namespace
 
 pybind11::dict TransferEnginePy::getBatchProgressPy(batch_id_t batch_id) {
-    if (!knownBatch(batch_id))
+    Transport::BatchID batch;
+    if (!acquireBatch(batch_id, &batch))
         throw pybind11::value_error("unknown or already freed batch id");
     Transport::BatchProgress p;
     Status s;
     {
+        BatchUse use([this, batch_id] { releaseBatch(batch_id); });
         pybind11::gil_scoped_release release;
-        s = engine_->getBatchProgress(batch_id, p);
+        s = engine_->getBatchProgress(batch, p);
     }
     if (!s.ok()) throw std::runtime_error(s.ToString());
     pybind11::dict d;
-    d["state"] = !p.quiesced ? "running" : (p.failed ? "failed" : "completed");
+    const char* state = "running";
+    if (p.quiesced)
+        state = p.failed ? "failed" : "completed";
+    else if (p.all_terminal && p.unprovable > 0)
+        state = "unprovable";
+    d["state"] = state;
     d["quiesced"] = p.quiesced;
+    d["provable"] = p.provable;
     d["completed"] = p.completed;
     d["failed"] = p.failed;
     d["pending"] = p.pending;
     d["unconfirmed"] = p.unconfirmed;
+    d["unprovable"] = p.unprovable;
     d["total"] = p.total;
     return d;
 }
 
 bool TransferEnginePy::waitBatchQuiescedPy(batch_id_t batch_id,
                                            int64_t timeout_ms) {
-    if (!knownBatch(batch_id))
+    Transport::BatchID batch;
+    if (!acquireBatch(batch_id, &batch))
         throw pybind11::value_error("unknown or already freed batch id");
+    BatchUse use([this, batch_id] { releaseBatch(batch_id); });
     pybind11::gil_scoped_release release;
-    return waitBatchQuiesced(*engine_, batch_id, timeout_ms);
+    return waitBatchQuiesced(*engine_, batch, timeout_ms);
 }
 
 int TransferEnginePy::cancelBatchPy(batch_id_t batch_id) {
-    if (!knownBatch(batch_id))
+    Transport::BatchID batch;
+    if (!acquireBatch(batch_id, &batch))
         throw pybind11::value_error("unknown or already freed batch id");
+    BatchUse use([this, batch_id] { releaseBatch(batch_id); });
     pybind11::gil_scoped_release release;
-    return engine_->cancelBatch(batch_id).ok() ? 0 : -1;
+    return engine_->cancelBatch(batch).ok() ? 0 : -1;
 }
 
 int TransferEnginePy::freeBatchPy(batch_id_t batch_id) {
-    if (!knownBatch(batch_id))
-        throw pybind11::value_error("unknown or already freed batch id");
+    {
+        std::lock_guard<std::mutex> guard(batches_mu_);
+        if (!live_batches_.count(batch_id))
+            throw pybind11::value_error("unknown or already freed batch id");
+    }
     pybind11::gil_scoped_release release;
-    return freeBatch(batch_id);
+    reapLeftBatches();
+    return freeBatch(batch_id, 0);
 }
 
 int TransferEnginePy::getBatchTransferStatus(
     const std::vector<batch_id_t>& batch_ids) {
     pybind11::gil_scoped_release release;
-    std::unordered_map<batch_id_t, int64_t> timeout_table{};
-    for (auto& batch_id : batch_ids) {
-        if (!knownBatch(batch_id)) {
+    reapLeftBatches();
+    struct Tracked {
+        batch_id_t id;
+        Transport::BatchID batch;
+        int64_t timeout_at_ns;  // steady clock
+        bool done = false;      // freed (completed), or no longer tracked
+    };
+    std::vector<Tracked> tracked;
+    tracked.reserve(batch_ids.size());
+    auto release_all = [&] {
+        for (auto& t : tracked)
+            if (!t.done) releaseBatch(t.id);
+    };
+    for (auto id : batch_ids) {
+        bool duplicate = false;
+        for (auto& t : tracked) duplicate |= t.id == id;
+        if (duplicate) continue;
+        Transport::BatchID batch;
+        LiveBatch live;
+        if (!acquireBatch(id, &batch, &live)) {
             LOG(ERROR) << "get_batch_transfer_status: unknown or already "
                           "freed batch id "
-                       << batch_id;
+                       << id;
+            release_all();
             return -1;
         }
         int64_t total_length = 0;
-        auto batch_desc = reinterpret_cast<BatchDesc*>(batch_id);
-        for (auto& task : batch_desc->task_list)
-            for (auto& slice : task.slice_list) total_length += slice->length;
-        timeout_table[batch_id] = total_length + transfer_timeout_nsec_;
+        for (auto& entry : *live.entries) total_length += entry.length;
+        // 1 GiB/s on top of the transfer timeout, as before.
+        tracked.push_back(
+            {id, batch,
+             live.start_ns + total_length + int64_t(transfer_timeout_nsec_)});
     }
 
     bool failed_or_timeout = false;
-    std::unordered_set<batch_id_t> remove_ids{};
-    while (!timeout_table.empty() && !failed_or_timeout) {
-        for (auto& entry : timeout_table) {
-            auto batch_desc = reinterpret_cast<BatchDesc*>(entry.first);
-            auto start_timestamp = batch_desc->start_timestamp;
+    size_t open = tracked.size();
+    int spins = 0;
+    while (open > 0 && !failed_or_timeout) {
+        for (auto& t : tracked) {
+            if (t.done) continue;
             Transport::BatchProgress p;
-            Status s = engine_->getBatchProgress(entry.first, p);
+            Status s = engine_->getBatchProgress(t.batch, p);
             LOG_ASSERT(s.ok());
-            if (p.all_terminal && p.failed == 0 && p.quiesced) {
-                freeBatch(entry.first);
-                remove_ids.insert(entry.first);
-            } else if (p.failed > 0) {
-                failed_or_timeout = true;
+            if (p.all_terminal && p.failed == 0 && batchSettled(p)) {
+                // Completed. Freed, unless another call uses it now.
+                if (freeBatch(t.id, 1) != 0) releaseBatch(t.id);
+                t.done = true;
+                --open;
+                continue;
             }
-            auto current_ts = getCurrentTimeInNano();
-            if (current_ts - start_timestamp > entry.second) {
-                LOG(INFO) << "Sync batch data transfer timeout after "
-                          << current_ts - start_timestamp << "ns";
+            if (p.failed > 0) failed_or_timeout = true;
+            if (batchQuiesceNowNs() > t.timeout_at_ns) {
+                LOG(INFO) << "Sync batch data transfer timeout";
                 failed_or_timeout = true;
             }
         }
-        for (auto& remove_id : remove_ids) timeout_table.erase(remove_id);
-        remove_ids.clear();
-    }
-
-    if (failed_or_timeout) {
-        // Freed only once quiesced; the others stay allocated (and known to
-        // get_batch_progress / wait_batch_quiesced / free_batch).
-        for (auto& entry : timeout_table) engine_->cancelBatch(entry.first);
-        for (auto& entry : timeout_table) {
-            if (waitBatchQuiesced(*engine_, entry.first, quiesce_wait_ms_))
-                freeBatch(entry.first);
+        if (++spins < 1000) {
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
+    if (!failed_or_timeout) return 0;
 
-    return failed_or_timeout ? -1 : 0;
+    // Cancel the rest, then wait for all of them together (one deadline):
+    // each is freed once quiesced; one that is not by then, or never can
+    // be, stays allocated and known (get_batch_progress, free_batch).
+    for (auto& t : tracked)
+        if (!t.done) engine_->cancelBatch(t.batch);
+    const int64_t until = batchQuiesceNowNs() +
+                          std::max<int64_t>(0, quiesce_wait_ms_) * 1000000LL;
+    bool unquiesced = false;
+    spins = 0;
+    while (true) {
+        size_t waiting = 0;
+        for (auto& t : tracked) {
+            if (t.done) continue;
+            Transport::BatchProgress p;
+            if (!engine_->getBatchProgress(t.batch, p).ok()) {
+                unquiesced = true;
+                releaseBatch(t.id);
+                t.done = true;
+                continue;
+            }
+            if (p.quiesced) {
+                if (freeBatch(t.id, 1) != 0) releaseBatch(t.id);
+                t.done = true;
+                continue;
+            }
+            if (p.all_terminal && p.unprovable > 0) {
+                // Never quiesces.
+                unquiesced = true;
+                releaseBatch(t.id);
+                t.done = true;
+                continue;
+            }
+            ++waiting;
+        }
+        if (waiting == 0) break;
+        if (batchQuiesceNowNs() >= until) {
+            unquiesced = true;
+            break;
+        }
+        if (++spins < 1000) {
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }
+    release_all();
+    if (unquiesced)
+        LOG(ERROR) << "get_batch_transfer_status: a failed batch is not "
+                      "quiesced: writes may still land";
+    return unquiesced ? -2 : -1;
 }
 
 batch_id_t TransferEnginePy::transferSubmitWrite(
@@ -811,6 +970,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     uintptr_t peer_buffer_address, size_t length,
     const std::string& transport_hint) {
     pybind11::gil_scoped_release release;
+    reapLeftBatches();
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -833,34 +993,29 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     entry.target_id = handle;
     entry.target_offset = peer_buffer_address;
     entry.transport_hint = parseTransportHint(transport_hint);
-
-    batch_id_t batch_id = engine_->allocateBatchID(1);
-    {
-        std::lock_guard<std::mutex> guard(batches_mu_);
-        live_batches_[batch_id] = entries;
-    }
-    Status s = engine_->submitTransfer(batch_id, *entries);
-    if (!s.ok()) {
-        engine_->cancelBatch(batch_id);
-        if (waitBatchQuiesced(*engine_, batch_id, quiesce_wait_ms_))
-            freeBatch(batch_id);
-        return 0;
-    }
-
-    return batch_id;
+    return submitAsync(entries, 0);
 }
 
 int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     pybind11::gil_scoped_release release;
-    if (!knownBatch(batch_id)) return -1;
+    Transport::BatchID batch;
+    if (!acquireBatch(batch_id, &batch)) return -1;
+    BatchUse use([this, batch_id] { releaseBatch(batch_id); });
     Transport::BatchProgress p;
-    Status s = engine_->getBatchProgress(batch_id, p);
+    Status s = engine_->getBatchProgress(batch, p);
     LOG_ASSERT(s.ok());
     if (!p.all_terminal) return 0;
-    if (!p.quiesced) return -2;  // ended, but writes may still land
-    const bool ok = p.failed == 0;
-    freeBatch(batch_id);
-    return ok ? 1 : -1;
+    if (p.failed == 0) {
+        // Completed; freed once settled (an earlier attempt inside the
+        // engine may still be being confirmed: in progress until then).
+        if (!batchSettled(p) || freeBatch(batch_id, 1) != 0) return 0;
+        use.keep();
+        return 1;
+    }
+    if (!p.quiesced || freeBatch(batch_id, 1) != 0)
+        return -2;  // ended, but writes may still land
+    use.keep();
+    return -1;
 }
 
 int TransferEnginePy::batchRegisterMemory(

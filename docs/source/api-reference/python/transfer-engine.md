@@ -186,10 +186,12 @@ Performs a synchronous write operation to transfer data from local buffer to rem
 - `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success; -1 on failure (nothing of the call can still be
-  applied: see "Quiescence" below); -2 on failure when the failed attempt
-  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
-  (default 10000): writes of it may still land
+- `int`: 0 on success (to a TCP receiver of protocol v1: sent, see
+  "Quiescence" below); -1 on failure (nothing of the call can still be
+  applied); -2 on failure when the failed attempt could not be confirmed
+  quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS` (default 10000), or never
+  can be (a TCP receiver older than protocol v3): writes of it may still
+  land. Its batch is freed by later calls once settled.
 
 #### transfer_sync_read()
 
@@ -207,10 +209,12 @@ Performs a synchronous read operation to transfer data from remote buffer to loc
 - `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success; -1 on failure (nothing of the call can still be
-  applied: see "Quiescence" below); -2 on failure when the failed attempt
-  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
-  (default 10000): writes of it may still land
+- `int`: 0 on success (to a TCP receiver of protocol v1: sent, see
+  "Quiescence" below); -1 on failure (nothing of the call can still be
+  applied); -2 on failure when the failed attempt could not be confirmed
+  quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS` (default 10000), or never
+  can be (a TCP receiver older than protocol v3): writes of it may still
+  land. Its batch is freed by later calls once settled.
 
 #### transfer_sync()
 
@@ -230,10 +234,12 @@ Performs a synchronous transfer operation with specified opcode and optional not
 - `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success; -1 on failure (nothing of the call can still be
-  applied: see "Quiescence" below); -2 on failure when the failed attempt
-  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
-  (default 10000): writes of it may still land
+- `int`: 0 on success (to a TCP receiver of protocol v1: sent, see
+  "Quiescence" below); -1 on failure (nothing of the call can still be
+  applied); -2 on failure when the failed attempt could not be confirmed
+  quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS` (default 10000), or never
+  can be (a TCP receiver older than protocol v3): writes of it may still
+  land. Its batch is freed by later calls once settled.
 
 #### transfer_submit_write()
 
@@ -267,10 +273,12 @@ Checks the status of an asynchronous transfer operation.
 **Returns:**
 - `int`:
   - 1: Transfer completed successfully (the batch is freed)
-  - 0: Transfer still in progress
+  - 0: Transfer still in progress (or completed while an earlier attempt
+    inside the engine is still being confirmed)
   - -1: Transfer failed (quiesced; the batch is freed)
-  - -2: Transfer ended but is not quiesced yet: writes may still land (the
-    batch is kept; check again later)
+  - -2: Transfer failed and is not quiesced: writes may still land (the
+    batch is kept; check again later, or release it with `free_batch()`
+    once it never can be quiesced, see `get_batch_progress()`)
 
 #### transfer_write_on_cuda()
 
@@ -342,10 +350,12 @@ Performs a batch synchronous write operation to transfer multiple data chunks fr
 - `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success; -1 on failure (nothing of the call can still be
-  applied: see "Quiescence" below); -2 on failure when the failed attempt
-  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
-  (default 10000): writes of it may still land
+- `int`: 0 on success (to a TCP receiver of protocol v1: sent, see
+  "Quiescence" below); -1 on failure (nothing of the call can still be
+  applied); -2 on failure when the failed attempt could not be confirmed
+  quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS` (default 10000), or never
+  can be (a TCP receiver older than protocol v3): writes of it may still
+  land. Its batch is freed by later calls once settled.
 
 #### batch_transfer_sync_read()
 
@@ -363,10 +373,12 @@ Performs a batch synchronous read operation to transfer multiple data chunks fro
 - `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success; -1 on failure (nothing of the call can still be
-  applied: see "Quiescence" below); -2 on failure when the failed attempt
-  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
-  (default 10000): writes of it may still land
+- `int`: 0 on success (to a TCP receiver of protocol v1: sent, see
+  "Quiescence" below); -1 on failure (nothing of the call can still be
+  applied); -2 on failure when the failed attempt could not be confirmed
+  quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS` (default 10000), or never
+  can be (a TCP receiver older than protocol v3): writes of it may still
+  land. Its batch is freed by later calls once settled.
 
 #### batch_transfer_sync()
 
@@ -386,10 +398,12 @@ Performs a batch synchronous transfer operation with specified opcode and option
 - `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success; -1 on failure (nothing of the call can still be
-  applied: see "Quiescence" below); -2 on failure when the failed attempt
-  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
-  (default 10000): writes of it may still land
+- `int`: 0 on success (to a TCP receiver of protocol v1: sent, see
+  "Quiescence" below); -1 on failure (nothing of the call can still be
+  applied); -2 on failure when the failed attempt could not be confirmed
+  quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS` (default 10000), or never
+  can be (a TCP receiver older than protocol v3): writes of it may still
+  land. Its batch is freed by later calls once settled.
 
 #### batch_transfer_async_write()
 
@@ -473,12 +487,16 @@ Waits for multiple batch asynchronous transfer operations to complete.
 - `batch_ids` (List[int]): List of batch IDs returned from batch async transfer operations
 
 **Returns:**
-- `int`: 0 if all transfers completed successfully, -1 if any transfer failed or timed out
+- `int`: 0 if all transfers completed successfully (every batch is freed);
+  -1 if a transfer failed or timed out and every batch is quiesced (and
+  freed); -2 if a transfer failed or timed out and a batch is not quiesced:
+  writes of it may still land
 
-Batches are freed once quiesced. After a failure or timeout the remaining
-batches are canceled and waited for (at most `MC_TRANSFER_QUIESCE_WAIT_MS`
-each); those not quiesced by then stay allocated and can still be queried
-with `get_batch_progress()`.
+Completed batches are freed once settled. After a failure or timeout the
+remaining batches are canceled and waited for together, at most
+`MC_TRANSFER_QUIESCE_WAIT_MS` in all; each is freed once quiesced. Those not
+quiesced by then, or that never can be, stay allocated: query them with
+`get_batch_progress()` and release them with `free_batch()`.
 
 #### Quiescence
 
@@ -492,13 +510,24 @@ daemon did not answer may still run. Until then the batch is not quiesced.
 - TCP receivers of protocol v3 (this build) drop the chunks of a canceled
   write, and those that arrive after the batch deadline, and confirm a cut
   write's final state to the sender; that confirmation is what makes the
-  batch quiesced.
-- With a receiver of protocol v2 (an older build), the only proof is the
-  closed TCP session: a cut write counts as quiesced once the sender closed
-  its connection, although the receiver may still apply bytes it had
-  already buffered (milliseconds, at most a socket buffer).
-- With a receiver of protocol v1, a completed write counts as quiesced (that
-  protocol has no acknowledgment at all).
+  batch quiesced. The sender asks until it gets an answer, with a capped
+  backoff; a receiver whose address refuses connections (its process is
+  gone), or a restarted one (it does not know the write), confirms it too.
+- A receiver of protocol v2 (an older build, or a sender limited by
+  `MC_TCP_PROTO=2`) acknowledges completed writes but cannot confirm a cut
+  one: it may still apply what the network and its socket buffers held when
+  the sender closed the connection, with no bound in time that the sender
+  could observe. A batch with such a write is never quiesced
+  (`provable` is `False`).
+- A receiver of protocol v1 (`MC_TCP_PROTO=1`) acknowledges nothing: a
+  completed write was only sent, so a batch with any write to it is never
+  quiesced either. Synchronous calls still report such a write as a success.
+- The TENT backend cannot prove quiescence: its batches report `quiesced`
+  once every transfer is terminal, with `provable` `False`.
+
+A batch is **settled** when it is quiesced, or when every transfer of it
+ended and the only unconfirmed attempts are ones that never can be
+confirmed: nothing more will be learned about it, and it can be freed.
 
 #### get_batch_progress()
 
@@ -510,16 +539,21 @@ Non-blocking state of a batch of the async APIs (it is not freed).
 
 **Returns:**
 - `dict`:
-  - `state` (str): `"running"` while the batch is not quiesced (a transfer
-    is in flight, or an ended one is not confirmed yet), then
-    `"completed"` (every transfer completed) or `"failed"`
-  - `quiesced` (bool): `state != "running"`; nothing of the batch can
-    still be applied
+  - `state` (str): `"running"` while a transfer is in flight or an ended
+    attempt is still to be confirmed; `"completed"` (every transfer
+    completed) or `"failed"` once quiesced; `"unprovable"` when every
+    transfer ended but an attempt never can be confirmed (writes of it may
+    still land; the batch never quiesces)
+  - `quiesced` (bool): nothing of the batch can still be applied
+  - `provable` (bool): `False` when the batch never can be quiesced (see
+    above), or the backend cannot prove it
   - `completed`, `failed`, `pending` (int): transfers by state on this side
-  - `unconfirmed` (int): ended attempts not confirmed yet
+  - `unconfirmed` (int): ended attempts not confirmed yet; `unprovable`
+    (int): of those, attempts that never can be
   - `total` (int)
 
-Raises `ValueError` for an unknown or already freed batch id.
+Raises `ValueError` for an unknown or already freed batch id. Batch ids are
+never reused.
 
 #### wait_batch_quiesced()
 
@@ -527,13 +561,13 @@ Raises `ValueError` for an unknown or already freed batch id.
 wait_batch_quiesced(batch_id, timeout_ms)
 ```
 
-Waits until the batch is quiesced or `timeout_ms` passed (0: no wait). The
-GIL is released while waiting.
+Waits until the batch is quiesced or `timeout_ms` passed (0: no wait); it
+returns early when the batch never can be quiesced. The GIL is released
+while waiting.
 
 **Returns:**
 - `bool`: `True` when the batch is quiesced -- nothing of it can still be
-  applied anywhere. `False` when the timeout passed first: writes of it
-  **may still land**.
+  applied anywhere. `False` otherwise: writes of it **may still land**.
 
 Raises `ValueError` for an unknown or already freed batch id.
 
@@ -556,10 +590,12 @@ and confirm the cut). It does not wait: use `wait_batch_quiesced()`.
 free_batch(batch_id)
 ```
 
-Frees a batch of the async APIs, only once it is quiesced.
+Frees a batch of the async APIs, only once it is settled (quiesced, or
+`state` is `"unprovable"`).
 
 **Returns:**
-- `int`: 0 when freed; -1 when it is not quiesced yet (it is kept)
+- `int`: 0 when freed; -1 when it is not settled yet, or another call is
+  using the batch (it is kept)
 
 Raises `ValueError` for an unknown or already freed batch id.
 

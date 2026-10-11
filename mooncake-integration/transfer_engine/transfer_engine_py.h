@@ -133,7 +133,7 @@ class TransferEnginePy {
 
     // Batches of the async APIs (see batch_quiesce.h): non-blocking
     // progress, a wait for quiescence, cancel, and free (only once
-    // quiesced). Unknown or freed ids raise ValueError.
+    // settled). Unknown or freed ids raise ValueError.
     pybind11::dict getBatchProgressPy(batch_id_t batch_id);
     bool waitBatchQuiescedPy(batch_id_t batch_id, int64_t timeout_ms);
     int cancelBatchPy(batch_id_t batch_id);
@@ -232,21 +232,46 @@ class TransferEnginePy {
 
     uint64_t transfer_timeout_nsec_;
 
-    // Batches this binding allocated and has not freed, with the requests
-    // their tasks point at (they must outlive the batch).
+    // Batches of the async APIs, by the id handed to Python. Ids count up
+    // and are never reused, so a stale id cannot reach another batch.
+    // |uses| counts the binding calls using the batch now (each holds one
+    // for its duration); it is freed only with no other use, under
+    // batches_mu_, and only once settled (batch_quiesce.h).
+    struct LiveBatch {
+        Transport::BatchID batch = 0;
+        // The requests its tasks point at (they must outlive the batch).
+        std::shared_ptr<std::vector<TransferRequest>> entries;
+        int64_t start_ns = 0;  // steady clock
+        int uses = 0;
+    };
+    // Batches of failed calls not settled in time (sync calls that returned
+    // -2): freed by later calls once settled.
+    struct LeftBatch {
+        Transport::BatchID batch = 0;
+        std::shared_ptr<std::vector<TransferRequest>> entries;
+    };
     std::mutex batches_mu_;
-    std::unordered_map<batch_id_t,
-                       std::shared_ptr<std::vector<TransferRequest>>>
-        live_batches_;
-    // Requests of sync attempts left unquiesced (never freed).
-    std::vector<std::shared_ptr<std::vector<TransferRequest>>>
-        unquiesced_requests_;
+    std::unordered_map<batch_id_t, LiveBatch> live_batches_;
+    batch_id_t next_batch_id_ = 1;
+    std::vector<LeftBatch> left_batches_;
     // How long a failed or timed-out attempt is waited for to quiesce
     // (MC_TRANSFER_QUIESCE_WAIT_MS, default 10000).
     int64_t quiesce_wait_ms_ = 10000;
 
-    bool knownBatch(batch_id_t batch_id);
-    int freeBatch(batch_id_t batch_id);  // 0 freed, -1 not quiesced
+    batch_id_t addBatch(
+        Transport::BatchID batch,
+        const std::shared_ptr<std::vector<TransferRequest>> &entries);
+    // A use of batch |id| (false: unknown or freed); |copy| gets its state.
+    bool acquireBatch(batch_id_t id, Transport::BatchID *batch,
+                      LiveBatch *copy = nullptr);
+    void releaseBatch(batch_id_t id);
+    // Frees batch |id| (with its use) when settled and no call but the
+    // caller's |own_uses| uses it: 0 freed, -1 kept.
+    int freeBatch(batch_id_t id, int own_uses);
+    void reapLeftBatches();
+    batch_id_t submitAsync(
+        const std::shared_ptr<std::vector<TransferRequest>> &entries,
+        int64_t deadline_ms);
     int runSync(const char *target_hostname, Transport::SegmentHandle handle,
                 const std::shared_ptr<std::vector<TransferRequest>> &entries,
                 int max_attempts, int64_t timeout_ns, TransferNotify *notify);
