@@ -596,6 +596,15 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
                     expirePendingAdmissionsLocked(*group, admission_time,
                                                   expired);
                     promoted = promotePendingAdmissionsLocked(*group);
+                    // Queued work must not outlive its batch's deadline:
+                    // a timer at the earliest one sweeps the queue.
+                    const int64_t work_deadline = work.deadline_ns;
+                    if (work_deadline != 0 &&
+                        (group->next_deadline_ns == 0 ||
+                         work_deadline < group->next_deadline_ns)) {
+                        group->next_deadline_ns = work_deadline;
+                        armDeadlineTimerLocked(group, work_deadline);
+                    }
 
                     if (group->pending_admissions.empty() &&
                         group->queue.size() < group->queue_capacity) {
@@ -738,6 +747,7 @@ void TcpTransport::runGroupPump(
     size_t stale_count = 0;
     std::deque<TcpWorkItem> failed;
     std::deque<TcpWorkItem> expired;
+    std::deque<TcpWorkItem> limit_expired;
     std::deque<TcpWorkItem> runtime_failed;
     std::shared_ptr<asio::steady_timer> admission_timer_to_cancel;
     WorkFailureReason failure_reason = WorkFailureReason::CONNECT_FAILED;
@@ -757,9 +767,25 @@ void TcpTransport::runGroupPump(
 
         expirePendingAdmissionsLocked(*group, std::chrono::steady_clock::now(),
                                       expired);
+        const int64_t now_ns = steadyNowNs();
+        if (group->sweep_requested || (group->next_deadline_ns != 0 &&
+                                       now_ns >= group->next_deadline_ns)) {
+            group->sweep_requested = false;
+            sweepExpiredLocked(*group, now_ns, limit_expired);
+        }
         promoted += promotePendingAdmissionsLocked(*group);
 
         for (const auto& lane : group->lanes) {
+            // Work whose batch was canceled or ran out of time is failed
+            // instead of started (nothing of it was sent).
+            while (!group->queue.empty() &&
+                   group->queue.front().expired(now_ns)) {
+                const uint64_t length = group->queue.front().slice->length;
+                limit_expired.emplace_back(std::move(group->queue.front()));
+                group->queue.pop_front();
+                removeQueuedBytesLocked(*group, length);
+                if (group->queue.empty()) clearQueuedBytesLocked(*group);
+            }
             if (group->queue.empty()) break;
             if (lane->state != LaneState::IDLE) continue;
             // An idle lane holds no session, so this group lock serialises
@@ -913,11 +939,182 @@ void TcpTransport::runGroupPump(
     failWorkItems(std::move(failed), failure_reason, group->failure_counters);
     failWorkItems(std::move(expired), WorkFailureReason::QUEUE_TIMEOUT,
                   group->failure_counters);
+    failWorkItems(std::move(limit_expired), WorkFailureReason::EXPIRED,
+                  group->failure_counters);
     failWorkItems(std::move(runtime_failed),
                   WorkFailureReason::RUNTIME_UNAVAILABLE,
                   group->failure_counters);
     if (followup_pump_epoch != 0) postGroupPump(group, followup_pump_epoch);
     scheduleGroupRetirement(group);
+}
+
+// Moves queued and pending work whose batch was canceled or whose deadline
+// passed to |expired|, and re-arms the deadline timer for the earliest
+// deadline still queued.
+void TcpTransport::sweepExpiredLocked(PeerConnectionGroup& group,
+                                      int64_t now_ns,
+                                      std::deque<TcpWorkItem>& expired) {
+    int64_t next = 0;
+    // TcpWorkItem is move-constructible only: rebuild the queue in order.
+    auto sweep = [&](std::deque<TcpWorkItem>& q, bool queued) {
+        std::deque<TcpWorkItem> kept;
+        while (!q.empty()) {
+            TcpWorkItem& item = q.front();
+            if (item.expired(now_ns)) {
+                if (queued) removeQueuedBytesLocked(group, item.slice->length);
+                expired.emplace_back(std::move(item));
+            } else {
+                if (item.deadline_ns != 0 &&
+                    (next == 0 || item.deadline_ns < next))
+                    next = item.deadline_ns;
+                kept.emplace_back(std::move(item));
+            }
+            q.pop_front();
+        }
+        q.swap(kept);
+    };
+    sweep(group.queue, true);
+    sweep(group.pending_admissions, false);
+    if (group.queue.empty()) clearQueuedBytesLocked(group);
+    group.next_deadline_ns = next;
+}
+
+void TcpTransport::armDeadlineTimerLocked(
+    const std::shared_ptr<PeerConnectionGroup>& group, int64_t deadline_ns) {
+    ++group->deadline_epoch;
+    if (group->deadline_epoch == 0) ++group->deadline_epoch;
+    const uint64_t epoch = group->deadline_epoch;
+    try {
+        auto timer = std::make_shared<asio::steady_timer>(group->executor);
+        timer->expires_at(std::chrono::steady_clock::time_point(
+            std::chrono::nanoseconds(deadline_ns)));
+        group->deadline_timer = timer;
+        std::weak_ptr<PeerConnectionGroup> weak = group;
+        timer->async_wait([weak, timer, epoch](asio::error_code ec) {
+            if (ec == asio::error::operation_aborted) return;
+            auto g = weak.lock();
+            if (!g) return;
+            uint64_t pump_epoch = 0;
+            {
+                std::lock_guard<std::mutex> lock(g->mutex);
+                if (g->state != GroupState::OPEN || g->deadline_epoch != epoch)
+                    return;
+                g->sweep_requested = true;
+                pump_epoch = requestGroupPumpLocked(*g);
+            }
+            if (pump_epoch != 0) postGroupPump(g, pump_epoch);
+        });
+    } catch (...) {
+        // Without a timer the next pump still sweeps expired work.
+        group->sweep_requested = true;
+    }
+}
+
+void TcpTransport::noteUnconfirmed(TcpWorkItem& work, uint64_t request_id,
+                                   const asio::any_io_executor& executor,
+                                   const ConnectionKey& key) noexcept {
+    if (!work.unconfirmed) return;
+    // Counted before the slice turns terminal, so that a batch never looks
+    // quiesced in between.
+    work.unconfirmed->fetch_add(1, std::memory_order_acq_rel);
+    confirmByCancel(executor, key, request_id, work.unconfirmed);
+}
+
+void TcpTransport::confirmByCancel(
+    asio::any_io_executor executor, const ConnectionKey& key,
+    uint64_t request_id, std::shared_ptr<std::atomic<int64_t>> counter,
+    int attempt) noexcept {
+    constexpr int kAttempts = 6;
+    struct Op {
+        explicit Op(const asio::any_io_executor& ex)
+            : socket(ex), resolver(ex), timer(ex) {}
+        asio::ip::tcp::socket socket;
+        asio::ip::tcp::resolver resolver;
+        asio::steady_timer timer;
+        SessionHeader header{};
+        SessionHeaderV3Ext ext{};
+        CancelReply reply{};
+        bool done = false;
+    };
+    try {
+        auto op = std::make_shared<Op>(executor);
+        op->header.size = 0;
+        op->header.addr = 0;
+        op->header.opcode = kOpcodeCancel | kOpcodeV2Flag | kOpcodeV3Flag;
+        op->ext.request_id = htole64(request_id);
+        op->ext.remaining_us = 0;
+        auto finish = [op, executor, key, request_id, counter,
+                       attempt](bool answered) {
+            if (op->done) return;
+            op->done = true;
+            asio::error_code ec;
+            op->timer.cancel(ec);
+            op->socket.close(ec);
+            const uint64_t frame = le64toh(op->reply.status);
+            if (answered && v3FinalStatus(frame) &&
+                le64toh(op->reply.request_id) == request_id) {
+                counter->fetch_sub(1, std::memory_order_acq_rel);
+                return;
+            }
+            if (attempt + 1 >= kAttempts) {
+                LOG(ERROR) << "TCP request " << std::hex << request_id
+                           << std::dec << " to " << key.host << ":" << key.port
+                           << " was cut and its receiver did not confirm it "
+                              "applies nothing more; its batch stays "
+                              "unquiesced";
+                return;
+            }
+            // Back off and ask again (100 ms, doubling).
+            auto retry = std::make_shared<asio::steady_timer>(executor);
+            retry->expires_after(std::chrono::milliseconds(100 << attempt));
+            retry->async_wait([retry, executor, key, request_id, counter,
+                               attempt](asio::error_code wait_ec) {
+                if (wait_ec == asio::error::operation_aborted) return;
+                confirmByCancel(executor, key, request_id, counter,
+                                attempt + 1);
+            });
+        };
+        op->timer.expires_after(std::chrono::seconds(2));
+        op->timer.async_wait([op, finish](asio::error_code ec) {
+            if (ec == asio::error::operation_aborted) return;
+            finish(false);
+        });
+        op->resolver.async_resolve(
+            key.host, std::to_string(key.port),
+            [op, finish](asio::error_code ec,
+                         asio::ip::tcp::resolver::results_type results) {
+                if (ec) return finish(false);
+                asio::async_connect(
+                    op->socket, results,
+                    [op, finish](asio::error_code cec,
+                                 const asio::ip::tcp::endpoint&) {
+                        if (cec) return finish(false);
+                        std::array<asio::const_buffer, 2> bufs = {
+                            asio::buffer(&op->header, sizeof(SessionHeader)),
+                            asio::buffer(&op->ext, sizeof(op->ext))};
+                        asio::async_write(
+                            op->socket, bufs,
+                            [op, finish](asio::error_code wec, std::size_t) {
+                                if (wec) return finish(false);
+                                asio::async_read(
+                                    op->socket,
+                                    asio::buffer(&op->reply, sizeof(op->reply)),
+                                    [op, finish](asio::error_code rec,
+                                                 std::size_t n) {
+                                        finish(!rec && n == sizeof(op->reply));
+                                    });
+                            });
+                    });
+            });
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "TCP request " << std::hex << request_id << std::dec
+                   << ": cannot ask its receiver to confirm the cancel: "
+                   << e.what() << "; its batch stays unquiesced";
+    } catch (...) {
+        LOG(ERROR) << "TCP request " << std::hex << request_id << std::dec
+                   << ": cannot ask its receiver to confirm the cancel; its "
+                      "batch stays unquiesced";
+    }
 }
 
 void TcpTransport::startLaneConnect(
@@ -1232,14 +1429,18 @@ void TcpTransport::startLaneSessionOnLane(
                 std::weak_ptr<ConnectionLane> weak_lane(lane);
                 auto session = std::make_shared<ClientSession>(
                     lane->socket, lane->current->use_v2,
-                    [weak_group, weak_lane, epoch](TransferStatusEnum status,
-                                                   bool clean) noexcept {
+                    [weak_group, weak_lane, epoch](
+                        TransferStatusEnum status, bool clean,
+                        uint64_t unconfirmed_request) noexcept {
                         auto callback_group = weak_group.lock();
                         auto callback_lane = weak_lane.lock();
                         if (!callback_group || !callback_lane) return;
                         handleLaneTerminal(callback_group, callback_lane, epoch,
-                                           status, clean);
+                                           status, clean, unconfirmed_request);
                     });
+                session->setLimits(lane->current->use_v3,
+                                   lane->current->deadline_ns,
+                                   lane->current->control);
                 lane->session = session;
                 session->initiate(lane->current->slice->source_addr,
                                   lane->current->slice->tcp.dest_addr,
@@ -1277,7 +1478,8 @@ void TcpTransport::startLaneSessionOnLane(
 void TcpTransport::handleLaneTerminal(
     const std::shared_ptr<PeerConnectionGroup>& group,
     const std::shared_ptr<ConnectionLane>& lane, uint64_t epoch,
-    TransferStatusEnum status, bool connection_clean) noexcept {
+    TransferStatusEnum status, bool connection_clean,
+    uint64_t unconfirmed_request) noexcept {
     std::optional<TerminalAction> action;
     std::shared_ptr<asio::ip::tcp::socket> socket_to_close;
     bool stale = false;
@@ -1311,6 +1513,9 @@ void TcpTransport::handleLaneTerminal(
     // A dirty protocol stream must be closed before terminal Slice status is
     // visible to the caller.
     closeSocketNoThrow(socket_to_close);
+    if (unconfirmed_request != 0)
+        noteUnconfirmed(action->work, unconfirmed_request, lane->executor,
+                        group->key);
     completeTerminalAction(std::move(*action));
 
     uint64_t pump_epoch = 0;
@@ -1410,6 +1615,9 @@ uint64_t TcpTransport::recordWorkFailure(
             break;
         case WorkFailureReason::SHUTDOWN:
             counter = &counters->shutdown;
+            break;
+        case WorkFailureReason::EXPIRED:
+            counter = &counters->expired;
             break;
     }
     if (!counter) return 0;

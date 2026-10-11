@@ -37,7 +37,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
+#include <thread>
 #include <type_traits>
+#include <unordered_map>
 
 #include "common.h"
 #include "transfer_engine.h"
@@ -439,7 +442,9 @@ int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
     desc->tcp_data_port = tcp_data_port;
     // Advertise acknowledged framing (#2086); initiators fall back to v1
     // against descriptors that do not carry the field.
-    desc->tcp_proto_version = 2;
+    // 2: acknowledged framing; 3: also deadlines, request ids and cancel
+    // (tcp_transport_session_impl.h).
+    desc->tcp_proto_version = 3;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -531,6 +536,7 @@ Status TcpTransport::submitTransfer(
     for (auto& request : entries) {
         TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
+        task.batch_id = batch_id;  // the batch's deadline and cancel apply
         slices.push_back(prepareTransfer(&task, request));
     }
     startTransfers(std::move(slices));
@@ -775,6 +781,27 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
 
 #include "tcp_transport_lane_impl.h"
 
+void TcpTransport::onBatchCanceled(BatchID batch_id) {
+    (void)batch_id;  // the queued work carries its batch's control
+    std::vector<std::shared_ptr<PeerConnectionGroup>> groups;
+    {
+        std::lock_guard<std::mutex> lock(lane_state_->mutex);
+        for (auto& entry : lane_state_->groups) groups.push_back(entry.second);
+        for (auto& group : lane_state_->retiring_groups)
+            groups.push_back(group);
+    }
+    for (auto& group : groups) {
+        uint64_t pump_epoch = 0;
+        {
+            std::lock_guard<std::mutex> lock(group->mutex);
+            if (group->state != GroupState::OPEN) continue;
+            group->sweep_requested = true;
+            pump_epoch = requestGroupPumpLocked(*group);
+        }
+        if (pump_epoch != 0) postGroupPump(group, pump_epoch);
+    }
+}
+
 void TcpTransport::startTransfer(Slice* slice,
                                  std::function<void()> continuation,
                                  bool reuse_connection) {
@@ -788,6 +815,15 @@ void TcpTransport::startTransfer(Slice* slice,
             next();
         }
     };
+
+    // The batch's deadline passed or it was canceled: nothing is sent.
+    BatchControl* control = batchControl(slice);
+    if (control && control->expired(BatchControl::nowNs())) {
+        recordWorkFailure(WorkFailureReason::EXPIRED,
+                          lane_state_->failure_counters);
+        finish(TransferStatusEnum::FAILED);
+        return;
+    }
 
     auto desc = metadata_->getSegmentDescByID(slice->target_id);
     if (!desc) {
@@ -820,8 +856,15 @@ void TcpTransport::startTransfer(Slice* slice,
 
     const ConnectionKey key{desc->tcp_data_host,
                             static_cast<uint16_t>(desc->tcp_data_port)};
-    const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
+    const int max_proto = maxTcpProto();
+    const bool use_v2 = desc->tcp_proto_version >= 2 && max_proto >= 2;
     TcpWorkItem work(slice, use_v2, std::move(continuation));
+    work.use_v3 = use_v2 && desc->tcp_proto_version >= 3 && max_proto >= 3;
+    if (control) {
+        work.control = control;
+        work.deadline_ns = control->deadlineNs();
+        work.unconfirmed = control->unconfirmed();
+    }
 
     // Scatter task groups request reuse even when the general pool setting is
     // disabled. Fixed lanes provide the same serial socket reuse without
@@ -857,37 +900,47 @@ void TcpTransport::startTransfer(Slice* slice,
     pending->work.emplace(std::move(work));
     pending->counters = lane_state_->failure_counters;
     try {
-        asio::post(socket->get_executor(), [this, pending, socket] {
+        asio::post(socket->get_executor(), [this, pending, socket, key] {
             auto ready = std::move(*pending->work);
             pending->work.reset();
-            startTransferWithSocket(std::move(ready), socket);
+            startTransferWithSocket(std::move(ready), socket, key);
         });
     } catch (...) {
         if (pending->work) {
             auto ready = std::move(*pending->work);
             pending->work.reset();
-            startTransferWithSocket(std::move(ready), std::move(socket));
+            startTransferWithSocket(std::move(ready), std::move(socket), key);
         }
     }
 }
 
 void TcpTransport::startTransferWithSocket(
-    TcpWorkItem work, std::shared_ptr<asio::ip::tcp::socket> socket) noexcept {
+    TcpWorkItem work, std::shared_ptr<asio::ip::tcp::socket> socket,
+    const ConnectionKey& key) noexcept {
     const Slice* slice = work.slice;
     std::shared_ptr<std::optional<TcpWorkItem>> terminal_work;
     try {
         terminal_work =
             std::make_shared<std::optional<TcpWorkItem>>(std::move(work));
+        auto executor = socket->get_executor();
         auto session = std::make_shared<ClientSession>(
             socket, terminal_work->value().use_v2,
-            [terminal_work, socket](TransferStatusEnum status, bool) noexcept {
+            [terminal_work, socket, executor, key](
+                TransferStatusEnum status, bool,
+                uint64_t unconfirmed_request) noexcept {
                 closeSocketNoThrow(socket);
                 if (!terminal_work->has_value()) return;
                 auto completed = std::move(terminal_work->value());
                 terminal_work->reset();
+                if (unconfirmed_request)
+                    noteUnconfirmed(completed, unconfirmed_request, executor,
+                                    key);
                 completeTerminalAction(
                     TerminalAction(std::move(completed), status, false));
             });
+        session->setLimits(terminal_work->value().use_v3,
+                           terminal_work->value().deadline_ns,
+                           terminal_work->value().control);
         session->initiate(terminal_work->value().slice->source_addr,
                           terminal_work->value().slice->tcp.dest_addr,
                           terminal_work->value().slice->length,

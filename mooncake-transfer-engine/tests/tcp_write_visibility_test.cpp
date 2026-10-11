@@ -51,6 +51,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "batch_quiesce.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -4204,4 +4205,244 @@ TEST(TcpWriteVisibilityTest, RpcMetadataRefreshInvalidatesCachedHost) {
         << initial_rpc.ip_or_host_name;
 }
 
+#endif
+
+// --- Batch deadlines, cancel and quiescence (protocol v3) ------------------
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+namespace {
+
+int64_t steadyNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// |target| owns the destination pool; |h| writes its pool into it.
+struct WritePair {
+    LocalHttpMetadataServer metadata_server;
+    EngineHandle target;
+    EngineHandle h;
+    size_t size = 0;
+    bool ok = false;
+
+    WritePair(const std::string& port_suffix, size_t pool_size)
+        : size(pool_size) {
+        if (!metadata_server.ok()) return;
+        const std::string target_name = "127.0.0.2:1850" + port_suffix;
+        target.init(metadata_server.uri(), target_name, pool_size);
+        if (!target.ok) return;
+        h.init(metadata_server.uri(), "127.0.0.2:1860" + port_suffix, pool_size,
+               target_name);
+        if (!h.ok) return;
+        auto* src = static_cast<uint8_t*>(h.pool);
+        // Never 0: the destination starts zeroed.
+        for (size_t i = 0; i < pool_size; ++i)
+            src[i] = static_cast<uint8_t>(1 + ((i * 131) ^ (i >> 11)) % 255);
+        ok = true;
+    }
+
+    std::vector<uint8_t> destination() const {
+        auto* p = static_cast<const uint8_t*>(target.pool);
+        return std::vector<uint8_t>(p, p + size);
+    }
+
+    // Bytes of the destination equal to the source, from |offset| on.
+    size_t appliedFrom(size_t offset, size_t length) const {
+        auto* d = static_cast<const uint8_t*>(target.pool);
+        auto* s = static_cast<const uint8_t*>(h.pool);
+        size_t n = 0;
+        for (size_t i = offset; i < offset + length; ++i) n += d[i] == s[i];
+        return n;
+    }
+};
+
+Transport::BatchProgress progressOf(EngineHandle& h, Transport::BatchID b) {
+    Transport::BatchProgress p;
+    EXPECT_TRUE(h.engine->getBatchProgress(b, p).ok());
+    return p;
+}
+
+bool waitAllTerminal(EngineHandle& h, Transport::BatchID b,
+                     std::chrono::milliseconds timeout) {
+    const auto until = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < until) {
+        if (progressOf(h, b).all_terminal) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return progressOf(h, b).all_terminal;
+}
+
+}  // namespace
+
+// A write slower than its batch deadline is cut at the deadline; the
+// receiver drops the chunks it reads after its deadline (those the initiator
+// had already sent), and once the batch is quiesced -- the receiver
+// confirmed the cut -- nothing more of it lands.
+TEST(TcpBatchLimitsTest, TotalDeadlineCutsSlowWriteAndNothingLandsLater) {
+    ScopedEnvVar delay("MC_TCP_TEST_SERVER_CHUNK_DELAY_MS", "10");
+    constexpr size_t kSize = 4 << 20;  // 64 chunks of 64 KiB, ~640 ms
+    WritePair pair("1", kSize);
+    ASSERT_TRUE(pair.ok);
+    auto& h = pair.h;
+    auto batch = h.engine->allocateBatchID(1);
+    const int64_t start = steadyNs();
+    const int64_t deadline = start + 200LL * 1000 * 1000;
+    ASSERT_TRUE(h.engine->setBatchDeadline(batch, deadline).ok());
+    ASSERT_TRUE(
+        h.engine->submitTransfer(batch, {makeWriteRequest(h, kSize)}).ok());
+    ASSERT_TRUE(waitAllTerminal(h, batch, std::chrono::seconds(5)));
+    const int64_t terminal_at = steadyNs();
+    auto p = progressOf(h, batch);
+    EXPECT_EQ(p.failed, 1u);
+    EXPECT_LT(terminal_at - deadline, 150LL * 1000 * 1000)
+        << "the transfer was not cut at its deadline";
+    ASSERT_TRUE(waitBatchQuiesced(*h.engine, batch, 5000, &p))
+        << "the receiver never confirmed the cut (unconfirmed=" << p.unconfirmed
+        << ")";
+    const auto at_quiesce = pair.destination();
+    const size_t applied = pair.appliedFrom(0, kSize);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(pair.destination(), at_quiesce)
+        << "bytes landed after the batch was quiesced";
+    LOG(INFO) << "total deadline: " << applied / 1024 << " KiB of "
+              << kSize / 1024 << " KiB applied; cut "
+              << (terminal_at - deadline) / 1000000 << " ms after the deadline";
+    // About 20 chunks reached the receiver before its deadline.
+    EXPECT_GT(applied, 0u);
+    EXPECT_LT(applied, size_t(2) << 20);
+    EXPECT_TRUE(h.engine->freeBatchID(batch).ok());
+}
+
+// The receiver on its own: an initiator that keeps sending past the
+// deadline. The receiver applies only the chunks that arrived before its
+// deadline, drops the rest, and answers kStatusDeadline -- a final status,
+// so the attempt is quiesced without a cancel round trip.
+TEST(TcpBatchLimitsTest, ReceiverDropsChunksArrivingAfterItsDeadline) {
+    ScopedEnvVar delay("MC_TCP_TEST_SERVER_CHUNK_DELAY_MS", "10");
+    ScopedEnvVar no_cut("MC_TCP_TEST_CLIENT_NO_CUT", "1");
+    constexpr size_t kSize = 4 << 20;  // 64 chunks, ~640 ms at the receiver
+    WritePair pair("5", kSize);
+    ASSERT_TRUE(pair.ok);
+    auto& h = pair.h;
+    auto batch = h.engine->allocateBatchID(1);
+    const int64_t start = steadyNs();
+    ASSERT_TRUE(
+        h.engine->setBatchDeadline(batch, start + 200LL * 1000 * 1000).ok());
+    ASSERT_TRUE(
+        h.engine->submitTransfer(batch, {makeWriteRequest(h, kSize)}).ok());
+    ASSERT_TRUE(waitAllTerminal(h, batch, std::chrono::seconds(5)));
+    const int64_t terminal_ms = (steadyNs() - start) / 1000000;
+    auto p = progressOf(h, batch);
+    EXPECT_EQ(p.failed, 1u);
+    EXPECT_TRUE(p.quiesced) << "a final status needs no confirmation";
+    EXPECT_EQ(p.unconfirmed, 0);
+    const size_t applied = pair.appliedFrom(0, kSize);
+    LOG(INFO) << "receiver deadline: " << applied / 1024 << " KiB of "
+              << kSize / 1024 << " KiB applied; terminal after " << terminal_ms
+              << " ms";
+    EXPECT_GE(terminal_ms, 500) << "the whole body went through";
+    EXPECT_GT(applied, 0u);
+    EXPECT_LT(applied, size_t(2) << 20);
+    const auto at_terminal = pair.destination();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(pair.destination(), at_terminal);
+    EXPECT_TRUE(h.engine->freeBatchID(batch).ok());
+}
+
+// Cancel mid-batch: queued writes fail without being sent, the one in
+// flight is cut and confirmed by its receiver; nothing lands afterwards.
+TEST(TcpBatchLimitsTest, CancelMidBatchFailsQueuedAndInFlightWork) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar delay("MC_TCP_TEST_SERVER_CHUNK_DELAY_MS", "10");
+    constexpr size_t kWrites = 6, kEach = 512 << 10;  // 8 chunks, ~80 ms each
+    WritePair pair("2", kWrites * kEach);
+    ASSERT_TRUE(pair.ok);
+    auto& h = pair.h;
+    std::vector<TransferRequest> requests;
+    for (size_t i = 0; i < kWrites; ++i) {
+        auto r = makeWriteRequest(h, kEach, h.remote_base + i * kEach);
+        r.source = static_cast<char*>(h.pool) + i * kEach;
+        requests.push_back(r);
+    }
+    auto batch = h.engine->allocateBatchID(kWrites);
+    ASSERT_TRUE(h.engine->submitTransfer(batch, requests).ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const int64_t canceled_at = steadyNs();
+    ASSERT_TRUE(h.engine->cancelBatch(batch).ok());
+    ASSERT_TRUE(waitAllTerminal(h, batch, std::chrono::seconds(5)));
+    EXPECT_LT(steadyNs() - canceled_at, 300LL * 1000 * 1000);
+    Transport::BatchProgress p;
+    ASSERT_TRUE(waitBatchQuiesced(*h.engine, batch, 5000, &p));
+    EXPECT_GE(p.failed, kWrites - 2);
+    const auto at_quiesce = pair.destination();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(pair.destination(), at_quiesce);
+    // The last writes were never started.
+    EXPECT_EQ(pair.appliedFrom((kWrites - 1) * kEach, kEach), size_t(0))
+        << "a queued write of a canceled batch was applied";
+    EXPECT_TRUE(h.engine->freeBatchID(batch).ok());
+}
+
+// Protocol mixes: no flag means exactly the v2 behaviour.
+TEST(TcpBatchLimitsTest, V2AndV3PeersInteroperate) {
+    constexpr size_t kSize = 1 << 20;
+    WritePair pair("3", kSize);
+    ASSERT_TRUE(pair.ok);
+    auto& h = pair.h;
+    auto run = [&](const char* what) {
+        memset(pair.target.pool, 0, kSize);
+        auto batch = h.engine->allocateBatchID(1);
+        EXPECT_TRUE(
+            h.engine->submitTransfer(batch, {makeWriteRequest(h, kSize)}).ok());
+        Transport::BatchProgress p;
+        EXPECT_TRUE(waitBatchQuiesced(*h.engine, batch, 5000, &p)) << what;
+        EXPECT_EQ(p.completed, 1u) << what;
+        EXPECT_EQ(pair.appliedFrom(0, kSize), kSize) << what;
+        EXPECT_TRUE(h.engine->freeBatchID(batch).ok()) << what;
+    };
+    run("v3 initiator, v3 receiver");
+    {
+        ScopedEnvVar proto("MC_TCP_PROTO", "2");
+        run("v2 initiator, v3 receiver");
+    }
+    {
+        // A receiver that advertises only v2: the initiator speaks v2.
+        auto desc = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+        ASSERT_NE(desc, nullptr);
+        const int saved = desc->tcp_proto_version;
+        desc->tcp_proto_version = 2;
+        run("v3 initiator, receiver advertising v2");
+        desc->tcp_proto_version = saved;
+    }
+    {
+        // A receiver of a build before v3 (opcode 0x40 unknown) with a v2
+        // initiator: today's behaviour.
+        ScopedEnvVar old_server("MC_TCP_TEST_SERVER_IGNORE_V3", "1");
+        ScopedEnvVar proto("MC_TCP_PROTO", "2");
+        run("v2 initiator, pre-v3 receiver");
+    }
+}
+
+// A stale descriptor sends v3 to a receiver that does not understand it: the
+// write fails (it is not reported done), nothing is applied, and the batch
+// is not quiesced -- that receiver cannot confirm anything.
+TEST(TcpBatchLimitsTest, V3ToPreV3ReceiverFailsAndStaysUnquiesced) {
+    constexpr size_t kSize = 256 << 10;
+    WritePair pair("4", kSize);
+    ASSERT_TRUE(pair.ok);
+    auto& h = pair.h;
+    ScopedEnvVar old_server("MC_TCP_TEST_SERVER_IGNORE_V3", "1");
+    auto batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(batch, {makeWriteRequest(h, kSize)}).ok());
+    ASSERT_TRUE(waitAllTerminal(h, batch, std::chrono::seconds(5)));
+    auto p = progressOf(h, batch);
+    EXPECT_EQ(p.failed, 1u);
+    EXPECT_EQ(pair.appliedFrom(0, kSize), size_t(0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    p = progressOf(h, batch);
+    EXPECT_FALSE(p.quiesced);
+    EXPECT_GE(p.unconfirmed, 1);
+    // Not freed: the engine's teardown may still run its cancel attempts.
+}
 #endif

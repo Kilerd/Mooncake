@@ -72,6 +72,10 @@ class TcpTransport : public Transport {
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
+    // Fails the batch's work still queued for a peer (its sessions in
+    // flight were cut by BatchControl::cancel()).
+    void onBatchCanceled(BatchID batch_id) override;
+
    private:
     int install(std::string &local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
@@ -150,6 +154,7 @@ class TcpTransport : public Transport {
         CONNECT_FAILED,
         SESSION_FAILED,
         SHUTDOWN,
+        EXPIRED,  // the batch's deadline passed or it was canceled
     };
 
     struct FailureCounters {
@@ -159,6 +164,7 @@ class TcpTransport : public Transport {
         std::atomic<uint64_t> runtime_unavailable{0};
         std::atomic<uint64_t> session_failed{0};
         std::atomic<uint64_t> shutdown{0};
+        std::atomic<uint64_t> expired{0};
     };
 
     struct TcpWorkItem {
@@ -166,6 +172,11 @@ class TcpTransport : public Transport {
         bool use_v2 = false;
         std::function<void()> continuation;
         std::chrono::steady_clock::time_point admission_deadline;
+        // The batch's limits (Transport::BatchControl) and protocol v3.
+        bool use_v3 = false;
+        int64_t deadline_ns = 0;  // steady_clock ns, 0 = none
+        BatchControl *control = nullptr;
+        std::shared_ptr<std::atomic<int64_t>> unconfirmed;
 
         TcpWorkItem() = default;
         TcpWorkItem(Slice *slice_arg, bool use_v2_arg,
@@ -177,8 +188,17 @@ class TcpTransport : public Transport {
             : slice(other.slice),
               use_v2(other.use_v2),
               continuation(std::move(other.continuation)),
-              admission_deadline(other.admission_deadline) {
+              admission_deadline(other.admission_deadline),
+              use_v3(other.use_v3),
+              deadline_ns(other.deadline_ns),
+              control(other.control),
+              unconfirmed(std::move(other.unconfirmed)) {
             other.slice = nullptr;
+        }
+        // Must not start or continue (deadline passed, or canceled).
+        bool expired(int64_t now_ns) const {
+            if (control && control->expired(now_ns)) return true;
+            return deadline_ns != 0 && now_ns >= deadline_ns;
         }
         TcpWorkItem &operator=(TcpWorkItem &&) = delete;
         TcpWorkItem(const TcpWorkItem &) = delete;
@@ -305,6 +325,13 @@ class TcpTransport : public Transport {
         bool retirement_scheduled = false;
         std::weak_ptr<ConnectionLaneState> owner_state;
         std::shared_ptr<FailureCounters> failure_counters;
+        // Batch limits: the next pump sweeps queued work whose batch was
+        // canceled or whose deadline passed; a timer at the earliest queued
+        // deadline requests such a sweep.
+        bool sweep_requested = false;
+        int64_t next_deadline_ns = 0;
+        std::shared_ptr<asio::steady_timer> deadline_timer;
+        uint64_t deadline_epoch = 0;
     };
 
     struct ConnectionLaneState {
@@ -402,7 +429,21 @@ class TcpTransport : public Transport {
     static void handleLaneTerminal(
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch,
-        TransferStatusEnum status, bool connection_clean) noexcept;
+        TransferStatusEnum status, bool connection_clean,
+        uint64_t unconfirmed_request = 0) noexcept;
+    // A v3 WRITE ended without its receiver's final status: counts as one
+    // unconfirmed attempt until the receiver answers a cancel of it.
+    static void confirmByCancel(asio::any_io_executor executor,
+                                const ConnectionKey &key, uint64_t request_id,
+                                std::shared_ptr<std::atomic<int64_t>> counter,
+                                int attempt = 0) noexcept;
+    static void noteUnconfirmed(TcpWorkItem &work, uint64_t request_id,
+                                const asio::any_io_executor &executor,
+                                const ConnectionKey &key) noexcept;
+    static void sweepExpiredLocked(PeerConnectionGroup &group, int64_t now_ns,
+                                   std::deque<TcpWorkItem> &expired);
+    static void armDeadlineTimerLocked(
+        const std::shared_ptr<PeerConnectionGroup> &group, int64_t deadline_ns);
     static void completeTerminalAction(TerminalAction action) noexcept;
     static void failWorkItem(
         TcpWorkItem work, WorkFailureReason reason,
@@ -430,9 +471,9 @@ class TcpTransport : public Transport {
     static void closeSocketNoThrow(
         const std::shared_ptr<asio::ip::tcp::socket> &socket) noexcept;
     void shutdownConnectionLanes();
-    void startTransferWithSocket(
-        TcpWorkItem work,
-        std::shared_ptr<asio::ip::tcp::socket> socket) noexcept;
+    void startTransferWithSocket(TcpWorkItem work,
+                                 std::shared_ptr<asio::ip::tcp::socket> socket,
+                                 const ConnectionKey &key) noexcept;
 
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     friend bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept;

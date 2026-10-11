@@ -111,36 +111,234 @@ static inline bool statusFrameValid(uint64_t frame) {
     return (frame & 0xFFFFFFFF00000000ull) == kStatusMagic;
 }
 
+// --- Deadlines, request ids and cancellation (protocol v3) ------------------
+// A v3 request sets kOpcodeV3Flag next to kOpcodeV2Flag (initiators set it
+// only when the target segment advertises tcp_proto_version >= 3, so a v2
+// server never sees it) and follows the 24-byte header with
+// SessionHeaderV3Ext: a request id chosen by the initiator and the time it
+// has left (microseconds, 0 = no deadline). The receiver's deadline is the
+// header's arrival plus that time. Status frames of a v3 request:
+// - kStatusOkV3: READ status before the data; WRITE ack once every chunk was
+//   applied. (A v2 kStatusOk in its place means a server that did not
+//   understand the request -- e.g. an older one behind a stale descriptor
+//   -- and fails it.)
+// - kStatusDeadline / kStatusCanceled: the receiver dropped the request's
+//   chunks from the moment its deadline passed / it was canceled, and
+//   applies nothing more of it.
+// - kStatusAddrRejected: as in v2; nothing was applied.
+// Opcode kOpcodeCancel (v3 only, on its own connection) names a request id:
+// the receiver makes sure nothing more of that request is applied -- also
+// when its header has not arrived yet -- and answers with the request's
+// final status (kStatusOkV3 if it had been applied in full) followed by the
+// request id (CancelReply, 16 bytes; a server that does not know v3 cannot
+// produce it). That answer is the initiator's proof that a cut WRITE is
+// quiesced at the receiver.
+static constexpr uint8_t kOpcodeV3Flag = 0x40;
+static constexpr uint8_t kOpcodeMask = 0x3f;
+static constexpr uint8_t kOpcodeCancel = 2;
+static constexpr uint64_t kStatusDeadline = kStatusMagic | 2;
+static constexpr uint64_t kStatusCanceled = kStatusMagic | 3;
+static constexpr uint64_t kStatusOkV3 = kStatusMagic | 4;
+
+struct SessionHeaderV3Ext {
+    uint64_t request_id;    // little-endian
+    uint64_t remaining_us;  // little-endian, 0 = no deadline
+};
+static_assert(sizeof(SessionHeaderV3Ext) == 16, "v3 header extension");
+
+struct CancelReply {
+    uint64_t status;      // little-endian, the request's final status
+    uint64_t request_id;  // little-endian, echoed
+};
+static_assert(sizeof(CancelReply) == 16, "v3 cancel reply");
+
+// The final statuses that prove a v3 request is quiesced at its receiver.
+static inline bool v3FinalStatus(uint64_t frame) {
+    return frame == kStatusOkV3 || frame == kStatusDeadline ||
+           frame == kStatusCanceled || frame == kStatusAddrRejected;
+}
+
+static uint64_t nextTcpRequestId() {
+    static std::atomic<uint64_t> next{[] {
+        std::random_device rd;
+        uint64_t v = (uint64_t(rd()) << 32) ^ rd();
+        return v ? v : 1;
+    }()};
+    uint64_t id = next.fetch_add(1, std::memory_order_relaxed);
+    if (id == 0) id = next.fetch_add(1, std::memory_order_relaxed);
+    return id;
+}
+
+static int64_t steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+// Tests: a server that does not know v3 (reads 0x40 as part of the opcode,
+// as servers before v3 did), and a delay before each chunk a server applies.
+static bool testServerIgnoresV3() {
+    const char* env = std::getenv("MC_TCP_TEST_SERVER_IGNORE_V3");
+    return env && env[0] == '1';
+}
+// Tests: initiators do not cut a transfer at its deadline (the receiver's
+// own deadline handling then shows on its own).
+static bool testClientNoCut() {
+    const char* env = std::getenv("MC_TCP_TEST_CLIENT_NO_CUT");
+    return env && env[0] == '1';
+}
+static void testServerChunkDelay() {
+    const char* env = std::getenv("MC_TCP_TEST_SERVER_CHUNK_DELAY_MS");
+    if (env && *env) {
+        const int ms = std::atoi(env);
+        if (ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }
+}
+#endif
+
+struct ServerSession;
+
+// v3 requests a server has seen, for cancellation by request id. Finished
+// requests (and ids canceled before their header arrived) are remembered
+// for a while so a late cancel still gets the final status.
+class ServerRequestRegistry {
+   public:
+    struct Running {
+        std::weak_ptr<ServerSession> session;
+        asio::any_io_executor executor;
+    };
+
+    // A request's header arrived. False when it was canceled before that:
+    // the request must be dropped.
+    bool begin(uint64_t id, std::weak_ptr<ServerSession> session,
+               asio::any_io_executor executor) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto done = done_.find(id);
+        if (done != done_.end()) return false;
+        running_[id] = Running{std::move(session), std::move(executor)};
+        return true;
+    }
+
+    void finish(uint64_t id, uint64_t status) {
+        std::lock_guard<std::mutex> lock(mu_);
+        running_.erase(id);
+        rememberLocked(id, status);
+    }
+
+    enum class Lookup { kRunning, kDone };
+    // For a cancel of |id|: the running request, or its final status (an
+    // unknown id is recorded as canceled now, so its header is dropped if it
+    // still arrives).
+    Lookup lookup(uint64_t id, Running* running, uint64_t* status) {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = running_.find(id);
+        if (it != running_.end()) {
+            *running = it->second;
+            return Lookup::kRunning;
+        }
+        auto done = done_.find(id);
+        if (done != done_.end()) {
+            *status = done->second;
+            return Lookup::kDone;
+        }
+        rememberLocked(id, kStatusCanceled);
+        *status = kStatusCanceled;
+        return Lookup::kDone;
+    }
+
+   private:
+    void rememberLocked(uint64_t id, uint64_t status) {
+        if (done_.emplace(id, status).second) order_.push_back(id);
+        while (order_.size() > kRemembered) {
+            done_.erase(order_.front());
+            order_.pop_front();
+        }
+    }
+
+    static constexpr size_t kRemembered = 1 << 16;
+    std::mutex mu_;
+    std::unordered_map<uint64_t, Running> running_;
+    std::unordered_map<uint64_t, uint64_t> done_;
+    std::deque<uint64_t> order_;
+};
+
 // Operational escape hatch: MC_TCP_PROTO=1 forces initiators to speak the
-// legacy unacknowledged framing even to v2-capable servers. Also used by
-// tests to cover the mixed-version matrix in one process.
-static bool forceLegacyTcpProto() {
+// legacy unacknowledged framing even to v2-capable servers, MC_TCP_PROTO=2
+// the v2 framing without deadlines and request ids even to v3-capable ones.
+// Also used by tests to cover the mixed-version matrix in one process.
+static int maxTcpProto() {
     // Read per call (startTransfer already does metadata lookups; getenv is
-    // noise) so tests can cover both protocol modes in one process.
+    // noise) so tests can cover every protocol mode in one process.
     const char* env = std::getenv("MC_TCP_PROTO");
-    return env && env[0] == '1' && env[1] == '\0';
+    if (env && (env[0] == '1' || env[0] == '2') && env[1] == '\0')
+        return env[0] - '0';
+    return 3;
 }
 
 // Server-side session: handles transfer requests on a persistent connection.
 // The session owns the socket; ending the callback chain without rearming
 // (start()/next handler) drops the last reference and closes the connection.
 struct ServerSession : public std::enable_shared_from_this<ServerSession> {
-    explicit ServerSession(std::shared_ptr<tcpsocket> socket,
-                           ValidateAddrFn validate_addr)
+    explicit ServerSession(
+        std::shared_ptr<tcpsocket> socket, ValidateAddrFn validate_addr,
+        std::shared_ptr<ServerRequestRegistry> registry = nullptr)
         : socket_(std::move(socket)),
-          validate_addr_(std::move(validate_addr)) {}
+          validate_addr_(std::move(validate_addr)),
+          registry_(std::move(registry)) {}
+
+    ~ServerSession() {
+        // A v3 request this session never finished (connection lost, or
+        // cut by a cancel) applies nothing more once the session is gone.
+        if (registry_ && request_open_)
+            registry_->finish(request_id_, kStatusCanceled);
+    }
 
     std::shared_ptr<tcpsocket> socket_;
     ValidateAddrFn validate_addr_;
+    std::shared_ptr<ServerRequestRegistry> registry_;
     SessionHeader header_;
     uint64_t total_transferred_bytes_;
     char* local_buffer_;
     bool v2_ = false;
     uint64_t status_frame_;
+    // v3 request state (all on this session's executor).
+    bool v3_ = false;
+    SessionHeaderV3Ext ext_{};
+    uint64_t request_id_ = 0;
+    bool request_open_ = false;  // registered, not finished yet
+    std::chrono::steady_clock::time_point deadline_{};
+    bool has_deadline_ = false;
+    bool canceled_ = false;     // by a cancel of this request
+    uint64_t drop_status_ = 0;  // kStatusDeadline/kStatusCanceled once dropping
+    std::vector<char> bounce_;
+    CancelReply cancel_reply_{};
 
     void start() {
         total_transferred_bytes_ = 0;
+        v3_ = false;
+        request_open_ = false;
+        has_deadline_ = false;
+        canceled_ = false;
+        drop_status_ = 0;
         readHeader();
+    }
+
+    // A cancel of this session's request: nothing more of it is applied
+    // from now on (every apply runs on this executor and checks the flag),
+    // and the connection is closed so that no read waits for a body the
+    // initiator stopped sending.
+    void cancelByPeer() {
+        canceled_ = true;
+        if (request_open_) {
+            request_open_ = false;
+            if (registry_) registry_->finish(request_id_, kStatusCanceled);
+        }
+        if (socket_ && socket_->is_open()) {
+            asio::error_code ec;
+            socket_->cancel(ec);
+            socket_->close(ec);
+        }
     }
 
    private:
@@ -159,6 +357,36 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                           });
     }
 
+    // Answer a cancel request (and end this session).
+    void sendCancelReply(uint64_t status) {
+        cancel_reply_.status = htole64(status);
+        cancel_reply_.request_id = htole64(request_id_);
+        auto self(shared_from_this());
+        asio::async_write(*socket_,
+                          asio::buffer(&cancel_reply_, sizeof(cancel_reply_)),
+                          [self](const asio::error_code&, std::size_t) {});
+    }
+
+    // The v3 request ended: |status| is final for a later cancel.
+    void finishRequest(uint64_t status) {
+        if (!request_open_) return;
+        request_open_ = false;
+        if (registry_) registry_->finish(request_id_, status);
+    }
+
+    // True when the chunk at hand must be dropped (v3: canceled, or the
+    // receiver's deadline has passed).
+    bool dropNow() {
+        if (drop_status_) return true;
+        if (canceled_) {
+            drop_status_ = kStatusCanceled;
+        } else if (has_deadline_ &&
+                   std::chrono::steady_clock::now() >= deadline_) {
+            drop_status_ = kStatusDeadline;
+        }
+        return drop_status_ != 0;
+    }
+
     void readHeader() {
         auto self(shared_from_this());
         asio::async_read(
@@ -173,33 +401,113 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                     }
                     return;
                 }
-
                 v2_ = (header_.opcode & kOpcodeV2Flag) != 0;
-                const uint8_t opcode = header_.opcode & ~kOpcodeV2Flag;
-                local_buffer_ = (char*)(le64toh(header_.addr));
-                uint64_t size = le64toh(header_.size);
-                if (validate_addr_ &&
-                    !validate_addr_((uint64_t)local_buffer_, size)) {
-                    LOG(ERROR) << "ServerSession: remote-supplied address 0x"
-                               << std::hex << (uint64_t)local_buffer_
-                               << std::dec << " with size " << size
-                               << " is not within any registered buffer";
-                    // v2 initiators learn of the rejection; v1 initiators
-                    // only see the connection close (and, for small WRITEs,
-                    // may have already reported success — the defect v2
-                    // exists to fix).
-                    if (v2_) sendStatus(kStatusAddrRejected, nullptr);
+                v3_ = v2_ && (header_.opcode & kOpcodeV3Flag) != 0;
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+                if (testServerIgnoresV3()) v3_ = false;
+#endif
+                if (!v3_) {
+                    handleRequest();
                     return;
                 }
-                if (opcode == (uint8_t)TransferRequest::WRITE) {
-                    readBody();
-                } else if (v2_) {
-                    // READ, v2: status frame precedes the data.
-                    sendStatus(kStatusOk, [this] { writeBody(); });
-                } else {
-                    writeBody();
-                }
+                asio::async_read(*socket_, asio::buffer(&ext_, sizeof(ext_)),
+                                 [this, self](const asio::error_code& ec2,
+                                              std::size_t len2) {
+                                     if (ec2 || len2 != sizeof(ext_)) return;
+                                     handleRequest();
+                                 });
             });
+    }
+
+    void handleRequest() {
+        uint8_t opcode = header_.opcode & ~kOpcodeV2Flag;
+        if (v3_) {
+            opcode = header_.opcode & kOpcodeMask;
+            request_id_ = le64toh(ext_.request_id);
+            const uint64_t remaining_us = le64toh(ext_.remaining_us);
+            has_deadline_ = remaining_us != 0;
+            if (has_deadline_)
+                deadline_ = std::chrono::steady_clock::now() +
+                            std::chrono::microseconds(remaining_us);
+            if (opcode == kOpcodeCancel) {
+                handleCancel();
+                return;
+            }
+        }
+        local_buffer_ = (char*)(le64toh(header_.addr));
+        uint64_t size = le64toh(header_.size);
+        if (validate_addr_ && !validate_addr_((uint64_t)local_buffer_, size)) {
+            LOG(ERROR) << "ServerSession: remote-supplied address 0x"
+                       << std::hex << (uint64_t)local_buffer_ << std::dec
+                       << " with size " << size
+                       << " is not within any registered buffer";
+            // v2 initiators learn of the rejection; v1 initiators only see
+            // the connection close (and, for small WRITEs, may have already
+            // reported success — the defect v2 exists to fix).
+            if (v3_ && registry_)
+                registry_->finish(request_id_, kStatusAddrRejected);
+            if (v2_) sendStatus(kStatusAddrRejected, nullptr);
+            return;
+        }
+        if (v3_ && registry_) {
+            request_open_ = true;
+            if (!registry_->begin(request_id_, weak_from_this(),
+                                  socket_->get_executor())) {
+                // Canceled before its header arrived: drop all of it.
+                request_open_ = false;
+                canceled_ = true;
+            }
+        }
+        if (opcode == (uint8_t)TransferRequest::WRITE) {
+            readBody();
+        } else if (v3_) {
+            if (dropNow()) {
+                finishRequest(drop_status_);
+                sendStatus(drop_status_, nullptr);
+                return;
+            }
+            sendStatus(kStatusOkV3, [this] { writeBody(); });
+        } else if (v2_) {
+            // READ, v2: status frame precedes the data.
+            sendStatus(kStatusOk, [this] { writeBody(); });
+        } else {
+            writeBody();
+        }
+    }
+
+    // A cancel request (its own connection): make sure nothing more of the
+    // named request is applied, then answer with its final status.
+    void handleCancel() {
+        auto self(shared_from_this());
+        if (!registry_) {
+            sendCancelReply(kStatusCanceled);
+            return;
+        }
+        ServerRequestRegistry::Running running;
+        uint64_t status = 0;
+        if (registry_->lookup(request_id_, &running, &status) ==
+            ServerRequestRegistry::Lookup::kDone) {
+            sendCancelReply(status);
+            return;
+        }
+        auto target = running.session.lock();
+        if (!target) {
+            registry_->finish(request_id_, kStatusCanceled);
+            sendCancelReply(kStatusCanceled);
+            return;
+        }
+        // Cut it on its own executor (serial with its applies), then answer
+        // from ours.
+        auto reply_executor = socket_->get_executor();
+        try {
+            asio::post(running.executor, [target, self, reply_executor] {
+                target->cancelByPeer();
+                asio::post(reply_executor,
+                           [self] { self->sendCancelReply(kStatusCanceled); });
+            });
+        } catch (...) {
+            // No answer: the initiator keeps the request unconfirmed.
+        }
     }
 
     void writeBody() {
@@ -211,7 +519,14 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
             // Transfer complete, wait for next request on this connection
+            finishRequest(kStatusOkV3);
             start();
+            return;
+        }
+        if (v3_ && dropNow()) {
+            // Past the deadline or canceled: stop sending; the initiator
+            // sees the connection close.
+            finishRequest(drop_status_);
             return;
         }
 
@@ -268,6 +583,33 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             });
     }
 
+    // Applies one received chunk to the destination; false on a CUDA error.
+    bool applyChunk(char* dst, const char* src, size_t n, int cuda_device) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+        if (cuda_device >= 0) {
+            cudaSetDevice(cuda_device);
+#ifdef USE_MACA
+            cudaError_t cuda_status = copyTcpCudaMemory(dst, src, n);
+#else
+            cudaError_t cuda_status =
+                cudaMemcpy(dst, src, n, cudaMemcpyDefault);
+#endif
+            if (cuda_status != cudaSuccess) {
+                LOG(ERROR) << "ServerSession::readBody failed to copy to CUDA "
+                              "memory. "
+                           << "Error: " << cudaGetErrorString(cuda_status);
+                return false;
+            }
+            return true;
+        }
+#endif
+        (void)cuda_device;
+        if (dst != src) memcpy(dst, src, n);
+        return true;
+    }
+
     void readBody() {
         auto self(shared_from_this());
         uint64_t size = le64toh(header_.size);
@@ -279,8 +621,15 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             // Destination memory now holds the complete payload. Under v2,
             // acknowledge before accepting the next request — this is what
             // makes the initiator's COMPLETED mean "applied at the
-            // destination" rather than "left my socket buffer".
-            if (v2_) {
+            // destination" rather than "left my socket buffer". Under v3 the
+            // ack is the request's final status: applied in full, or
+            // dropped from the deadline / cancel on.
+            if (v3_) {
+                const uint64_t status =
+                    drop_status_ ? drop_status_ : kStatusOkV3;
+                finishRequest(status);
+                sendStatus(status, [this] { start(); });
+            } else if (v2_) {
                 sendStatus(kStatusOk, [this] { start(); });
             } else {
                 start();
@@ -288,26 +637,32 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             return;
         }
 
-        char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
-
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
-        if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
-        }
 #endif
+        // Payload lands in a bounce buffer, applied after the deadline /
+        // cancel check, when the device needs one or a v3 deadline is set
+        // (or the request is being dropped); otherwise straight in place.
+        const bool bounce = cuda_device >= 0 || (v3_ && has_deadline_) ||
+                            (v3_ && (canceled_ || drop_status_));
+        char* dram_buffer = addr + total_transferred_bytes_;
+        if (bounce) {
+            if (bounce_.size() < buffer_size) bounce_.resize(buffer_size);
+            dram_buffer = bounce_.data();
+        }
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, self](
+            [this, addr, dram_buffer, cuda_device, bounce, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 if (ec) {
                     // If client closed connection (EOF), this is normal - don't
                     // log
-                    if (ec.value() != asio::error::eof) {
+                    if (ec.value() != asio::error::eof &&
+                        ec != asio::error::operation_aborted) {
                         LOG(WARNING)
                             << "ServerSession::readBody failed. "
                             << "Attempt to read data "
@@ -316,35 +671,20 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << ". Error: " << ec.message()
                             << " (value: " << ec.value() << ")";
                     }
-                    if (cuda_device >= 0) delete[] dram_buffer;
                     return;  // Connection will be closed
                 }
-
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
-                if (cuda_device >= 0) {
-                    cudaSetDevice(cuda_device);
-#ifdef USE_MACA
-                    cudaError_t cuda_status =
-                        copyTcpCudaMemory(addr + total_transferred_bytes_,
-                                          dram_buffer, transferred_bytes);
-#else
-                    cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+                // Tests: the chunk "arrives" this much later.
+                testServerChunkDelay();
 #endif
-                    if (cuda_status != cudaSuccess) {
-                        LOG(ERROR)
-                            << "ServerSession::readBody failed to copy to CUDA "
-                               "memory. "
-                            << "Error: " << cudaGetErrorString(cuda_status);
-                        delete[] dram_buffer;
+                // A chunk that arrives after the deadline, or after a
+                // cancel, is dropped; its apply starts only before them.
+                if (bounce && !(v3_ && dropNow())) {
+                    if (!applyChunk(addr + total_transferred_bytes_,
+                                    dram_buffer, transferred_bytes,
+                                    cuda_device))
                         return;  // Connection will be closed
-                    }
-                    delete[] dram_buffer;
                 }
-#endif
                 total_transferred_bytes_ += transferred_bytes;
                 readBody();
             });
@@ -353,8 +693,12 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
 // Client-side session: initiates one transfer request
 struct ClientSession : public std::enable_shared_from_this<ClientSession> {
+    // |unconfirmed_request|: a v3 WRITE that ended without its receiver's
+    // final status (cut mid-body); the caller asks the receiver to confirm
+    // (kOpcodeCancel) before the attempt counts as quiesced. 0 otherwise.
     using OnTerminal =
-        std::function<void(TransferStatusEnum, bool connection_clean)>;
+        std::function<void(TransferStatusEnum, bool connection_clean,
+                           uint64_t unconfirmed_request)>;
 
     explicit ClientSession(std::shared_ptr<tcpsocket> socket, bool use_v2,
                            OnTerminal on_terminal)
@@ -419,6 +763,28 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     bool terminal_reported_ = false;
     OnTerminal on_terminal_;
 
+    // Batch limits and protocol v3 (deadline, cancel, request id).
+    bool v3_ = false;
+    SessionHeaderV3Ext ext_{};
+    uint64_t request_id_ = 0;
+    int64_t deadline_ns_ = 0;  // steady_clock ns, 0 = none
+    Transport::BatchControl* control_ = nullptr;
+    uint64_t aborter_id_ = 0;
+    bool header_initiated_ = false;
+    bool final_frame_ = false;  // v3: the receiver's final status arrived
+    bool cut_ = false;
+    std::optional<asio::steady_timer> total_timer_;
+    std::vector<char> bounce_;
+
+    // Before initiate(): speak v3 (the peer advertises it; implies v2), the
+    // batch's deadline and its control (cancel).
+    void setLimits(bool v3, int64_t deadline_ns,
+                   Transport::BatchControl* control) {
+        v3_ = v3 && v2_;
+        deadline_ns_ = deadline_ns;
+        control_ = control;
+    }
+
     void initiate(void* buffer, uint64_t dest_addr, size_t size,
                   TransferRequest::OpCode opcode) {
         local_buffer_ = (char*)buffer;
@@ -426,7 +792,81 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         header_.size = htole64(size);
         header_.opcode = (uint8_t)opcode | (v2_ ? kOpcodeV2Flag : 0);
         total_transferred_bytes_ = 0;
+        auto self(shared_from_this());
+        if (limitsExpired()) {
+            // Nothing is sent. Not inline: callers may hold locks here.
+            asio::post(socket_->get_executor(), [this, self] {
+                finalize(TransferStatusEnum::FAILED, false);
+            });
+            return;
+        }
+        if (v3_) {
+            header_.opcode |= kOpcodeV3Flag;
+            request_id_ = nextTcpRequestId();
+            ext_.request_id = htole64(request_id_);
+            uint64_t remaining_us = 0;
+            if (deadline_ns_) {
+                const int64_t left = deadline_ns_ - steadyNowNs();
+                remaining_us = left > 1000 ? uint64_t(left / 1000) : 1;
+            }
+            ext_.remaining_us = htole64(remaining_us);
+        }
+        if (control_) {
+            std::weak_ptr<ClientSession> weak = self;
+            auto executor = socket_->get_executor();
+            aborter_id_ = control_->addAborter([weak, executor] {
+                asio::post(executor, [weak] {
+                    if (auto session = weak.lock()) session->cut("canceled");
+                });
+            });
+            if (aborter_id_ == 0) {
+                asio::post(socket_->get_executor(),
+                           [this, self] { cut("canceled"); });
+            }
+        }
+        bool arm_total = deadline_ns_ != 0;
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+        if (testClientNoCut()) arm_total = false;
+#endif
+        if (arm_total) {
+            total_timer_.emplace(socket_->get_executor());
+            total_timer_->expires_at(std::chrono::steady_clock::time_point(
+                std::chrono::nanoseconds(deadline_ns_)));
+            total_timer_->async_wait([this, self](const asio::error_code& ec) {
+                if (ec == asio::error::operation_aborted) return;
+                cut("total deadline reached");
+            });
+        }
         writeHeader();
+    }
+
+    bool limitsExpired() const {
+        const int64_t now = steadyNowNs();
+        if (control_ && control_->expired(now)) return true;
+        return deadline_ns_ && now >= deadline_ns_;
+    }
+
+    // The batch's deadline passed or it was canceled: stop like a committed
+    // progress timeout -- the socket is closed, and the pending operation
+    // finalizes the session (a WRITE only once its body buffer is quiescent).
+    void cut(const char* why) {
+        if (terminal_reported_ || cut_) return;
+        cut_ = true;
+        progress_timeout_committed_ = true;
+        progress_deadline_disarmed_ = true;
+        ++progress_epoch_;
+        if (progress_epoch_ == 0) ++progress_epoch_;
+        if ((header_.opcode & kOpcodeMask) ==
+            static_cast<uint8_t>(TransferRequest::WRITE)) {
+            write_abort_requested_ = true;
+        }
+        VLOG(1) << "ClientSession: " << why << "; cutting the transfer";
+        if (socket_ && socket_->is_open()) {
+            asio::error_code ec;
+            socket_->cancel(ec);
+            socket_->close(ec);
+        }
+        if (!header_initiated_) finalize(TransferStatusEnum::FAILED, false);
     }
 
     void cancel() noexcept {
@@ -507,7 +947,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         progress_deadline_disarmed_ = true;
         ++progress_epoch_;
         if (progress_epoch_ == 0) ++progress_epoch_;
-        if ((header_.opcode & ~kOpcodeV2Flag) ==
+        if ((header_.opcode & kOpcodeMask) ==
             static_cast<uint8_t>(TransferRequest::WRITE)) {
             write_abort_requested_ = true;
         }
@@ -562,11 +1002,26 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         terminal_reported_ = true;
         cancelStatusDeadline();
         cancelProgressDeadline();
+        if (control_) control_->removeAborter(aborter_id_);
+        aborter_id_ = 0;
+        if (total_timer_) {
+            asio::error_code ec;
+            total_timer_->cancel(ec);
+        }
+        // A v3 WRITE whose header went out but whose final status did not
+        // come back may still be applied at the receiver until it confirms.
+        const uint64_t unconfirmed =
+            (v3_ && status != TransferStatusEnum::COMPLETED &&
+             header_initiated_ && !final_frame_ &&
+             (header_.opcode & kOpcodeMask) ==
+                 static_cast<uint8_t>(TransferRequest::WRITE))
+                ? request_id_
+                : 0;
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
         (void)invokeSessionProgressHook(kSessionTerminal, clean);
 #endif
         auto on_terminal = std::move(on_terminal_);
-        if (on_terminal) on_terminal(status, clean);
+        if (on_terminal) on_terminal(status, clean, unconfirmed);
     }
 
     // Abort a v2 WRITE and cancel any body operation. If asio still owns the
@@ -583,10 +1038,18 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
     void writeHeader() {
         auto self(shared_from_this());
+        // v3: the header and its extension in one write.
+        const size_t header_bytes =
+            sizeof(SessionHeader) + (v3_ ? sizeof(ext_) : 0);
+        std::array<asio::const_buffer, 2> header_buffers = {
+            asio::buffer(&header_, sizeof(SessionHeader)),
+            asio::buffer(&ext_, v3_ ? sizeof(ext_) : 0)};
+        header_initiated_ = true;
         asio::async_write(
-            *socket_, asio::buffer(&header_, sizeof(SessionHeader)),
-            [this, self](const asio::error_code& ec, std::size_t len) {
-                if (ec || len != sizeof(SessionHeader)) {
+            *socket_, header_buffers,
+            [this, self, header_bytes](const asio::error_code& ec,
+                                       std::size_t len) {
+                if (ec || len != header_bytes) {
                     LOG(ERROR)
                         << "ClientSession::writeHeader failed. Error: "
                         << ec.message() << " (value: " << ec.value() << ")"
@@ -595,7 +1058,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     return;
                 }
                 if (!acceptProgress()) {
-                    if ((header_.opcode & ~kOpcodeV2Flag) ==
+                    if ((header_.opcode & kOpcodeMask) ==
                         static_cast<uint8_t>(TransferRequest::WRITE)) {
                         abortWrite();
                     } else {
@@ -603,7 +1066,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     }
                     return;
                 }
-                if ((header_.opcode & ~kOpcodeV2Flag) ==
+                if ((header_.opcode & kOpcodeMask) ==
                     (uint8_t)TransferRequest::WRITE) {
                     if (v2_) readWriteAck();  // concurrent with the body
                     writeBody();
@@ -647,10 +1110,14 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
-                if (frame != kStatusOk) {
+                if (frame != (v3_ ? kStatusOkV3 : kStatusOk)) {
                     LOG(ERROR) << "ClientSession: READ rejected by server, "
                                   "status "
-                               << (frame & 0xFFFFFFFFull);
+                               << (frame & 0xFFFFFFFFull)
+                               << (v3_ && frame == kStatusOk
+                                       ? " (peer did not understand protocol "
+                                         "v3: stale descriptor?)"
+                                       : "");
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
@@ -702,10 +1169,26 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     abortWrite();
                     return;
                 }
-                if (frame != kStatusOk) {
-                    LOG(ERROR) << "ClientSession: WRITE rejected by server, "
-                                  "status "
-                               << (frame & 0xFFFFFFFFull);
+                if (v3_ && v3FinalStatus(frame)) final_frame_ = true;
+                if (frame != (v3_ ? kStatusOkV3 : kStatusOk)) {
+                    if (v3_ && frame == kStatusOk) {
+                        LOG(ERROR) << "ClientSession: WRITE answered with a "
+                                      "v2 status: the peer did not "
+                                      "understand protocol v3 (stale "
+                                      "descriptor?)";
+                    } else if (frame == kStatusDeadline ||
+                               frame == kStatusCanceled) {
+                        LOG(WARNING)
+                            << "ClientSession: WRITE dropped by the "
+                               "receiver ("
+                            << (frame == kStatusDeadline ? "deadline passed"
+                                                         : "canceled")
+                            << ")";
+                    } else {
+                        LOG(ERROR) << "ClientSession: WRITE rejected by "
+                                      "server, status "
+                                   << (frame & 0xFFFFFFFFull);
+                    }
                     abortWrite();
                     return;
                 }
@@ -744,13 +1227,20 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
             dram_buffer = new char[buffer_size];
         }
 #endif
+        // With a deadline, host memory is read through a bounce buffer too,
+        // so that a chunk that arrives after it is never applied.
+        const bool host_bounce = cuda_device < 0 && deadline_ns_ != 0;
+        if (host_bounce) {
+            if (bounce_.size() < buffer_size) bounce_.resize(buffer_size);
+            dram_buffer = bounce_.data();
+        }
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, self](
+            [this, addr, dram_buffer, cuda_device, host_bounce, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 if (ec) {
-                    LOG(ERROR)
+                    LOG_IF(ERROR, !cut_)
                         << "ClientSession::readBody failed. "
                         << "Attempt to read data " << static_cast<void*>(addr)
                         << " using buffer " << static_cast<void*>(dram_buffer)
@@ -774,7 +1264,8 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     progress_accepted = acceptProgress();
 #endif
                 }
-                if (!progress_accepted) {
+                if (!progress_accepted || (deadline_ns_ && limitsExpired())) {
+                // Past the deadline: this chunk is not applied.
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
@@ -783,6 +1274,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
+                if (host_bounce)
+                    memcpy(addr + total_transferred_bytes_, dram_buffer,
+                           transferred_bytes);
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
@@ -842,7 +1336,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 }
             } else {
                 // v1: no acknowledgment exists in the protocol; this only
-                // means the payload left the initiator (#2086).
+                // means the payload left the initiator (#2086). (Nor can a
+                // v1 receiver confirm anything: such a COMPLETED counts as
+                // quiesced, as before.)
                 finalize(TransferStatusEnum::COMPLETED, true);
             }
             return;
@@ -886,13 +1382,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 if (cuda_device >= 0) {
                     delete[] dram_buffer;
                 }
-                if (ec) {
+                if (ec && !cut_) {
                     LOG(ERROR)
                         << "ClientSession::writeBody failed. "
                         << "Attempt to write data " << static_cast<void*>(addr)
                         << " using buffer " << static_cast<void*>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")";
+                    abortWrite();
+                    return;
+                }
+                if (ec) {  // cut (deadline or cancel): expected
                     abortWrite();
                     return;
                 }
@@ -978,8 +1478,8 @@ struct TcpContext {
                 socket.set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
                 auto socket_ptr =
                     std::make_shared<tcpsocket>(std::move(socket));
-                auto session =
-                    std::make_shared<ServerSession>(socket_ptr, validate_addr_);
+                auto session = std::make_shared<ServerSession>(
+                    socket_ptr, validate_addr_, registry);
                 try {
                     asio::post(socket_ptr->get_executor(),
                                [session] { session->start(); });
@@ -999,4 +1499,7 @@ struct TcpContext {
     asio::ip::tcp::acceptor acceptor;
     ValidateAddrFn validate_addr_;
     std::atomic<size_t> next_io_context{0};
+    // v3 requests seen by this server, for cancellation by request id.
+    std::shared_ptr<ServerRequestRegistry> registry =
+        std::make_shared<ServerRequestRegistry>();
 };
