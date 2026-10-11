@@ -35,6 +35,21 @@ void cancelTimerNoThrow(
     timer->cancel(ec);
 }
 
+// is_open() describes only the local descriptor. While a lane sits idle the
+// peer (or something on the path) may close its connection, and a request
+// sent on it then fails. A healthy idle connection has nothing to read, so a
+// non-blocking peek must find no data: end of stream, a socket error or
+// unsolicited bytes all mean it cannot carry another request.
+bool idleLaneSocketReusable(asio::ip::tcp::socket& socket) noexcept {
+    char byte;
+    while (true) {
+        const ssize_t received =
+            ::recv(socket.native_handle(), &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (received < 0 && errno == EINTR) continue;
+        return received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+    }
+}
+
 // Tracks only whether executor-posted cancellation actions ran. It is not an
 // asynchronous-handler quiescence barrier; stop/join provides that boundary.
 struct LaneCancellationPostTracker {
@@ -711,10 +726,16 @@ void TcpTransport::runGroupPump(
         std::shared_ptr<ConnectionLane> lane;
         uint64_t epoch;
     };
+    struct StaleSocket {
+        std::shared_ptr<ConnectionLane> lane;
+        std::shared_ptr<asio::ip::tcp::socket> socket;
+    };
     std::array<LaneStart, kMaxTcpLanesPerPeer> sessions;
     std::array<LaneStart, kMaxTcpLanesPerPeer> connects;
+    std::array<StaleSocket, kMaxTcpLanesPerPeer> stale_sockets;
     size_t session_count = 0;
     size_t connect_count = 0;
+    size_t stale_count = 0;
     std::deque<TcpWorkItem> failed;
     std::deque<TcpWorkItem> expired;
     std::deque<TcpWorkItem> runtime_failed;
@@ -741,9 +762,18 @@ void TcpTransport::runGroupPump(
         for (const auto& lane : group->lanes) {
             if (group->queue.empty()) break;
             if (lane->state != LaneState::IDLE) continue;
-            if (!lane->socket || !lane->socket->is_open()) {
+            // An idle lane holds no session, so this group lock serialises
+            // every use of its socket and peeking from here is safe.
+            if (!lane->socket || !lane->socket->is_open() ||
+                !idleLaneSocketReusable(*lane->socket)) {
+                if (lane->socket)
+                    stale_sockets[stale_count++] = {lane,
+                                                    std::move(lane->socket)};
                 lane->socket.reset();
                 lane->state = LaneState::DISCONNECTED;
+                // Not tried in this connect round, so it is reconnected
+                // right away instead of failing work or waiting a cooldown.
+                lane->last_connect_round = 0;
                 continue;
             }
 
@@ -854,6 +884,16 @@ void TcpTransport::runGroupPump(
             followup_pump_epoch = requestGroupPumpLocked(*group);
     }
 
+    if (stale_count != 0) {
+        LOG(INFO) << "TCP lane connection to " << group->key.host << ":"
+                  << group->key.port << " closed while idle; reconnecting "
+                  << stale_count << " lane(s)";
+    }
+    // A socket belongs to its lane's io thread; close it there.
+    for (size_t i = 0; i < stale_count; ++i) {
+        releaseLaneObjects(stale_sockets[i].lane->executor, nullptr, nullptr,
+                           std::move(stale_sockets[i].socket));
+    }
     cancelTimerNoThrow(admission_timer_to_cancel);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     if (retry_armed) invokeLaneObserverHook(kLaneRetryArmed, 0, 0, 0, false);

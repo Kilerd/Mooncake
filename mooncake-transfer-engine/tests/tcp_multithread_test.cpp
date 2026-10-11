@@ -655,6 +655,94 @@ TEST(TcpMultiThreadTest, WorkQueuedDuringReconnectCooldownStillFails) {
     }
 }
 
+// A burst to one peer overflows its bounded queue, so some slices fail with
+// queue-full, and the peer then goes quiet. A transfer submitted after the
+// pause, well past the admission timeout, must complete: a rejection must not
+// leave the peer's lanes idle with work stranded in the queue, which would
+// fail every later transfer to that peer with queue-full or queue timeout.
+TEST(TcpMultiThreadTest, TransferAfterQueueFullBurstAndIdleCompletes) {
+    constexpr size_t kBatches = 40;
+    constexpr size_t kPerBatch = 80;  // queue + pending: the direct path
+    constexpr size_t kBlockSize = 4096;
+    constexpr size_t kBlocks = kBatches * kPerBatch;
+    ScopedEnvVar queue("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "64");
+    ScopedEnvVar pending("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER", "16");
+    ScopedEnvVar admission("MC_TCP_ADMISSION_TIMEOUT_MS", "200");
+    for (const char* io_threads : {"1", "4"}) {
+        SCOPED_TRACE(std::string("io threads ") + io_threads);
+        ScopedEnvVar io("MC_TCP_IO_THREADS", io_threads);
+        Peer server;
+        server.init(std::string("127.0.0.2:1842") + io_threads,
+                    kBlocks * kBlockSize);
+        ASSERT_TRUE(server.ok);
+        Peer client;
+        client.init(std::string("127.0.0.2:1843") + io_threads,
+                    kBlocks * kBlockSize, &server);
+        ASSERT_TRUE(client.ok);
+
+        // One thread submits every batch before waiting on any of them.
+        std::vector<Transport::BatchID> batches;
+        for (size_t b = 0; b < kBatches; ++b) {
+            std::vector<TransferRequest> requests;
+            for (size_t i = 0; i < kPerBatch; ++i) {
+                const size_t block = b * kPerBatch + i;
+                requests.push_back(
+                    makeRequest(client, TransferRequest::WRITE,
+                                client.base() + block * kBlockSize,
+                                block * kBlockSize, kBlockSize));
+            }
+            auto batch = client.engine->allocateBatchID(kPerBatch);
+            ASSERT_TRUE(client.engine->submitTransfer(batch, requests).ok());
+            batches.push_back(batch);
+        }
+        size_t completed = 0, failed = 0, pending_after = 0;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        for (auto batch : batches) {
+            for (size_t i = 0; i < kPerBatch; ++i) {
+                const auto left =
+                    std::max(std::chrono::seconds(0),
+                             std::chrono::duration_cast<std::chrono::seconds>(
+                                 deadline - std::chrono::steady_clock::now()));
+                switch (waitTask(client.engine.get(), batch, i, left)) {
+                    case TransferStatusEnum::COMPLETED:
+                        ++completed;
+                        break;
+                    case TransferStatusEnum::FAILED:
+                        ++failed;
+                        break;
+                    default:
+                        ++pending_after;
+                }
+            }
+        }
+        if (pending_after == 0)
+            for (auto batch : batches) (void)client.engine->freeBatchID(batch);
+        LOG(INFO) << "burst: completed=" << completed << " failed=" << failed
+                  << " pending=" << pending_after;
+        EXPECT_EQ(pending_after, 0u);
+        EXPECT_GT(failed, 0u) << "the burst never overflowed the queue";
+
+        // Idle well past the admission timeout, then a small transfer.
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        constexpr size_t kSmall = 16;
+        std::vector<TransferRequest> small;
+        for (size_t i = 0; i < kSmall; ++i) {
+            fillPattern(client.base() + i * kBlockSize, kBlockSize,
+                        static_cast<uint32_t>(1000 + i));
+            small.push_back(makeRequest(client, TransferRequest::WRITE,
+                                        client.base() + i * kBlockSize,
+                                        i * kBlockSize, kBlockSize));
+        }
+        const auto start = std::chrono::steady_clock::now();
+        EXPECT_TRUE(
+            runBatch(client.engine.get(), small, std::chrono::seconds(10)));
+        EXPECT_LT(std::chrono::steady_clock::now() - start,
+                  std::chrono::seconds(5));
+        EXPECT_EQ(memcmp(client.base(), server.base(), kSmall * kBlockSize), 0);
+    }
+}
+
 namespace {
 // Fails a test that hangs instead of letting it block the whole run: a
 // transport hang must surface as a failure with a clear message.

@@ -1288,6 +1288,12 @@ class ReusingWriteServer {
     bool ok() const { return ok_; }
     uint16_t port() const { return port_; }
     int acceptedCount() const { return accepted_count_.load(); }
+    // Closes every accepted connection from the server side, as a peer that
+    // drops idle connections would.
+    void closeClientConnections() {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        for (int fd : accepted_fds_) (void)shutdown(fd, SHUT_RDWR);
+    }
     int activeAcceptedCount() const {
         std::lock_guard<std::mutex> lock(connection_mutex_);
         return static_cast<int>(accepted_fds_.size());
@@ -1411,12 +1417,14 @@ class ReusingWriteServer {
             request_count_.fetch_add(1);
         }
         {
+            // Close under the lock so closeClientConnections() never shuts
+            // down a descriptor number that has already been reused.
             std::lock_guard<std::mutex> lock(connection_mutex_);
             auto it = std::find(accepted_fds_.begin(), accepted_fds_.end(), fd);
             if (it != accepted_fds_.end()) accepted_fds_.erase(it);
+            close(fd);
         }
         connection_cv_.notify_all();
-        close(fd);
     }
 
     void stop() {
@@ -3920,6 +3928,70 @@ TEST(TcpWriteVisibilityTest, EndpointRefreshRetiresOldTcpGroup) {
         endpoint_a.waitForNoActiveConnections(std::chrono::milliseconds(500)))
         << "RED: endpoint B is visible, but the idle group/socket for old "
            "endpoint A is never retired";
+}
+
+// Submits `count` small writes as one batch and returns how many completed.
+static size_t runWrites(EngineHandle& handle, size_t count) {
+    std::vector<TransferRequest> requests(count,
+                                          makeWriteRequest(handle, 1024));
+    auto batch_id = handle.engine->allocateBatchID(count);
+    if (!handle.engine->submitTransfer(batch_id, requests).ok()) return 0;
+    if (!waitForBatchTerminal(handle.engine.get(), batch_id, count,
+                              std::chrono::seconds(30)))
+        return 0;
+    size_t completed = 0;
+    for (size_t task_id = 0; task_id < count; ++task_id) {
+        TransferStatus status;
+        if (handle.engine->getTransferStatus(batch_id, task_id, status).ok() &&
+            status.s == TransferStatusEnum::COMPLETED)
+            ++completed;
+    }
+    (void)handle.engine->freeBatchID(batch_id);
+    return completed;
+}
+
+// The peer, or something on the path, closes pooled connections while their
+// lanes are idle. The next transfer must reconnect rather than send on the
+// closed sockets and fail.
+TEST(TcpWriteVisibilityTest, ReconnectsWhenPeerClosesIdlePooledSockets) {
+    for (const char* lane_count : {"1", "4"}) {
+        SCOPED_TRACE(std::string("lanes per peer ") + lane_count);
+        ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", lane_count);
+        LocalHttpMetadataServer metadata_server;
+        ReusingWriteServer endpoint;
+        ASSERT_TRUE(metadata_server.ok());
+        ASSERT_TRUE(endpoint.ok());
+
+        const std::string logical_peer =
+            std::string("127.0.0.2:1806") + lane_count;
+        EngineHandle target;
+        target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+        ASSERT_TRUE(target.ok);
+        EngineHandle h;
+        h.init(metadata_server.uri(),
+               std::string("127.0.0.2:1816") + lane_count, 64 * 1024,
+               logical_peer);
+        ASSERT_TRUE(h.ok);
+        ASSERT_EQ(publishAndRefreshTcpEndpoint(h, endpoint.port()),
+                  logical_peer);
+
+        constexpr size_t kWrites = 16;
+        ASSERT_EQ(runWrites(h, kWrites), kWrites);
+        // Let any connect still in flight finish before closing them all.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const int connected = endpoint.activeAcceptedCount();
+        ASSERT_GE(connected, 1);
+        endpoint.closeClientConnections();
+        ASSERT_TRUE(
+            endpoint.waitForNoActiveConnections(std::chrono::seconds(5)));
+        // The client's kernel has the FIN well before the next submit.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        EXPECT_EQ(runWrites(h, kWrites), kWrites)
+            << "RED: a transfer was sent on a connection the peer had "
+               "closed while its lane was idle";
+        EXPECT_GT(endpoint.acceptedCount(), connected);
+    }
 }
 
 TEST(TcpWriteVisibilityTest, SharedEndpointOnePeerMovesDoesNotRetireOtherPeer) {

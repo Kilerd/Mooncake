@@ -16,6 +16,7 @@
 
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
+#include <sys/socket.h>
 #include <asio/ip/v6_only.hpp>
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
@@ -24,6 +25,7 @@
 #include <array>
 #include <cassert>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
