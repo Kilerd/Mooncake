@@ -177,6 +177,7 @@ class TcpTransport : public Transport {
         int64_t deadline_ns = 0;  // steady_clock ns, 0 = none
         BatchControl *control = nullptr;
         std::shared_ptr<std::atomic<int64_t>> unconfirmed;
+        std::shared_ptr<std::atomic<int64_t>> unprovable;
 
         TcpWorkItem() = default;
         TcpWorkItem(Slice *slice_arg, bool use_v2_arg,
@@ -192,7 +193,8 @@ class TcpTransport : public Transport {
               use_v3(other.use_v3),
               deadline_ns(other.deadline_ns),
               control(other.control),
-              unconfirmed(std::move(other.unconfirmed)) {
+              unconfirmed(std::move(other.unconfirmed)),
+              unprovable(std::move(other.unprovable)) {
             other.slice = nullptr;
         }
         // Must not start or continue (deadline passed, or canceled).
@@ -442,7 +444,8 @@ class TcpTransport : public Transport {
                                 const ConnectionKey &key) noexcept;
     static void sweepExpiredLocked(PeerConnectionGroup &group, int64_t now_ns,
                                    std::deque<TcpWorkItem> &expired);
-    static void armDeadlineTimerLocked(
+    // Returns the timer it supersedes, to be canceled outside the lock.
+    static std::shared_ptr<asio::steady_timer> armDeadlineTimerLocked(
         const std::shared_ptr<PeerConnectionGroup> &group, int64_t deadline_ns);
     static void completeTerminalAction(TerminalAction action) noexcept;
     static void failWorkItem(

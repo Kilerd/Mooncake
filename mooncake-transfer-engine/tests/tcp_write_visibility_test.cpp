@@ -4445,4 +4445,99 @@ TEST(TcpBatchLimitsTest, V3ToPreV3ReceiverFailsAndStaysUnquiesced) {
     EXPECT_GE(p.unconfirmed, 1);
     // Not freed: the engine's teardown may still run its cancel attempts.
 }
+
+// Receivers older than v3 cannot confirm what a v3 receiver confirms. A
+// write cut mid-body to a v2 receiver may still be applied from what its
+// socket held; under v1 even a completed write was only sent. Such a batch
+// never quiesces (provable is false) and is not waited for, but it is
+// settled and can be freed.
+TEST(TcpBatchLimitsTest, WritesOldReceiversCannotConfirmAreUnprovable) {
+    constexpr size_t kSize = 4 << 20;
+    WritePair pair("7", kSize);
+    ASSERT_TRUE(pair.ok);
+    auto& h = pair.h;
+    {
+        ScopedEnvVar delay("MC_TCP_TEST_SERVER_CHUNK_DELAY_MS", "10");
+        ScopedEnvVar proto("MC_TCP_PROTO", "2");
+        auto batch = h.engine->allocateBatchID(1);
+        ASSERT_TRUE(
+            h.engine->setBatchDeadline(batch, steadyNs() + 200LL * 1000 * 1000)
+                .ok());
+        ASSERT_TRUE(
+            h.engine->submitTransfer(batch, {makeWriteRequest(h, kSize)}).ok());
+        ASSERT_TRUE(waitAllTerminal(h, batch, std::chrono::seconds(5)));
+        Transport::BatchProgress p;
+        const auto t0 = std::chrono::steady_clock::now();
+        EXPECT_FALSE(waitBatchQuiesced(*h.engine, batch, 5000, &p));
+        EXPECT_LT(std::chrono::steady_clock::now() - t0,
+                  std::chrono::seconds(1))
+            << "a batch that never quiesces was waited for";
+        EXPECT_EQ(p.failed, 1u);
+        EXPECT_FALSE(p.quiesced);
+        EXPECT_FALSE(p.provable);
+        EXPECT_GE(p.unprovable, 1);
+        EXPECT_TRUE(batchSettled(p));
+        EXPECT_TRUE(h.engine->freeBatchID(batch).ok());
+    }
+    {
+        ScopedEnvVar proto("MC_TCP_PROTO", "1");
+        memset(pair.target.pool, 0, kSize);
+        auto batch = h.engine->allocateBatchID(1);
+        ASSERT_TRUE(
+            h.engine->submitTransfer(batch, {makeWriteRequest(h, 256 << 10)})
+                .ok());
+        ASSERT_TRUE(waitAllTerminal(h, batch, std::chrono::seconds(5)));
+        auto p = progressOf(h, batch);
+        EXPECT_EQ(p.completed, 1u);
+        EXPECT_FALSE(p.quiesced);
+        EXPECT_FALSE(p.provable);
+        EXPECT_TRUE(batchSettled(p));
+        EXPECT_TRUE(h.engine->freeBatchID(batch).ok());
+    }
+}
+
+// The receiver's process goes away mid-write: nothing listens at its
+// address any more, so the refused cancel confirms the cut write and the
+// batch quiesces.
+TEST(TcpBatchLimitsTest, ReceiverThatIsGoneConfirmsByRefusingConnections) {
+    ScopedEnvVar delay("MC_TCP_TEST_SERVER_CHUNK_DELAY_MS", "10");
+    constexpr size_t kSize = 4 << 20;
+    WritePair pair("8", kSize);
+    ASSERT_TRUE(pair.ok);
+    auto& h = pair.h;
+    auto batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->setBatchDeadline(batch, steadyNs() + 5000LL * 1000 * 1000)
+            .ok());
+    ASSERT_TRUE(
+        h.engine->submitTransfer(batch, {makeWriteRequest(h, kSize)}).ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    pair.target.engine.reset();  // its pool stays allocated until the end
+    ASSERT_TRUE(waitAllTerminal(h, batch, std::chrono::seconds(5)));
+    Transport::BatchProgress p;
+    EXPECT_TRUE(waitBatchQuiesced(*h.engine, batch, 5000, &p))
+        << "unconfirmed=" << p.unconfirmed;
+    EXPECT_EQ(p.failed, 1u);
+    EXPECT_TRUE(p.provable);
+    EXPECT_TRUE(h.engine->freeBatchID(batch).ok());
+}
+
+// A task whose submission is still running is pending, not failed; once the
+// submission returned without a slice for it, it failed.
+TEST(TcpBatchLimitsTest, TaskWithoutSlicesIsPendingWhileItsSubmissionRuns) {
+    WritePair pair("9", 64 << 10);
+    ASSERT_TRUE(pair.ok);
+    auto& h = pair.h;
+    auto batch = h.engine->allocateBatchID(1);
+    auto& desc = Transport::toBatchDesc(batch);
+    desc.task_list.resize(1);  // the submission has created the task only
+    auto p = progressOf(h, batch);
+    EXPECT_EQ(p.pending, 1u);
+    EXPECT_FALSE(p.all_terminal);
+    __atomic_store_n(&desc.task_list[0].submit_done, true, __ATOMIC_RELEASE);
+    p = progressOf(h, batch);
+    EXPECT_EQ(p.failed, 1u);
+    EXPECT_TRUE(p.quiesced);
+    EXPECT_TRUE(h.engine->freeBatchID(batch).ok());
+}
 #endif

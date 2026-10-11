@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -71,12 +72,18 @@ class ScopedEnvVar {
     bool had_old_value_ = false;
 };
 
-size_t countProcessThreads() {
+// Threads of this process named |name| (other threads, such as those of
+// other components or of earlier tests winding down, are not counted).
+size_t countThreadsNamed(const std::string& name) {
     size_t count = 0;
     DIR* dir = opendir("/proc/self/task");
     if (!dir) return 0;
     while (auto* entry = readdir(dir)) {
-        if (entry->d_name[0] != '.') ++count;
+        if (entry->d_name[0] == '.') continue;
+        std::ifstream comm(std::string("/proc/self/task/") + entry->d_name +
+                           "/comm");
+        std::string comm_name;
+        if (std::getline(comm, comm_name) && comm_name == name) ++count;
     }
     closedir(dir);
     return count;
@@ -206,9 +213,9 @@ TEST(TcpMultiThreadTest, IoThreadsSettingControlsWorkerCount) {
         auto hp = parseHostNameWithPort(name);
         EXPECT_EQ(
             engine->init("P2PHANDSHAKE", name, hp.first.c_str(), hp.second), 0);
-        const size_t after_init = countProcessThreads();
+        const size_t after_init = countThreadsNamed("mc-tcp-io");
         EXPECT_NE(engine->installTransport("tcp", nullptr), nullptr);
-        const size_t after_install = countProcessThreads();
+        const size_t after_install = countThreadsNamed("mc-tcp-io");
         engine.reset();
         return after_install - after_init;
     };

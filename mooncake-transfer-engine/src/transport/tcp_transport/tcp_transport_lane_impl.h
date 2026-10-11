@@ -508,6 +508,7 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
     std::deque<TcpWorkItem> expired;
     std::deque<TcpWorkItem> runtime_failed;
     std::shared_ptr<asio::steady_timer> timer_to_cancel;
+    std::shared_ptr<asio::steady_timer> deadline_timer_to_cancel;
     std::shared_ptr<PeerConnectionGroup> retiring_group;
     WorkFailureReason rejection_reason = WorkFailureReason::QUEUE_FULL;
     uint64_t pump_epoch = 0;
@@ -603,7 +604,8 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
                         (group->next_deadline_ns == 0 ||
                          work_deadline < group->next_deadline_ns)) {
                         group->next_deadline_ns = work_deadline;
-                        armDeadlineTimerLocked(group, work_deadline);
+                        deadline_timer_to_cancel =
+                            armDeadlineTimerLocked(group, work_deadline);
                     }
 
                     if (group->pending_admissions.empty() &&
@@ -648,6 +650,7 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
     }
 
     cancelTimerNoThrow(timer_to_cancel);
+    cancelTimerNoThrow(deadline_timer_to_cancel);
     if (retirement_scheduled) postGroupRetirement(retiring_group);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     if (rejected) {
@@ -750,6 +753,7 @@ void TcpTransport::runGroupPump(
     std::deque<TcpWorkItem> limit_expired;
     std::deque<TcpWorkItem> runtime_failed;
     std::shared_ptr<asio::steady_timer> admission_timer_to_cancel;
+    std::shared_ptr<asio::steady_timer> deadline_timer_to_cancel;
     WorkFailureReason failure_reason = WorkFailureReason::CONNECT_FAILED;
     uint64_t followup_pump_epoch = 0;
     [[maybe_unused]] size_t promoted = 0;
@@ -771,7 +775,17 @@ void TcpTransport::runGroupPump(
         if (group->sweep_requested || (group->next_deadline_ns != 0 &&
                                        now_ns >= group->next_deadline_ns)) {
             group->sweep_requested = false;
+            const int64_t armed = group->next_deadline_ns;
             sweepExpiredLocked(*group, now_ns, limit_expired);
+            // Re-arm for the earliest deadline still queued, or drop the
+            // timer once nothing with a deadline is left (the armed timer
+            // stays when it is still ahead and still the earliest).
+            if (group->next_deadline_ns != armed || now_ns >= armed) {
+                deadline_timer_to_cancel =
+                    group->next_deadline_ns != 0
+                        ? armDeadlineTimerLocked(group, group->next_deadline_ns)
+                        : std::move(group->deadline_timer);
+            }
         }
         promoted += promotePendingAdmissionsLocked(*group);
 
@@ -921,6 +935,7 @@ void TcpTransport::runGroupPump(
                            std::move(stale_sockets[i].socket));
     }
     cancelTimerNoThrow(admission_timer_to_cancel);
+    cancelTimerNoThrow(deadline_timer_to_cancel);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     if (retry_armed) invokeLaneObserverHook(kLaneRetryArmed, 0, 0, 0, false);
     if (cooldown_started)
@@ -949,8 +964,8 @@ void TcpTransport::runGroupPump(
 }
 
 // Moves queued and pending work whose batch was canceled or whose deadline
-// passed to |expired|, and re-arms the deadline timer for the earliest
-// deadline still queued.
+// passed to |expired| and records the earliest deadline still queued in
+// next_deadline_ns; the caller re-arms the timer for it.
 void TcpTransport::sweepExpiredLocked(PeerConnectionGroup& group,
                                       int64_t now_ns,
                                       std::deque<TcpWorkItem>& expired) {
@@ -979,8 +994,9 @@ void TcpTransport::sweepExpiredLocked(PeerConnectionGroup& group,
     group.next_deadline_ns = next;
 }
 
-void TcpTransport::armDeadlineTimerLocked(
+std::shared_ptr<asio::steady_timer> TcpTransport::armDeadlineTimerLocked(
     const std::shared_ptr<PeerConnectionGroup>& group, int64_t deadline_ns) {
+    auto superseded = std::move(group->deadline_timer);
     ++group->deadline_epoch;
     if (group->deadline_epoch == 0) ++group->deadline_epoch;
     const uint64_t epoch = group->deadline_epoch;
@@ -1008,6 +1024,7 @@ void TcpTransport::armDeadlineTimerLocked(
         // Without a timer the next pump still sweeps expired work.
         group->sweep_requested = true;
     }
+    return superseded;
 }
 
 void TcpTransport::noteUnconfirmed(TcpWorkItem& work, uint64_t request_id,
@@ -1017,6 +1034,21 @@ void TcpTransport::noteUnconfirmed(TcpWorkItem& work, uint64_t request_id,
     // Counted before the slice turns terminal, so that a batch never looks
     // quiesced in between.
     work.unconfirmed->fetch_add(1, std::memory_order_acq_rel);
+    if (request_id == kUnprovableRequest) {
+        // A v1/v2 receiver cannot confirm a cut write: never quiesced.
+        if (work.unprovable)
+            work.unprovable->fetch_add(1, std::memory_order_acq_rel);
+        static std::atomic<int64_t> last_log_ns{0};
+        const int64_t now = steadyNowNs();
+        int64_t last = last_log_ns.load();
+        if (now - last > 10LL * 1000 * 1000 * 1000 &&
+            last_log_ns.compare_exchange_strong(last, now))
+            LOG(WARNING) << "TCP write to " << key.host << ":" << key.port
+                         << " cannot be confirmed by its receiver (cut "
+                            "mid-body under protocol v2, or protocol v1): "
+                            "its batch will not quiesce";
+        return;
+    }
     confirmByCancel(executor, key, request_id, work.unconfirmed);
 }
 
@@ -1024,7 +1056,11 @@ void TcpTransport::confirmByCancel(
     asio::any_io_executor executor, const ConnectionKey& key,
     uint64_t request_id, std::shared_ptr<std::atomic<int64_t>> counter,
     int attempt) noexcept {
-    constexpr int kAttempts = 6;
+    // Asked again with a capped backoff for as long as this transport runs:
+    // the batch quiesces as soon as the receiver answers, or as soon as
+    // nothing listens at its address any more (its process is gone, so it
+    // can apply nothing). A restarted receiver does not know the id; it
+    // fences it and answers kStatusCanceled.
     struct Op {
         explicit Op(const asio::any_io_executor& ex)
             : socket(ex), resolver(ex), timer(ex) {}
@@ -1043,30 +1079,31 @@ void TcpTransport::confirmByCancel(
         op->header.opcode = kOpcodeCancel | kOpcodeV2Flag | kOpcodeV3Flag;
         op->ext.request_id = htole64(request_id);
         op->ext.remaining_us = 0;
-        auto finish = [op, executor, key, request_id, counter,
-                       attempt](bool answered) {
+        auto finish = [op, executor, key, request_id, counter, attempt](
+                          bool answered, bool refused) {
             if (op->done) return;
             op->done = true;
             asio::error_code ec;
             op->timer.cancel(ec);
             op->socket.close(ec);
             const uint64_t frame = le64toh(op->reply.status);
-            if (answered && v3FinalStatus(frame) &&
-                le64toh(op->reply.request_id) == request_id) {
+            if ((answered && v3FinalStatus(frame) &&
+                 le64toh(op->reply.request_id) == request_id) ||
+                refused) {
                 counter->fetch_sub(1, std::memory_order_acq_rel);
                 return;
             }
-            if (attempt + 1 >= kAttempts) {
+            if (attempt == 5) {
                 LOG(ERROR) << "TCP request " << std::hex << request_id
                            << std::dec << " to " << key.host << ":" << key.port
-                           << " was cut and its receiver did not confirm it "
-                              "applies nothing more; its batch stays "
-                              "unquiesced";
-                return;
+                           << " was cut and its receiver has not confirmed "
+                              "it applies nothing more; its batch stays "
+                              "unquiesced while this keeps asking";
             }
-            // Back off and ask again (100 ms, doubling).
+            // Back off and ask again (100 ms, doubling, at most 5 s).
             auto retry = std::make_shared<asio::steady_timer>(executor);
-            retry->expires_after(std::chrono::milliseconds(100 << attempt));
+            retry->expires_after(std::chrono::milliseconds(
+                std::min<int64_t>(5000, 100LL << std::min(attempt, 6))));
             retry->async_wait([retry, executor, key, request_id, counter,
                                attempt](asio::error_code wait_ec) {
                 if (wait_ec == asio::error::operation_aborted) return;
@@ -1077,31 +1114,34 @@ void TcpTransport::confirmByCancel(
         op->timer.expires_after(std::chrono::seconds(2));
         op->timer.async_wait([op, finish](asio::error_code ec) {
             if (ec == asio::error::operation_aborted) return;
-            finish(false);
+            finish(false, false);
         });
         op->resolver.async_resolve(
             key.host, std::to_string(key.port),
             [op, finish](asio::error_code ec,
                          asio::ip::tcp::resolver::results_type results) {
-                if (ec) return finish(false);
+                if (ec) return finish(false, false);
                 asio::async_connect(
                     op->socket, results,
                     [op, finish](asio::error_code cec,
                                  const asio::ip::tcp::endpoint&) {
-                        if (cec) return finish(false);
+                        if (cec)
+                            return finish(
+                                false, cec == asio::error::connection_refused);
                         std::array<asio::const_buffer, 2> bufs = {
                             asio::buffer(&op->header, sizeof(SessionHeader)),
                             asio::buffer(&op->ext, sizeof(op->ext))};
                         asio::async_write(
                             op->socket, bufs,
                             [op, finish](asio::error_code wec, std::size_t) {
-                                if (wec) return finish(false);
+                                if (wec) return finish(false, false);
                                 asio::async_read(
                                     op->socket,
                                     asio::buffer(&op->reply, sizeof(op->reply)),
                                     [op, finish](asio::error_code rec,
                                                  std::size_t n) {
-                                        finish(!rec && n == sizeof(op->reply));
+                                        finish(!rec && n == sizeof(op->reply),
+                                               false);
                                     });
                             });
                     });

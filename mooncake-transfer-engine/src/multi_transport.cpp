@@ -185,6 +185,8 @@ Status MultiTransport::submitTransfer(
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
+        for (auto* task : entry.second)
+            __atomic_store_n(&task->submit_done, true, __ATOMIC_RELEASE);
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         for (auto* task : entry.second)
             if (task->request_count > 1)
@@ -223,6 +225,7 @@ Status MultiTransport::mp_submitTransfer(
     }
 
     size_t task_id = batch_desc.task_list.size();
+    const size_t first_task = task_id;
     batch_desc.task_list.resize(task_id + entries.size());
 
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
@@ -230,7 +233,13 @@ Status MultiTransport::mp_submitTransfer(
     for (auto& request : entries) {
         Transport* transport = nullptr;
         auto status = mp_selectTransport(request, transport, proto);
-        if (!status.ok()) return status;
+        if (!status.ok()) {
+            // None of these tasks is submitted: they fail (no slices).
+            for (size_t k = first_task; k < batch_desc.task_list.size(); ++k)
+                __atomic_store_n(&batch_desc.task_list[k].submit_done, true,
+                                 __ATOMIC_RELEASE);
+            return status;
+        }
         assert(transport);
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
@@ -246,6 +255,8 @@ Status MultiTransport::mp_submitTransfer(
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
+        for (auto* task : entry.second)
+            __atomic_store_n(&task->submit_done, true, __ATOMIC_RELEASE);
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
@@ -369,7 +380,11 @@ Status MultiTransport::getBatchProgress(BatchID batch_id,
             __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
         const uint64_t failed =
             __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
-        if (slices == 0) {
+        const bool submitted =
+            __atomic_load_n(&task.submit_done, __ATOMIC_ACQUIRE);
+        if (slices == 0 && !submitted) {
+            ++progress.pending;  // its submission is still running
+        } else if (slices == 0) {
             // The transport issued nothing for it: nothing is in flight.
             ++progress.failed;
             task.is_finished = true;
@@ -385,9 +400,15 @@ Status MultiTransport::getBatchProgress(BatchID batch_id,
     }
     progress.all_terminal = progress.pending == 0;
     // Read after the tasks: an attempt is counted unconfirmed before its
-    // task becomes terminal, so a terminal task never hides one.
+    // task becomes terminal, so a terminal task never hides one. An
+    // unprovable attempt is counted in unconfirmed first, then in
+    // unprovable: read in the opposite order, unconfirmed - unprovable
+    // never undercounts the attempts that are still to be confirmed.
+    progress.unprovable =
+        batch_desc.control.unprovable()->load(std::memory_order_acquire);
     progress.unconfirmed =
         batch_desc.control.unconfirmed()->load(std::memory_order_acquire);
+    progress.provable = progress.unprovable <= 0;
     progress.quiesced = progress.all_terminal && progress.unconfirmed <= 0;
     return Status::OK();
 }

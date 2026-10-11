@@ -41,6 +41,7 @@ struct Script {
     int confirm_after_cancel_ms = 0;  // -1: never
     bool stop_on_cancel = true;       // cancel ends pending tasks at once
     bool stop_at_deadline = true;     // the batch deadline ends them too
+    int64_t unprovable = 0;           // of |unconfirmed|: never confirmed
 };
 
 class FakeEngine {
@@ -59,9 +60,9 @@ class FakeEngine {
     Status freeBatchID(Transport::BatchID id) {
         std::lock_guard<std::mutex> lock(mu_);
         Transport::BatchProgress p = progressLocked(id);
-        if (!p.quiesced) {
+        if (!batchSettled(p)) {
             freed_unquiesced_ = true;
-            return Status::BatchBusy("not quiesced");
+            return Status::BatchBusy("not settled");
         }
         batches_.erase(id);
         ++freed_;
@@ -149,6 +150,11 @@ class FakeEngine {
                     int64_t(s.confirm_after_cancel_ms) * 1000000;
             if (!confirmed) p.unconfirmed = s.unconfirmed;
         }
+        if (terminal && s.unprovable) {
+            p.unconfirmed = std::max(p.unconfirmed, s.unprovable);
+            p.unprovable = s.unprovable;
+        }
+        p.provable = p.unprovable == 0;
         p.quiesced = p.all_terminal && p.unconfirmed == 0;
         return p;
     }
@@ -162,15 +168,16 @@ class FakeEngine {
 };
 
 SyncOutcome runWith(FakeEngine &engine, int attempts, int64_t timeout_ms,
-                    int64_t quiesce_ms) {
+                    int64_t quiesce_ms, Transport::BatchID *left = nullptr) {
     SyncOptions opt;
     opt.max_attempts = attempts;
     opt.start_ns = batchQuiesceNowNs();
     opt.timeout_ns = timeout_ms * 1000000;
     opt.quiesce_wait_ms = quiesce_ms;
-    return runSyncWithRetries(engine, 1, opt, [&](Transport::BatchID b, int) {
-        return engine.submit(b);
-    });
+    return runSyncWithRetries(
+        engine, 1, opt,
+        [&](Transport::BatchID b, int) { return engine.submit(b); }, nullptr,
+        left);
 }
 
 }  // namespace
@@ -200,11 +207,61 @@ TEST(BatchQuiesce, RetryWaitsUntilTheFailedAttemptIsQuiesced) {
 // The failed attempt never quiesces: no retry, not freed, kUnquiesced.
 TEST(BatchQuiesce, UnquiescedAttemptIsNeitherRetriedNorFreed) {
     FakeEngine e({Script{5, true, 1, -1}, Script{5, false}});
-    EXPECT_EQ(runWith(e, 3, 5000, 100), SyncOutcome::kUnquiesced);
+    Transport::BatchID left = 0;
+    EXPECT_EQ(runWith(e, 3, 5000, 100, &left), SyncOutcome::kUnquiesced);
     EXPECT_EQ(e.submits(), 1);
     EXPECT_EQ(e.freed(), 0);
     EXPECT_EQ(e.live(), 1u);
+    EXPECT_NE(left, 0u);
     EXPECT_FALSE(e.submittedWhileUnquiesced());
+}
+
+// A failed attempt that never can be confirmed (a receiver older than TCP
+// protocol v3): reported at once, not waited for and not retried; it is
+// settled, so it can be freed.
+TEST(BatchQuiesce, UnprovableFailedAttemptIsLeftAtOnce) {
+    Script unprovable{5, true, 1, -1};
+    unprovable.unprovable = 1;
+    FakeEngine e({unprovable, Script{5, false}});
+    Transport::BatchID left = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(runWith(e, 3, 5000, 5000, &left), SyncOutcome::kUnquiesced);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0,
+              std::chrono::milliseconds(1000));
+    EXPECT_EQ(e.submits(), 1);
+    ASSERT_NE(left, 0u);
+    Transport::BatchProgress p;
+    ASSERT_TRUE(e.getBatchProgress(left, p).ok());
+    EXPECT_FALSE(p.provable);
+    EXPECT_TRUE(batchSettled(p));
+    EXPECT_TRUE(e.freeBatchID(left).ok());
+    EXPECT_EQ(e.live(), 0u);
+}
+
+// Every request completed, to a receiver that cannot acknowledge (TCP
+// protocol v1): a success, freed at once.
+TEST(BatchQuiesce, CompletedUnprovableAttemptIsACompletion) {
+    Script sent{5, false};
+    sent.unconfirmed = 1;
+    sent.confirm_after_cancel_ms = -1;
+    sent.unprovable = 1;
+    FakeEngine e({sent});
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(runWith(e, 3, 5000, 5000), SyncOutcome::kCompleted);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0,
+              std::chrono::milliseconds(1000));
+    EXPECT_EQ(e.freed(), 1);
+    EXPECT_EQ(e.live(), 0u);
+}
+
+// Completed, but an attempt inside the engine (e.g. a GPU copy without an
+// answer) is still to be confirmed and is not within the wait: left
+// allocated, not freed.
+TEST(BatchQuiesce, CompletedAttemptWaitsForAnUnconfirmedOne) {
+    Script s{5, false, 1, -1};
+    FakeEngine e({s});
+    EXPECT_EQ(runWith(e, 3, 5000, 50), SyncOutcome::kUnquiesced);
+    EXPECT_EQ(e.freed(), 0);
 }
 
 // The call's deadline passes with the task still running: canceled, waited
@@ -235,6 +292,7 @@ TEST(BatchQuiesce, WaitReportsFalseWhileWritesMayStillLand) {
     EXPECT_FALSE(waitBatchQuiesced(e, b, 150, &p));  // failed, unconfirmed
     EXPECT_TRUE(p.all_terminal);
     EXPECT_EQ(p.unconfirmed, 1);
+    EXPECT_FALSE(batchSettled(p));
     ASSERT_TRUE(e.cancelBatch(b).ok());
     EXPECT_TRUE(waitBatchQuiesced(e, b, 1000, &p));
     EXPECT_EQ(p.failed, 1u);

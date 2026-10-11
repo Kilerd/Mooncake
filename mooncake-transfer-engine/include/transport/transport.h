@@ -119,18 +119,21 @@ class Transport {
     //   arrives late never touches a freed batch. The batch is quiesced --
     //   nothing of it can still be applied anywhere -- once every task is
     //   terminal and this count is 0.
+    // - unprovable(): of those, attempts that can never be confirmed (a TCP
+    //   write cut mid-body to a receiver older than protocol v3, or any TCP
+    //   write to a protocol v1 receiver, whose completion only means sent):
+    //   they stay unconfirmed for good, and the batch never quiesces. Such
+    //   an attempt is counted in unconfirmed() first, then here.
     class BatchControl {
        public:
         BatchControl()
-            : unconfirmed_(std::make_shared<std::atomic<int64_t>>(0)) {}
+            : unconfirmed_(std::make_shared<std::atomic<int64_t>>(0)),
+              unprovable_(std::make_shared<std::atomic<int64_t>>(0)) {}
         const std::shared_ptr<std::atomic<int64_t>> &unconfirmed() const {
             return unconfirmed_;
         }
-        // Counts this batch's unconfirmed attempts in |shared| (e.g. a
-        // private batch run on behalf of another batch's tasks). Call before
-        // submitting.
-        void shareUnconfirmed(std::shared_ptr<std::atomic<int64_t>> shared) {
-            if (shared) unconfirmed_ = std::move(shared);
+        const std::shared_ptr<std::atomic<int64_t>> &unprovable() const {
+            return unprovable_;
         }
         void setDeadlineNs(int64_t deadline_ns) {
             deadline_ns_.store(deadline_ns, std::memory_order_release);
@@ -186,6 +189,7 @@ class Transport {
 
        private:
         std::shared_ptr<std::atomic<int64_t>> unconfirmed_;
+        std::shared_ptr<std::atomic<int64_t>> unprovable_;
         std::atomic<int64_t> deadline_ns_{0};
         std::atomic<bool> canceled_{false};
         std::mutex mu_;
@@ -194,20 +198,26 @@ class Transport {
     };
 
     // Progress of a batch: a task is terminal once every slice it issued
-    // completed or failed (a task the transport issued no slice for counts
-    // as failed). |all_terminal|: no task is in flight on this side
-    // (pending == 0). |unconfirmed|: attempts that ended here without the
-    // receiver confirming it applies nothing more (BatchControl).
-    // |quiesced|: all_terminal and unconfirmed == 0 -- no task of the batch,
-    // of any attempt, can still write anywhere.
+    // completed or failed (a task whose submission returned without any
+    // slice counts as failed; while its submission runs it is pending).
+    // |all_terminal|: no task is in flight on this side (pending == 0).
+    // |unconfirmed|: attempts that ended here without the receiver
+    // confirming it applies nothing more (BatchControl); |unprovable| of
+    // them never can be. |quiesced|: all_terminal and unconfirmed == 0 -- no
+    // task of the batch, of any attempt, can still write anywhere.
+    // |provable|: false when an attempt can never be confirmed (the batch
+    // then never quiesces), or when the backend cannot prove quiescence at
+    // all (TENT: |quiesced| then only reflects terminal tasks).
     struct BatchProgress {
         size_t total = 0;
         size_t completed = 0;
         size_t failed = 0;
         size_t pending = 0;
         int64_t unconfirmed = 0;
+        int64_t unprovable = 0;
         bool all_terminal = false;
         bool quiesced = false;
+        bool provable = true;
     };
 
     // NOTE ABOUT BatchID → BatchDesc conversion:
@@ -452,6 +462,10 @@ class Transport {
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
+        // Set once the transport's submitTransferTask() for this task
+        // returned: until then a task without slices is still pending (a
+        // transport may create its slice only when the work ends).
+        volatile bool submit_done = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 

@@ -16,6 +16,7 @@
 
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <asio/ip/v6_only.hpp>
 #include <asio/post.hpp>
@@ -423,8 +424,13 @@ int TcpTransport::install(std::string& local_server_name,
     lane_state_->runtime = lane_runtime_;
     running_ = true;
     threads_.reserve(context_->io_contexts.size());
-    for (size_t i = 0; i < context_->io_contexts.size(); ++i)
+    for (size_t i = 0; i < context_->io_contexts.size(); ++i) {
         threads_.emplace_back(&TcpTransport::worker, this, i);
+#ifdef __linux__
+        // Named before install returns (diagnostics, tests).
+        pthread_setname_np(threads_.back().native_handle(), "mc-tcp-io");
+#endif
+    }
     return 0;
 }
 
@@ -864,6 +870,7 @@ void TcpTransport::startTransfer(Slice* slice,
         work.control = control;
         work.deadline_ns = control->deadlineNs();
         work.unconfirmed = control->unconfirmed();
+        work.unprovable = control->unprovable();
     }
 
     // Scatter task groups request reuse even when the general pool setting is

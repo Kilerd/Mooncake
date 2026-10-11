@@ -139,6 +139,10 @@ static constexpr uint8_t kOpcodeCancel = 2;
 static constexpr uint64_t kStatusDeadline = kStatusMagic | 2;
 static constexpr uint64_t kStatusCanceled = kStatusMagic | 3;
 static constexpr uint64_t kStatusOkV3 = kStatusMagic | 4;
+// ClientSession's unconfirmed_request for a WRITE cut mid-body on a
+// connection that cannot confirm anything (protocol v1/v2): unconfirmed for
+// good. (nextTcpRequestId never returns it.)
+static constexpr uint64_t kUnprovableRequest = ~0ull;
 
 struct SessionHeaderV3Ext {
     uint64_t request_id;    // little-endian
@@ -165,7 +169,8 @@ static uint64_t nextTcpRequestId() {
         return v ? v : 1;
     }()};
     uint64_t id = next.fetch_add(1, std::memory_order_relaxed);
-    if (id == 0) id = next.fetch_add(1, std::memory_order_relaxed);
+    while (id == 0 || id == kUnprovableRequest)
+        id = next.fetch_add(1, std::memory_order_relaxed);
     return id;
 }
 
@@ -313,6 +318,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     uint64_t drop_status_ = 0;  // kStatusDeadline/kStatusCanceled once dropping
     std::vector<char> bounce_;
     CancelReply cancel_reply_{};
+    // Device whose last copy from the (pageable) bounce buffer may still be
+    // in flight: cudaMemcpy can return once the source is staged.
+    int pending_device_ = -1;
 
     void start() {
         total_transferred_bytes_ = 0;
@@ -324,16 +332,18 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         readHeader();
     }
 
-    // A cancel of this session's request: nothing more of it is applied
-    // from now on (every apply runs on this executor and checks the flag),
-    // and the connection is closed so that no read waits for a body the
-    // initiator stopped sending.
-    void cancelByPeer() {
+    // A cancel of request |id|: if this session is still running it, nothing
+    // more of it is applied from now on (every apply runs on this executor
+    // and checks the flag), and the connection is closed so that no read
+    // waits for a body the initiator stopped sending. A request this session
+    // already finished keeps its final status, and a later request on the
+    // same connection is left alone.
+    void cancelByPeer(uint64_t id) {
+        if (!request_open_ || request_id_ != id) return;
         canceled_ = true;
-        if (request_open_) {
-            request_open_ = false;
-            if (registry_) registry_->finish(request_id_, kStatusCanceled);
-        }
+        syncDeviceWrites();
+        request_open_ = false;
+        if (registry_) registry_->finish(request_id_, kStatusCanceled);
         if (socket_ && socket_->is_open()) {
             asio::error_code ec;
             socket_->cancel(ec);
@@ -342,6 +352,22 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     }
 
    private:
+    // Waits for the last bounce-buffer copy to the device, before any status
+    // reports the request as applied or as no longer being applied (and
+    // before the session ends).
+    void syncDeviceWrites() {
+#ifdef USE_CUDA
+        if (pending_device_ < 0) return;
+        cudaSetDevice(pending_device_);
+        const cudaError_t status = cudaStreamSynchronize(0);
+        if (status != cudaSuccess)
+            LOG(ERROR) << "ServerSession: waiting for a copy to CUDA memory "
+                          "failed. Error: "
+                       << cudaGetErrorString(status);
+        pending_device_ = -1;
+#endif
+    }
+
     // Send an 8-byte status frame, then run `next` (or end the session —
     // closing the connection — when `next` is empty or the send fails).
     void sendStatus(uint64_t status, std::function<void()> next) {
@@ -393,7 +419,10 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             *socket_, asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const asio::error_code& ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
-                    if (ec.value() != asio::error::eof) {
+                    // Not worth a warning: the peer closed the connection,
+                    // or a cancel closed it from this side.
+                    if (ec.value() != asio::error::eof &&
+                        ec != asio::error::operation_aborted && !canceled_) {
                         LOG(WARNING)
                             << "ServerSession::readHeader failed. Error: "
                             << ec.message() << " (value: " << ec.value() << ")"
@@ -497,13 +526,21 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             return;
         }
         // Cut it on its own executor (serial with its applies), then answer
-        // from ours.
+        // from ours with the final status it now has (none: no answer, the
+        // initiator asks again).
         auto reply_executor = socket_->get_executor();
+        const uint64_t id = request_id_;
         try {
-            asio::post(running.executor, [target, self, reply_executor] {
-                target->cancelByPeer();
-                asio::post(reply_executor,
-                           [self] { self->sendCancelReply(kStatusCanceled); });
+            asio::post(running.executor, [target, self, reply_executor, id] {
+                target->cancelByPeer(id);
+                asio::post(reply_executor, [self, id] {
+                    ServerRequestRegistry::Running still_running;
+                    uint64_t final_status = 0;
+                    if (self->registry_->lookup(id, &still_running,
+                                                &final_status) ==
+                        ServerRequestRegistry::Lookup::kDone)
+                        self->sendCancelReply(final_status);
+                });
             });
         } catch (...) {
             // No answer: the initiator keeps the request unconfirmed.
@@ -602,6 +639,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                            << "Error: " << cudaGetErrorString(cuda_status);
                 return false;
             }
+#ifndef USE_MACA
+            pending_device_ = cuda_device;
+#endif
             return true;
         }
 #endif
@@ -618,6 +658,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
+            syncDeviceWrites();
             // Destination memory now holds the complete payload. Under v2,
             // acknowledge before accepting the next request — this is what
             // makes the initiator's COMPLETED mean "applied at the
@@ -659,10 +700,11 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             [this, addr, dram_buffer, cuda_device, bounce, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 if (ec) {
+                    syncDeviceWrites();
                     // If client closed connection (EOF), this is normal - don't
-                    // log
+                    // log; nor after a cancel closed it from this side.
                     if (ec.value() != asio::error::eof &&
-                        ec != asio::error::operation_aborted) {
+                        ec != asio::error::operation_aborted && !canceled_) {
                         LOG(WARNING)
                             << "ServerSession::readBody failed. "
                             << "Attempt to read data "
@@ -682,8 +724,10 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                 if (bounce && !(v3_ && dropNow())) {
                     if (!applyChunk(addr + total_transferred_bytes_,
                                     dram_buffer, transferred_bytes,
-                                    cuda_device))
+                                    cuda_device)) {
+                        syncDeviceWrites();
                         return;  // Connection will be closed
+                    }
                 }
                 total_transferred_bytes_ += transferred_bytes;
                 readBody();
@@ -1008,15 +1052,21 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
             asio::error_code ec;
             total_timer_->cancel(ec);
         }
-        // A v3 WRITE whose header went out but whose final status did not
-        // come back may still be applied at the receiver until it confirms.
-        const uint64_t unconfirmed =
-            (v3_ && status != TransferStatusEnum::COMPLETED &&
-             header_initiated_ && !final_frame_ &&
-             (header_.opcode & kOpcodeMask) ==
-                 static_cast<uint8_t>(TransferRequest::WRITE))
-                ? request_id_
-                : 0;
+        // A WRITE whose header went out but whose final status did not come
+        // back may still be applied at the receiver: under v3 until the
+        // receiver confirms the cut; under v1/v2 for as long as the receiver
+        // drains what it had buffered, which it can never confirm.
+        uint64_t unconfirmed = 0;
+        if (status != TransferStatusEnum::COMPLETED && header_initiated_ &&
+            !final_frame_ &&
+            (header_.opcode & kOpcodeMask) ==
+                static_cast<uint8_t>(TransferRequest::WRITE))
+            unconfirmed = v3_ ? request_id_ : kUnprovableRequest;
+        // v1 has no acknowledgment: a completed v1 WRITE only left this side.
+        if (status == TransferStatusEnum::COMPLETED && !v2_ &&
+            (header_.opcode & kOpcodeMask) ==
+                static_cast<uint8_t>(TransferRequest::WRITE))
+            unconfirmed = kUnprovableRequest;
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
         (void)invokeSessionProgressHook(kSessionTerminal, clean);
 #endif
@@ -1169,7 +1219,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     abortWrite();
                     return;
                 }
-                if (v3_ && v3FinalStatus(frame)) final_frame_ = true;
+                // A final status: nothing (more) of the request is applied.
+                if ((v3_ && v3FinalStatus(frame)) ||
+                    frame == kStatusAddrRejected)
+                    final_frame_ = true;
                 if (frame != (v3_ ? kStatusOkV3 : kStatusOk)) {
                     if (v3_ && frame == kStatusOk) {
                         LOG(ERROR) << "ClientSession: WRITE answered with a "

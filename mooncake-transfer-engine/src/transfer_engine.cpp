@@ -825,7 +825,10 @@ Status TransferEngine::getBatchProgress(BatchID batch_id,
             progress.pending = 1;
         }
         progress.all_terminal = progress.pending == 0;
+        // Not proven: TENT gives no receiver confirmation; |quiesced| here
+        // only means every task is terminal.
         progress.quiesced = progress.all_terminal;
+        progress.provable = false;
         return Status::OK();
     }
     return impl_->getBatchProgress(batch_id, progress);
