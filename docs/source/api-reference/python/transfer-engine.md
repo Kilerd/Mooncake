@@ -186,7 +186,10 @@ Performs a synchronous write operation to transfer data from local buffer to rem
 - `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success, negative value on failure
+- `int`: 0 on success; -1 on failure (nothing of the call can still be
+  applied: see "Quiescence" below); -2 on failure when the failed attempt
+  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
+  (default 10000): writes of it may still land
 
 #### transfer_sync_read()
 
@@ -204,7 +207,10 @@ Performs a synchronous read operation to transfer data from remote buffer to loc
 - `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success, negative value on failure
+- `int`: 0 on success; -1 on failure (nothing of the call can still be
+  applied: see "Quiescence" below); -2 on failure when the failed attempt
+  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
+  (default 10000): writes of it may still land
 
 #### transfer_sync()
 
@@ -224,7 +230,10 @@ Performs a synchronous transfer operation with specified opcode and optional not
 - `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success, negative value on failure
+- `int`: 0 on success; -1 on failure (nothing of the call can still be
+  applied: see "Quiescence" below); -2 on failure when the failed attempt
+  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
+  (default 10000): writes of it may still land
 
 #### transfer_submit_write()
 
@@ -257,10 +266,11 @@ Checks the status of an asynchronous transfer operation.
 
 **Returns:**
 - `int`:
-  - 1: Transfer completed successfully
+  - 1: Transfer completed successfully (the batch is freed)
   - 0: Transfer still in progress
-  - -1: Transfer failed
-  - -2: Transfer timed out
+  - -1: Transfer failed (quiesced; the batch is freed)
+  - -2: Transfer ended but is not quiesced yet: writes may still land (the
+    batch is kept; check again later)
 
 #### transfer_write_on_cuda()
 
@@ -332,7 +342,10 @@ Performs a batch synchronous write operation to transfer multiple data chunks fr
 - `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success, negative value on failure
+- `int`: 0 on success; -1 on failure (nothing of the call can still be
+  applied: see "Quiescence" below); -2 on failure when the failed attempt
+  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
+  (default 10000): writes of it may still land
 
 #### batch_transfer_sync_read()
 
@@ -350,7 +363,10 @@ Performs a batch synchronous read operation to transfer multiple data chunks fro
 - `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success, negative value on failure
+- `int`: 0 on success; -1 on failure (nothing of the call can still be
+  applied: see "Quiescence" below); -2 on failure when the failed attempt
+  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
+  (default 10000): writes of it may still land
 
 #### batch_transfer_sync()
 
@@ -370,12 +386,15 @@ Performs a batch synchronous transfer operation with specified opcode and option
 - `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: 0 on success, negative value on failure
+- `int`: 0 on success; -1 on failure (nothing of the call can still be
+  applied: see "Quiescence" below); -2 on failure when the failed attempt
+  could not be confirmed quiesced within `MC_TRANSFER_QUIESCE_WAIT_MS`
+  (default 10000): writes of it may still land
 
 #### batch_transfer_async_write()
 
 ```python
-batch_transfer_async_write(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="")
+batch_transfer_async_write(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="", deadline_ms=0)
 ```
 
 Submits a batch asynchronous write operation and returns immediately.
@@ -386,14 +405,19 @@ Submits a batch asynchronous write operation and returns immediately.
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
 - `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
+- `deadline_ms` (int, optional): the batch's deadline, in milliseconds from
+  the call; 0 (default) = none. Transfers not done by then fail; see
+  "Quiescence" below.
 
 **Returns:**
-- `int`: Batch ID for tracking the operation, or 0 on failure
+- `int`: Batch ID for tracking the operation, or 0 on failure. Track it with
+  `get_batch_progress()` / `wait_batch_quiesced()` and release it with
+  `free_batch()`, or wait for it with `get_batch_transfer_status()`.
 
 #### batch_transfer_async_read()
 
 ```python
-batch_transfer_async_read(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="")
+batch_transfer_async_read(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="", deadline_ms=0)
 ```
 
 Submits a batch asynchronous read operation and returns immediately.
@@ -404,14 +428,19 @@ Submits a batch asynchronous read operation and returns immediately.
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
 - `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
+- `deadline_ms` (int, optional): the batch's deadline, in milliseconds from
+  the call; 0 (default) = none. Transfers not done by then fail; see
+  "Quiescence" below.
 
 **Returns:**
-- `int`: Batch ID for tracking the operation, or 0 on failure
+- `int`: Batch ID for tracking the operation, or 0 on failure. Track it with
+  `get_batch_progress()` / `wait_batch_quiesced()` and release it with
+  `free_batch()`, or wait for it with `get_batch_transfer_status()`.
 
 #### batch_transfer_async()
 
 ```python
-batch_transfer_async(target_hostname, buffers, peer_buffer_addresses, lengths, opcode, transport_hint="")
+batch_transfer_async(target_hostname, buffers, peer_buffer_addresses, lengths, opcode, transport_hint="", deadline_ms=0)
 ```
 
 Submits a batch asynchronous transfer operation with specified opcode and returns immediately.
@@ -423,9 +452,14 @@ Submits a batch asynchronous transfer operation with specified opcode and return
 - `lengths` (List[int]): List of byte lengths for each transfer
 - `opcode` (TransferOpcode): The transfer operation type (READ or WRITE)
 - `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
+- `deadline_ms` (int, optional): the batch's deadline, in milliseconds from
+  the call; 0 (default) = none. Transfers not done by then fail; see
+  "Quiescence" below.
 
 **Returns:**
-- `int`: Batch ID for tracking the operation, or 0 on failure
+- `int`: Batch ID for tracking the operation, or 0 on failure. Track it with
+  `get_batch_progress()` / `wait_batch_quiesced()` and release it with
+  `free_batch()`, or wait for it with `get_batch_transfer_status()`.
 
 #### get_batch_transfer_status()
 
@@ -440,6 +474,94 @@ Waits for multiple batch asynchronous transfer operations to complete.
 
 **Returns:**
 - `int`: 0 if all transfers completed successfully, -1 if any transfer failed or timed out
+
+Batches are freed once quiesced. After a failure or timeout the remaining
+batches are canceled and waited for (at most `MC_TRANSFER_QUIESCE_WAIT_MS`
+each); those not quiesced by then stay allocated and can still be queried
+with `get_batch_progress()`.
+
+#### Quiescence
+
+A batch is **quiesced** when every transfer of it is terminal and nothing of
+it -- of any attempt, including retries and fallbacks inside the engine --
+can still be applied at any receiver. A transfer that fails on the sender is
+not enough: a TCP write cut mid-body may still be applied by its receiver
+until the receiver confirms the cut, and a same-node GPU copy whose copy
+daemon did not answer may still run. Until then the batch is not quiesced.
+
+- TCP receivers of protocol v3 (this build) drop the chunks of a canceled
+  write, and those that arrive after the batch deadline, and confirm a cut
+  write's final state to the sender; that confirmation is what makes the
+  batch quiesced.
+- With a receiver of protocol v2 (an older build), the only proof is the
+  closed TCP session: a cut write counts as quiesced once the sender closed
+  its connection, although the receiver may still apply bytes it had
+  already buffered (milliseconds, at most a socket buffer).
+- With a receiver of protocol v1, a completed write counts as quiesced (that
+  protocol has no acknowledgment at all).
+
+#### get_batch_progress()
+
+```python
+get_batch_progress(batch_id)
+```
+
+Non-blocking state of a batch of the async APIs (it is not freed).
+
+**Returns:**
+- `dict`:
+  - `state` (str): `"running"` while the batch is not quiesced (a transfer
+    is in flight, or an ended one is not confirmed yet), then
+    `"completed"` (every transfer completed) or `"failed"`
+  - `quiesced` (bool): `state != "running"`; nothing of the batch can
+    still be applied
+  - `completed`, `failed`, `pending` (int): transfers by state on this side
+  - `unconfirmed` (int): ended attempts not confirmed yet
+  - `total` (int)
+
+Raises `ValueError` for an unknown or already freed batch id.
+
+#### wait_batch_quiesced()
+
+```python
+wait_batch_quiesced(batch_id, timeout_ms)
+```
+
+Waits until the batch is quiesced or `timeout_ms` passed (0: no wait). The
+GIL is released while waiting.
+
+**Returns:**
+- `bool`: `True` when the batch is quiesced -- nothing of it can still be
+  applied anywhere. `False` when the timeout passed first: writes of it
+  **may still land**.
+
+Raises `ValueError` for an unknown or already freed batch id.
+
+#### cancel_batch()
+
+```python
+cancel_batch(batch_id)
+```
+
+Cancels the batch: transfers still queued fail without being sent, those in
+flight are cut (TCP receivers of protocol v3 also drop what arrives later
+and confirm the cut). It does not wait: use `wait_batch_quiesced()`.
+
+**Returns:**
+- `int`: 0 on success, -1 on failure
+
+#### free_batch()
+
+```python
+free_batch(batch_id)
+```
+
+Frees a batch of the async APIs, only once it is quiesced.
+
+**Returns:**
+- `int`: 0 when freed; -1 when it is not quiesced yet (it is kept)
+
+Raises `ValueError` for an unknown or already freed batch id.
 
 #### batch_transfer_write_on_cuda()
 

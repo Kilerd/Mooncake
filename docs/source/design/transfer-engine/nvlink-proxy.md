@@ -134,6 +134,17 @@ together with the exact address range in which that set is unchanged.
   rejected requests (e.g. a full TCP lane queue) retried with backoff until
   the request budget is spent. Fallbacks are logged at most every 5 seconds
   and counted.
+- Batch deadlines and cancel (`TransferEngine::setBatchDeadline`,
+  `cancelBatch`) apply here too: work of a canceled or expired batch is not
+  sent to the daemon, a fallback onto the base transport runs with the
+  batch's deadline and is canceled with the batch, and an attempt of it is
+  waited for until quiesced before its requests are retried. Quiescence
+  (`getBatchProgress`): a COPY the daemon did not answer -- it may still be
+  running -- keeps its batch unquiesced until the late answer arrives on its
+  connection or a new daemon epoch shows the old daemon gone; a fallback
+  attempt not quiesced long after its deadline is handed to the health
+  thread, which keeps the batch unquiesced until the attempt is, and frees
+  it then.
 - Registrations are keyed by a random per-engine client id and the block base,
   both published in the segment metadata, so peers' cached metadata stays
   valid across daemon restarts.
