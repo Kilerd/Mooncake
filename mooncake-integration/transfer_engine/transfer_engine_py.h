@@ -243,6 +243,9 @@ class TransferEnginePy {
         std::shared_ptr<std::vector<TransferRequest>> entries;
         int64_t start_ns = 0;  // steady clock
         int uses = 0;
+        // Freed by its caller while another call still used it: unknown to
+        // new calls, freed when the last use is released.
+        bool freed = false;
     };
     // Batches of failed calls not settled in time (sync calls that returned
     // -2): freed by later calls once settled.
@@ -265,9 +268,13 @@ class TransferEnginePy {
     bool acquireBatch(batch_id_t id, Transport::BatchID *batch,
                       LiveBatch *copy = nullptr);
     void releaseBatch(batch_id_t id);
-    // Frees batch |id| (with its use) when settled and no call but the
-    // caller's |own_uses| uses it: 0 freed, -1 kept.
+    // Frees batch |id| once settled, giving up the caller's |own_uses|:
+    // at once, or, while another call still uses it, when that use is
+    // released (it is unknown to new calls from now on). 0 freed, -1 not
+    // settled (kept).
     int freeBatch(batch_id_t id, int own_uses);
+    void eraseBatchLocked(
+        std::unordered_map<batch_id_t, LiveBatch>::iterator it);
     void reapLeftBatches();
     batch_id_t submitAsync(
         const std::shared_ptr<std::vector<TransferRequest>> &entries,

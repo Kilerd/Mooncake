@@ -523,7 +523,8 @@ daemon did not answer may still run. Until then the batch is not quiesced.
   completed write was only sent, so a batch with any write to it is never
   quiesced either. Synchronous calls still report such a write as a success.
 - The TENT backend cannot prove quiescence: its batches report `quiesced`
-  once every transfer is terminal, with `provable` `False`.
+  once every transfer is terminal, with `provable` `False`, and
+  `wait_batch_quiesced()` never returns `True` for them.
 
 A batch is **settled** when it is quiesced, or when every transfer of it
 ended and the only unconfirmed attempts are ones that never can be
@@ -566,8 +567,10 @@ returns early when the batch never can be quiesced. The GIL is released
 while waiting.
 
 **Returns:**
-- `bool`: `True` when the batch is quiesced -- nothing of it can still be
-  applied anywhere. `False` otherwise: writes of it **may still land**.
+- `bool`: `True` when the batch is quiesced and that is proven -- nothing
+  of it can still be applied anywhere. `False` otherwise: writes of it
+  **may still land**. Under the TENT backend, which cannot prove
+  quiescence, it is never `True`.
 
 Raises `ValueError` for an unknown or already freed batch id.
 
@@ -594,8 +597,9 @@ Frees a batch of the async APIs, only once it is settled (quiesced, or
 `state` is `"unprovable"`).
 
 **Returns:**
-- `int`: 0 when freed; -1 when it is not settled yet, or another call is
-  using the batch (it is kept)
+- `int`: 0 when freed (while another call still uses the batch, it is
+  freed as soon as that call returns; its id is unknown from now on); -1
+  when it is not settled yet (it is kept)
 
 Raises `ValueError` for an unknown or already freed batch id.
 

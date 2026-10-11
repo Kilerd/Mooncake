@@ -736,7 +736,7 @@ bool TransferEnginePy::acquireBatch(batch_id_t id, Transport::BatchID* batch,
                                     LiveBatch* copy) {
     std::lock_guard<std::mutex> guard(batches_mu_);
     auto it = live_batches_.find(id);
-    if (it == live_batches_.end()) return false;
+    if (it == live_batches_.end() || it->second.freed) return false;
     ++it->second.uses;
     *batch = it->second.batch;
     if (copy) *copy = it->second;
@@ -746,23 +746,39 @@ bool TransferEnginePy::acquireBatch(batch_id_t id, Transport::BatchID* batch,
 void TransferEnginePy::releaseBatch(batch_id_t id) {
     std::lock_guard<std::mutex> guard(batches_mu_);
     auto it = live_batches_.find(id);
-    if (it != live_batches_.end()) --it->second.uses;
+    if (it == live_batches_.end()) return;
+    if (--it->second.uses > 0 || !it->second.freed) return;
+    // The last use of a batch its caller already freed (it was settled
+    // then, and stays settled): freed now.
+    eraseBatchLocked(it);
+}
+
+void TransferEnginePy::eraseBatchLocked(
+    std::unordered_map<batch_id_t, LiveBatch>::iterator it) {
+    // Under batches_mu_ and with no use left: nothing can reach the batch
+    // between these two steps, and its id is never handed out again.
+    if (!engine_->freeBatchID(it->second.batch).ok())
+        left_batches_.push_back(
+            LeftBatch{it->second.batch, it->second.entries});
+    live_batches_.erase(it);
 }
 
 int TransferEnginePy::freeBatch(batch_id_t id, int own_uses) {
     std::lock_guard<std::mutex> guard(batches_mu_);
     auto it = live_batches_.find(id);
-    if (it == live_batches_.end()) return -1;
-    // Another call still uses it (e.g. waits for it): kept.
-    if (it->second.uses != own_uses) return -1;
+    if (it == live_batches_.end() || it->second.freed) return -1;
     Transport::BatchProgress p;
     if (!engine_->getBatchProgress(it->second.batch, p).ok() ||
         !batchSettled(p))
         return -1;
-    // Under batches_mu_ and with no other use: nothing can reach the batch
-    // between these two steps, and its id is never handed out again.
-    if (!engine_->freeBatchID(it->second.batch).ok()) return -1;
-    live_batches_.erase(it);
+    it->second.uses -= own_uses;
+    if (it->second.uses > 0) {
+        // Another call still uses it (e.g. polls it): unknown to new calls
+        // from now on, freed when the last use is released.
+        it->second.freed = true;
+        return 0;
+    }
+    eraseBatchLocked(it);
     return 0;
 }
 
@@ -823,7 +839,10 @@ bool TransferEnginePy::waitBatchQuiescedPy(batch_id_t batch_id,
         throw pybind11::value_error("unknown or already freed batch id");
     BatchUse use([this, batch_id] { releaseBatch(batch_id); });
     pybind11::gil_scoped_release release;
-    return waitBatchQuiesced(*engine_, batch, timeout_ms);
+    Transport::BatchProgress p;
+    // True only when proven: a backend that cannot prove quiescence (TENT)
+    // reports terminal tasks as quiesced, but provable false.
+    return waitBatchQuiesced(*engine_, batch, timeout_ms, &p) && p.provable;
 }
 
 int TransferEnginePy::cancelBatchPy(batch_id_t batch_id) {
@@ -838,7 +857,8 @@ int TransferEnginePy::cancelBatchPy(batch_id_t batch_id) {
 int TransferEnginePy::freeBatchPy(batch_id_t batch_id) {
     {
         std::lock_guard<std::mutex> guard(batches_mu_);
-        if (!live_batches_.count(batch_id))
+        auto it = live_batches_.find(batch_id);
+        if (it == live_batches_.end() || it->second.freed)
             throw pybind11::value_error("unknown or already freed batch id");
     }
     pybind11::gil_scoped_release release;
@@ -893,7 +913,8 @@ int TransferEnginePy::getBatchTransferStatus(
             Status s = engine_->getBatchProgress(t.batch, p);
             LOG_ASSERT(s.ok());
             if (p.all_terminal && p.failed == 0 && batchSettled(p)) {
-                // Completed. Freed, unless another call uses it now.
+                // Completed: freed (when another call still uses it, as
+                // soon as that call is done).
                 if (freeBatch(t.id, 1) != 0) releaseBatch(t.id);
                 t.done = true;
                 --open;
