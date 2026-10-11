@@ -266,6 +266,19 @@ class TransferEngineImpl {
         return multi_transports_->freeBatchID(batch_id);
     }
 
+    Status setBatchDeadline(BatchID batch_id, int64_t deadline_ns) {
+        return multi_transports_->setBatchDeadline(batch_id, deadline_ns);
+    }
+
+    Status cancelBatch(BatchID batch_id) {
+        return multi_transports_->cancelBatch(batch_id);
+    }
+
+    Status getBatchProgress(BatchID batch_id,
+                            Transport::BatchProgress& progress) {
+        return multi_transports_->getBatchProgress(batch_id, progress);
+    }
+
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
     int sendNotifyByID(SegmentID target_id,

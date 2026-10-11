@@ -326,6 +326,72 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
+Status MultiTransport::setBatchDeadline(BatchID batch_id, int64_t deadline_ns) {
+    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument("invalid batch id");
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    batch_desc.control.setDeadlineNs(deadline_ns);
+    return Status::OK();
+}
+
+Status MultiTransport::cancelBatch(BatchID batch_id) {
+    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument("invalid batch id");
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    batch_desc.control.cancel();
+    // Work still queued inside a transport (not in flight yet) is failed by
+    // the transport itself.
+    for (auto& entry : transport_map_) entry.second->onBatchCanceled(batch_id);
+    return Status::OK();
+}
+
+Status MultiTransport::getBatchProgress(BatchID batch_id,
+                                        BatchProgress& progress) {
+    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument("invalid batch id");
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    progress = BatchProgress();
+    const size_t task_count = batch_desc.task_list.size();
+    progress.total = task_count;
+    for (size_t task_id = 0; task_id < task_count; ++task_id) {
+        auto& task = batch_desc.task_list[task_id];
+        if (task.transport_) {
+            // Lets transports that complete by polling (e.g. CUDA streams)
+            // update their slices; the outcome is read from the slice
+            // counters below, since a polled TIMEOUT is not terminal.
+            TransferStatus ignored;
+            (void)task.transport_->getTransferStatus(batch_id, task_id,
+                                                     ignored);
+        }
+        const uint64_t slices =
+            __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t ok =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        if (slices == 0) {
+            // The transport issued nothing for it: nothing is in flight.
+            ++progress.failed;
+            task.is_finished = true;
+        } else if (ok + failed == slices) {
+            if (failed)
+                ++progress.failed;
+            else
+                ++progress.completed;
+            task.is_finished = true;
+        } else {
+            ++progress.pending;
+        }
+    }
+    progress.all_terminal = progress.pending == 0;
+    // Read after the tasks: an attempt is counted unconfirmed before its
+    // task becomes terminal, so a terminal task never hides one.
+    progress.unconfirmed =
+        batch_desc.control.unconfirmed()->load(std::memory_order_acquire);
+    progress.quiesced = progress.all_terminal && progress.unconfirmed <= 0;
+    return Status::OK();
+}
+
 Status MultiTransport::getScatterRequestStatuses(
     BatchID batch_id, size_t task_id,
     std::vector<TransferStatusEnum>& request_statuses) {

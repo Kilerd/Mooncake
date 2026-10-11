@@ -30,6 +30,8 @@
 #include <functional>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
+#include <unordered_map>
 
 #include "common/base/status.h"
 #include "transfer_metadata.h"
@@ -97,6 +99,116 @@ class Transport {
 
     struct BatchDesc;
     struct TransferTask;
+
+    // Limits that apply to every transfer of a batch, for the transports
+    // that support them (TCP; the nvlink_proxy transport passes them to its
+    // TCP fallback). Thread-safe.
+    // - deadline: an absolute steady_clock time (nanoseconds since the
+    //   clock's epoch, as std::chrono::steady_clock / CLOCK_MONOTONIC); 0 =
+    //   none. Work not done by then fails (queued work is never started, a
+    //   session in flight is cut, and a receiver that speaks TCP protocol v3
+    //   applies no payload chunk that arrives after it). Set it before the
+    //   transfers are submitted.
+    // - cancel(): work not done yet fails at once; sessions in flight are
+    //   cut. Idempotent.
+    // A cut transfer fails like any other failed transfer (FAILED).
+    // - unconfirmed(): attempts that ended on this side without proof that
+    //   the receiver will not apply more of them (e.g. a TCP write cut
+    //   mid-body before its receiver confirmed the cancel, or a GPU copy
+    //   whose daemon did not answer). Shared, so that a confirmation that
+    //   arrives late never touches a freed batch. The batch is quiesced --
+    //   nothing of it can still be applied anywhere -- once every task is
+    //   terminal and this count is 0.
+    class BatchControl {
+       public:
+        BatchControl()
+            : unconfirmed_(std::make_shared<std::atomic<int64_t>>(0)) {}
+        const std::shared_ptr<std::atomic<int64_t>> &unconfirmed() const {
+            return unconfirmed_;
+        }
+        // Counts this batch's unconfirmed attempts in |shared| (e.g. a
+        // private batch run on behalf of another batch's tasks). Call before
+        // submitting.
+        void shareUnconfirmed(std::shared_ptr<std::atomic<int64_t>> shared) {
+            if (shared) unconfirmed_ = std::move(shared);
+        }
+        void setDeadlineNs(int64_t deadline_ns) {
+            deadline_ns_.store(deadline_ns, std::memory_order_release);
+        }
+        int64_t deadlineNs() const {
+            return deadline_ns_.load(std::memory_order_acquire);
+        }
+        bool canceled() const {
+            return canceled_.load(std::memory_order_acquire);
+        }
+        // True when work of the batch must not start (or continue) at
+        // |now_ns| (steady_clock nanoseconds).
+        bool expired(int64_t now_ns) const {
+            if (canceled()) return true;
+            const int64_t deadline = deadlineNs();
+            return deadline != 0 && now_ns >= deadline;
+        }
+        static int64_t nowNs() {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        }
+        // Registers |abort| (it cuts one piece of work in flight) to run
+        // once on cancel(). Returns its id for removeAborter(), or 0 when the
+        // batch is already canceled: |abort| is then not kept and the caller
+        // cuts the work itself.
+        uint64_t addAborter(std::function<void()> abort) {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (canceled()) return 0;
+            const uint64_t id = next_id_++;
+            aborters_.emplace(id, std::move(abort));
+            return id;
+        }
+        void removeAborter(uint64_t id) {
+            if (id == 0) return;
+            std::lock_guard<std::mutex> lock(mu_);
+            aborters_.erase(id);
+        }
+        void cancel() {
+            std::unordered_map<uint64_t, std::function<void()>> run;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                canceled_.store(true, std::memory_order_release);
+                run.swap(aborters_);
+            }
+            for (auto &kv : run) {
+                try {
+                    kv.second();
+                } catch (...) {
+                }
+            }
+        }
+
+       private:
+        std::shared_ptr<std::atomic<int64_t>> unconfirmed_;
+        std::atomic<int64_t> deadline_ns_{0};
+        std::atomic<bool> canceled_{false};
+        std::mutex mu_;
+        uint64_t next_id_ = 1;
+        std::unordered_map<uint64_t, std::function<void()>> aborters_;
+    };
+
+    // Progress of a batch: a task is terminal once every slice it issued
+    // completed or failed (a task the transport issued no slice for counts
+    // as failed). |all_terminal|: no task is in flight on this side
+    // (pending == 0). |unconfirmed|: attempts that ended here without the
+    // receiver confirming it applies nothing more (BatchControl).
+    // |quiesced|: all_terminal and unconfirmed == 0 -- no task of the batch,
+    // of any attempt, can still write anywhere.
+    struct BatchProgress {
+        size_t total = 0;
+        size_t completed = 0;
+        size_t failed = 0;
+        size_t pending = 0;
+        int64_t unconfirmed = 0;
+        bool all_terminal = false;
+        bool quiesced = false;
+    };
 
     // NOTE ABOUT BatchID → BatchDesc conversion:
     //
@@ -382,6 +494,8 @@ class Transport {
         std::vector<TransferTask> task_list;
         void *context;  // for transport implementers.
         int64_t start_timestamp;
+        // Deadline and cancellation of the batch's transfers.
+        BatchControl control;
 
         // Track batch progress and notifies waiters
         std::atomic<bool> has_failure{false};
@@ -435,6 +549,18 @@ class Transport {
     /// progress.
     virtual Status getTransferStatus(BatchID batch_id, size_t task_id,
                                      TransferStatus &status) = 0;
+
+    /// @brief The batch was canceled (BatchControl::cancel() already ran):
+    /// fail its work that is still queued in this transport.
+    virtual void onBatchCanceled(BatchID batch_id) {}
+
+    /// @brief The control of the batch |slice| belongs to, or nullptr when
+    /// the slice's task has no batch.
+    static BatchControl *batchControl(const Slice *slice) {
+        if (!slice || !slice->task || slice->task->batch_id == 0)
+            return nullptr;
+        return &toBatchDesc(slice->task->batch_id).control;
+    }
 
     std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
 

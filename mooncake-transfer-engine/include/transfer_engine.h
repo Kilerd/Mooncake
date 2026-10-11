@@ -227,6 +227,25 @@ class TransferEngine {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
+    using BatchProgress = Transport::BatchProgress;
+
+    // Deadline for every transfer of the batch: an absolute
+    // std::chrono::steady_clock time in nanoseconds since its epoch
+    // (CLOCK_MONOTONIC), 0 = none. Set it after allocateBatchID() and before
+    // submitting. Transports that support it (TCP, and the nvlink_proxy
+    // fallback onto TCP) fail work not done by then; a TCP receiver that
+    // speaks protocol v3 applies no payload that arrives after it.
+    Status setBatchDeadline(BatchID batch_id, int64_t deadline_ns);
+
+    // Fails the batch's work that is not done yet: queued work at once,
+    // transfers in flight are cut. Its tasks become terminal shortly after
+    // (see getBatchProgress). Idempotent.
+    Status cancelBatch(BatchID batch_id);
+
+    // Counts the batch's tasks: completed, failed, pending (still in flight
+    // on this side). all_terminal == (pending == 0).
+    Status getBatchProgress(BatchID batch_id, BatchProgress& progress);
+
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
     Transport* getTransport(const std::string& proto);

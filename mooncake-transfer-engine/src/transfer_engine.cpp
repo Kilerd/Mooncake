@@ -253,6 +253,19 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
     return impl_->getBatchTransferStatus(batch_id, status);
 }
 
+Status TransferEngine::setBatchDeadline(BatchID batch_id, int64_t deadline_ns) {
+    return impl_->setBatchDeadline(batch_id, deadline_ns);
+}
+
+Status TransferEngine::cancelBatch(BatchID batch_id) {
+    return impl_->cancelBatch(batch_id);
+}
+
+Status TransferEngine::getBatchProgress(BatchID batch_id,
+                                        BatchProgress& progress) {
+    return impl_->getBatchProgress(batch_id, progress);
+}
+
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     stats.clear();
     return Status::OK();
@@ -776,6 +789,46 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
             return Status::OK();
     } else
         return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+Status TransferEngine::setBatchDeadline(BatchID batch_id, int64_t deadline_ns) {
+    if (use_tent_)
+        return Status::NotImplemented(
+            "batch deadlines need the classic engine");
+    return impl_->setBatchDeadline(batch_id, deadline_ns);
+}
+
+Status TransferEngine::cancelBatch(BatchID batch_id) {
+    if (use_tent_)
+        return Status::NotImplemented("batch cancel needs the classic engine");
+    return impl_->cancelBatch(batch_id);
+}
+
+Status TransferEngine::getBatchProgress(BatchID batch_id,
+                                        BatchProgress& progress) {
+    if (use_tent_) {
+        // TENT reports the batch as a whole and cannot confirm anything
+        // about a failed transfer: a terminal batch counts as quiesced, as
+        // the callers assumed before.
+        TransferStatus status;
+        Status s = getBatchTransferStatus(batch_id, status);
+        if (!s.ok()) return s;
+        progress = BatchProgress();
+        progress.total = 1;
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            progress.completed = 1;
+        } else if (status.s == TransferStatusEnum::FAILED ||
+                   status.s == TransferStatusEnum::TIMEOUT ||
+                   status.s == TransferStatusEnum::CANCELED) {
+            progress.failed = 1;
+        } else {
+            progress.pending = 1;
+        }
+        progress.all_terminal = progress.pending == 0;
+        progress.quiesced = progress.all_terminal;
+        return Status::OK();
+    }
+    return impl_->getBatchProgress(batch_id, progress);
 }
 
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {

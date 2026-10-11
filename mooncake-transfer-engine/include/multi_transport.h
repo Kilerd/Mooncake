@@ -70,6 +70,19 @@ class MultiTransport {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
 
+    using BatchProgress = Transport::BatchProgress;
+
+    // Deadline for every transfer of the batch (Transport::BatchControl):
+    // absolute steady_clock nanoseconds, 0 = none. Set before submitting.
+    Status setBatchDeadline(BatchID batch_id, int64_t deadline_ns);
+
+    // Fails the batch's work that is not done yet: queued work at once,
+    // sessions in flight are cut. Tasks become terminal shortly after.
+    Status cancelBatch(BatchID batch_id);
+
+    // Counts the batch's tasks by state; see Transport::BatchProgress.
+    Status getBatchProgress(BatchID batch_id, BatchProgress &progress);
+
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
 
