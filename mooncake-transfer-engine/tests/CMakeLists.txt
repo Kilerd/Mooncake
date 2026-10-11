@@ -445,6 +445,27 @@ if(USE_NVLINK_PROXY)
   target_link_libraries(nvlink_proxy_daemon_test PUBLIC gtest gtest_main
                                                         pthread)
   add_test(NAME nvlink_proxy_daemon_test COMMAND nvlink_proxy_daemon_test)
+
+  # The daemon itself against a CPU stand-in for the CUDA runtime, driven
+  # over its socket by nvlink_proxy_cpu_test.py (no GPU needed).
+  find_package(CUDAToolkit QUIET)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(CUDAToolkit_FOUND AND Python3_Interpreter_FOUND)
+    add_executable(
+      mooncake_nvlink_proxy_cpu
+      ${CMAKE_CURRENT_SOURCE_DIR}/../nvlink-proxy/mooncake_nvlink_proxy.cpp
+      ${WORKSPACE}/nvlink_proxy_mock_cudart.cpp)
+    target_include_directories(
+      mooncake_nvlink_proxy_cpu
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../nvlink-proxy
+              ${CMAKE_CURRENT_SOURCE_DIR}/../include
+              ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(mooncake_nvlink_proxy_cpu PRIVATE pthread rt)
+    add_test(NAME nvlink_proxy_cpu_test
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/nvlink_proxy_cpu_test.py
+                     $<TARGET_FILE:mooncake_nvlink_proxy_cpu>)
+  endif()
 endif()
 
 add_executable(graceful_shutdown_test ${WORKSPACE}/graceful_shutdown_test.cpp)
