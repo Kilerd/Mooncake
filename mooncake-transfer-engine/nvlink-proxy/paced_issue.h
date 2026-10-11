@@ -43,6 +43,7 @@
 #define MOONCAKE_NVLINK_PROXY_PACED_ISSUE_H_
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -71,60 +72,99 @@ class RateModel {
     static constexpr double kSeedPsPerByte = 1000.0;
     // Fixed cost of a chunk (submission, launch, completion) in microseconds.
     static constexpr double kOverheadUs = 20.0;
-    // Samples of fewer bytes are dominated by the fixed cost: they are
-    // pooled until they add up to this much, then used as one.
+    // A cold model takes its first sample from a chunk of at least this
+    // many bytes, or from smaller chunks pooled until they add up to it.
     static constexpr uint64_t kMinSampleBytes = 256ull << 10;
+    // A warm model is updated only by chunks of at least this many bytes
+    // (smaller ones are dominated by the fixed cost), weighted by their size
+    // up to kFullWeightBytes.
+    static constexpr uint64_t kMinUpdateBytes = 1ull << 20;
+    static constexpr uint64_t kFullWeightBytes = 8ull << 20;
+    // An estimate slower than the seed that no sample has confirmed for this
+    // long is dropped: the model is cold again (seed rate, next chunk a
+    // probe), so a stale low rate cannot keep refusing copies that are never
+    // issued and so never measured.
+    static constexpr int64_t kSlowEstimateTtlUs = 10LL * 1000 * 1000;
+
+    explicit RateModel(int64_t slow_estimate_ttl_us = kSlowEstimateTtlUs)
+        : slow_ttl_us_(slow_estimate_ttl_us) {}
 
     bool warm() const {
         std::lock_guard<std::mutex> lock(mu_);
-        return warm_;
+        return warm_ && !staleLocked();
     }
     double psPerByte() const {
         std::lock_guard<std::mutex> lock(mu_);
-        return ps_per_byte_;
+        return staleLocked() ? kSeedPsPerByte : ps_per_byte_;
     }
     // GB/s of the current estimate (stats).
     double gbps() const { return 1000.0 / psPerByte(); }
 
     // |bytes| took |us| (from start to completion). The first sample replaces
-    // the seed; later ones move the estimate by 1/2 when slower (a slowdown
-    // is followed at once) and by 1/8 when faster. Small samples are pooled
-    // (so a model that only ever sees small chunks still warms up).
+    // the seed; one pooled from small chunks never sets a rate below the
+    // seed (a floor: their fixed cost makes them look slow). Later samples
+    // of at least kMinUpdateBytes move the estimate by up to 1/2 when slower
+    // (a slowdown is followed at once) and by up to 1/8 when faster, in
+    // proportion to their size up to kFullWeightBytes; smaller ones are
+    // ignored. Only chunks of real size can show a link slower than the seed
+    // (the probe that finds a slow link is one).
     void observe(uint64_t bytes, double us) {
         if (bytes == 0 || us <= 0) return;
         std::lock_guard<std::mutex> lock(mu_);
-        double ps;
-        if (bytes < kMinSampleBytes) {
-            pooled_bytes_ += bytes;
-            pooled_us_ += us;
-            ++pooled_count_;
-            if (pooled_bytes_ < kMinSampleBytes) return;
-            const double total_us = pooled_us_;
-            const double fixed_us = pooled_count_ * kOverheadUs;
-            const double pooled = static_cast<double>(pooled_bytes_);
-            pooled_bytes_ = 0;
-            pooled_us_ = 0;
-            pooled_count_ = 0;
-            // All of it fixed cost by the model: take the whole time (slower
-            // than any real rate, so on the safe side).
-            ps = (total_us > fixed_us ? total_us - fixed_us : total_us) * 1e6 /
-                 pooled;
-        } else {
-            ps = std::max(0.0, us - kOverheadUs) * 1e6 /
-                 static_cast<double>(bytes);
-            if (ps <= 0) return;
-        }
+        if (warm_ && staleLocked()) warm_ = false;
         if (!warm_) {
+            double ps;
+            if (bytes < kMinSampleBytes) {
+                pooled_bytes_ += bytes;
+                pooled_us_ += us;
+                ++pooled_count_;
+                if (pooled_bytes_ < kMinSampleBytes) return;
+                const double total_us = pooled_us_;
+                const double fixed_us = pooled_count_ * kOverheadUs;
+                const double pooled = static_cast<double>(pooled_bytes_);
+                pooled_bytes_ = 0;
+                pooled_us_ = 0;
+                pooled_count_ = 0;
+                // All of it fixed cost by the model: take the whole time.
+                ps = (total_us > fixed_us ? total_us - fixed_us : total_us) *
+                     1e6 / pooled;
+                ps = std::min(ps, kSeedPsPerByte);
+            } else {
+                ps = std::max(0.0, us - kOverheadUs) * 1e6 /
+                     static_cast<double>(bytes);
+                if (ps <= 0) return;
+            }
             ps_per_byte_ = ps;
             warm_ = true;
+            updated_us_ = monoUs();
             return;
         }
-        const double alpha = ps > ps_per_byte_ ? 0.5 : 0.125;
+        if (bytes < kMinUpdateBytes) return;
+        const double ps =
+            std::max(0.0, us - kOverheadUs) * 1e6 / static_cast<double>(bytes);
+        if (ps <= 0) return;
+        const double weight =
+            std::min(1.0, static_cast<double>(bytes) /
+                              static_cast<double>(kFullWeightBytes));
+        const double alpha = (ps > ps_per_byte_ ? 0.5 : 0.125) * weight;
         ps_per_byte_ += alpha * (ps - ps_per_byte_);
+        updated_us_ = monoUs();
     }
 
    private:
+    static int64_t monoUs() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+    bool staleLocked() const {
+        return warm_ && ps_per_byte_ > kSeedPsPerByte &&
+               monoUs() - updated_us_ > slow_ttl_us_;
+    }
+
     mutable std::mutex mu_;
+    const int64_t slow_ttl_us_;
+    int64_t updated_us_ = 0;
     double ps_per_byte_ = kSeedPsPerByte;
     bool warm_ = false;
     uint64_t pooled_bytes_ = 0;

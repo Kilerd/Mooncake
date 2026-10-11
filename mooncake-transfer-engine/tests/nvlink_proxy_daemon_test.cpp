@@ -260,37 +260,82 @@ TEST(NvlinkProxyPacedIssue, RateModelLearnsSlowdownsFast) {
     m.observe(1024, 5000.0);  // below kMinSampleBytes: pooled, not used yet
     EXPECT_FALSE(m.warm());
     EXPECT_DOUBLE_EQ(m.psPerByte(), RateModel::kSeedPsPerByte);
-    const uint64_t mib = 1ull << 20;
-    m.observe(mib, 1000.0 + RateModel::kOverheadUs);  // ~1 GB/s
+    const uint64_t big = RateModel::kFullWeightBytes;  // 8 MiB
+    m.observe(big, 800.0 + RateModel::kOverheadUs);    // ~10 GB/s
     ASSERT_TRUE(m.warm());
     const double base = m.psPerByte();
-    EXPECT_NEAR(base, 1e9 / double(mib), 1.0);
-    m.observe(mib, 3000.0 + RateModel::kOverheadUs);  // 3x slower: half way
-    EXPECT_NEAR(m.psPerByte(), base * 2, 1.0);
+    EXPECT_NEAR(base, 800e6 / double(big), 0.01);
+    m.observe(big, 2400.0 + RateModel::kOverheadUs);  // 3x slower: half way
+    EXPECT_NEAR(m.psPerByte(), base * 2, 0.01);
     const double slow = m.psPerByte();
-    m.observe(mib, 1000.0 + RateModel::kOverheadUs);  // faster: an eighth
-    EXPECT_NEAR(m.psPerByte(), slow - (slow - base) / 8, 1.0);
-    EXPECT_NEAR(predictUs(mib, base), RateModel::kOverheadUs + 1000.0, 1.0);
+    m.observe(big, 800.0 + RateModel::kOverheadUs);  // faster: an eighth
+    EXPECT_NEAR(m.psPerByte(), slow - (slow - base) / 8, 0.01);
+    EXPECT_NEAR(predictUs(big, base), RateModel::kOverheadUs + 800.0, 0.01);
+}
+
+// Once warm, chunks under kMinUpdateBytes do not move the estimate, and the
+// others move it in proportion to their size: small, overhead-bound chunks
+// cannot drag a measured rate down.
+TEST(NvlinkProxyPacedIssue, RateModelWeighsSamplesByBytes) {
+    RateModel m;
+    const uint64_t big = RateModel::kFullWeightBytes;
+    m.observe(big, 800.0 + RateModel::kOverheadUs);
+    const double base = m.psPerByte();
+    for (int i = 0; i < 100; ++i)
+        m.observe(64 << 10, 500.0);  // 64 KiB in 500 us: ignored
+    EXPECT_DOUBLE_EQ(m.psPerByte(), base);
+    // 1 MiB, 3x slower: an eighth of the full-weight step (1/2).
+    const uint64_t mib = RateModel::kMinUpdateBytes;
+    const double slow_ps = 3 * base;
+    m.observe(mib, slow_ps * double(mib) / 1e6 + RateModel::kOverheadUs);
+    EXPECT_NEAR(m.psPerByte(), base + (slow_ps - base) / 16, 0.01);
 }
 
 // A model that only ever sees chunks smaller than kMinSampleBytes still
-// warms up: the small samples are pooled into one (less their fixed costs).
+// warms up: the small samples are pooled into one (less their fixed costs),
+// never slower than the seed (their fixed cost makes them look slow).
 TEST(NvlinkProxyPacedIssue, RateModelWarmsFromSmallChunks) {
     RateModel m;
     const uint64_t small = 64ull << 10;
     const size_t n = RateModel::kMinSampleBytes / small;
     for (size_t i = 0; i + 1 < n; ++i) {
-        m.observe(small, 64.0 + RateModel::kOverheadUs);  // ~1 GB/s
+        m.observe(small, 32.0 + RateModel::kOverheadUs);  // ~2 GB/s
         EXPECT_FALSE(m.warm());
     }
-    m.observe(small, 64.0 + RateModel::kOverheadUs);
+    m.observe(small, 32.0 + RateModel::kOverheadUs);
     ASSERT_TRUE(m.warm());
-    EXPECT_NEAR(m.psPerByte(), 64.0 * 1e6 / double(small), 1.0);
+    EXPECT_NEAR(m.psPerByte(), 32.0 * 1e6 / double(small), 0.01);
     // Pooled samples that are all fixed cost count as their whole time.
     RateModel f;
     for (size_t i = 0; i < n; ++i) f.observe(small, 1.0);
     ASSERT_TRUE(f.warm());
     EXPECT_NEAR(f.psPerByte(), double(n) * 1e6 / double(n * small), 1e-6);
+    // Slow-looking small chunks: no lower than the seed.
+    RateModel s;
+    for (size_t i = 0; i < n; ++i) s.observe(small, 5000.0);
+    ASSERT_TRUE(s.warm());
+    EXPECT_DOUBLE_EQ(s.psPerByte(), RateModel::kSeedPsPerByte);
+}
+
+// A rate slower than the seed that nothing confirms expires: the model is
+// cold again (seed rate, next chunk a probe). A fast one stays.
+TEST(NvlinkProxyPacedIssue, RateModelForgetsAnUnconfirmedSlowRate) {
+    RateModel slow(50 * 1000);  // 50 ms
+    const uint64_t big = RateModel::kFullWeightBytes;
+    slow.observe(big, 80000.0);  // ~0.1 GB/s, measured by a real chunk
+    ASSERT_TRUE(slow.warm());
+    EXPECT_GT(slow.psPerByte(), 5 * RateModel::kSeedPsPerByte);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_FALSE(slow.warm());
+    EXPECT_DOUBLE_EQ(slow.psPerByte(), RateModel::kSeedPsPerByte);
+    slow.observe(big, 80000.0);  // measured again: slow again
+    EXPECT_TRUE(slow.warm());
+    EXPECT_GT(slow.psPerByte(), 5 * RateModel::kSeedPsPerByte);
+    RateModel fast(50 * 1000);
+    fast.observe(big, 800.0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    EXPECT_TRUE(fast.warm());
+    EXPECT_LT(fast.psPerByte(), RateModel::kSeedPsPerByte);
 }
 
 // Every chunk issued and landed when it returns; never more than the window

@@ -318,12 +318,15 @@ daemon.
   - Before it issues a chunk or piece, the daemon predicts when it would
     complete: the work still in flight ahead of it plus the chunk itself, at
     the measured rate of that GPU's copy engines or gather kernel (or of
-    the staged pair) -- an average over completed chunks that follows a
-    slowdown at once, kept across copies (`rate_gbps`), and never faster
-    than this copy's own progress. Until a rate is measured it is assumed to
-    be 1 GB/s and the first chunk is at most 8 MiB and runs alone (a probe).
-    Chunks under 256 KiB are measured together (pooled until they add up to
-    256 KiB, less their fixed costs), so small copies alone warm a rate too.
+    the staged pair) -- an average over completed chunks of at least 1 MiB,
+    weighted by their size up to 8 MiB, that follows a slowdown at once,
+    kept across copies (`rate_gbps`), and never faster than this copy's own
+    progress. Until a rate is measured it is assumed to be 1 GB/s and the
+    first chunk is at most 8 MiB and runs alone (a probe); smaller chunks
+    only warm a cold rate, pooled until they add up to 256 KiB (less their
+    fixed costs) and never below 1 GB/s. A rate below 1 GB/s that no chunk
+    confirms for 10 s is dropped (the next chunk probes again), so a stale
+    low rate cannot keep refusing copies that are then never measured.
     A chunk predicted to finish after the hard deadline is not issued: what
     is in flight is drained and the copy is refused with
     `DEADLINE_EXCEEDED` (`deadline_aborts`), also for host-staged copies.
