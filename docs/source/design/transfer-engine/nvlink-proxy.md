@@ -82,8 +82,10 @@ the wheel with the console entry point `mooncake_nvlink_proxy`. The workflow
    | `MC_NVLINK_PROXY_RECONNECT_WAIT_MS` | How long same-node requests wait for an unavailable daemon before they use the base transport (default: half of the request budget). |
    | `MC_NVLINK_PROXY_FALLBACK_INFLIGHT` | Maximum requests the proxy has in flight on the base transport at a time, across all threads (default 512; with TCP at most half of `MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER`). |
    | `MC_NVLINK_PROXY_STATS_INTERVAL` | Seconds between counter log lines (default 60, 0 = off). |
+   | `MC_NVLINK_PROXY_RELEASE_WAIT_MS` | How long `shutdown()` waits for the daemon to close its mappings of the engine's memory (default 10000). |
 
-   The Python API is unchanged.
+   The Python API is unchanged, apart from `TransferEngine.shutdown()` (see
+   [Shutdown and process snapshots](#shutdown-and-process-snapshots)).
 
 ## Batches of many small copies
 
@@ -153,7 +155,8 @@ together with the exact address range in which that set is unchanged.
   both published in the segment metadata, so peers' cached metadata stays
   valid across daemon restarts.
 - The daemon drops an engine's registrations when its control connection
-  closes (the engine exited or its container restarted) and closes every
+  closes (the engine exited or its container restarted), or when the engine
+  sends `RELEASE` (`shutdown()`), and closes every
   IPC mapping it had opened of that engine's memory, in every GPU context:
   at once, or when the last copy in flight that uses one finishes (bounded
   by the copy's deadline). An open mapping would keep the exporting
@@ -361,6 +364,57 @@ P2P self-test gpu 2 (0000:5e:00) <-> gpu 3 (0000:b1:00): FAILED -> P2P denied ->
 followed by a summary per batch and, when every pair tested so far failed,
 `P2P unusable on this node: N/N GPU pairs tested so far failed the self-test`.
 
+## Shutdown and process snapshots
+
+An engine process can be checkpointed (CRIU with `cuda-checkpoint`) and
+restored, possibly several times from one snapshot, on another node and
+GPU. Its engine must not be part of the snapshot: connections to the daemon
+and to peers, listeners, threads and the daemon's IPC mappings of its
+memory cannot be carried over. The process shuts its engine down before the
+checkpoint and creates a new one after the restore:
+
+1. `TransferEngine.shutdown()` (C++ `TransferEngine::shutdown()`): the
+   binding waits for calls in flight and settles its batches, then every
+   transport is shut down, `nvlink_proxy` first. It stops its health thread
+   and sends `RELEASE` on its control connection (on one opened for it when
+   that connection was lost): the daemon drops the engine's registrations
+   and answers once it holds no IPC mapping of the engine's memory any more
+   -- at once, or when the copies in flight that use one finished, at most
+   `MC_NVLINK_PROXY_RELEASE_WAIT_MS`. Then every connection to the daemon is
+   closed, and the base transport (TCP) closes its acceptor, lanes, server
+   sessions and io threads; last the metadata service closes its handshake
+   listener (woken at once, not at its next receive timeout). When it
+   returns, the process holds no socket, epoll / eventfd descriptor or
+   thread of the engine, and no other process imports its memory.
+   `shutdown()` returns -1 (and logs why) when that was not confirmed: the
+   daemon kept a mapping past the wait, cannot be reached although it
+   listens, or predates `RELEASE` (it then closes the mappings only after
+   the disconnect, unconfirmed). An engine that never had a block accepted
+   by a daemon, or whose daemon no longer listens, has nothing to release.
+2. After the restore, a new `TransferEngine` reads the variables its
+   transports read at start (`MC_FORCE_TCP`, `MC_NVLINK_PROXY_*`,
+   `MC_NODE_ID` / `NODE_NAME`, `MC_TCP_*`), queries the GPU UUID of every
+   block it registers, and draws its identities from the kernel
+   (`getrandom`), not from state the snapshot copied:
+   - the client id, new for every engine;
+   - the process token of `HELLO`: shared by the engines of a process while
+     any of them is installed, drawn anew by an engine installed when none
+     is. Processes restored from one snapshot therefore never present the
+     same token to a daemon, and never share a mapping with each other;
+   - the start of the TCP request ids (protocol v3), redrawn whenever a TCP
+     transport is installed: a receiver tells requests apart by id alone,
+     whichever peer sent them.
+
+The process's environment is the snapshot's: set `NODE_NAME` (or
+`MC_NODE_ID`) in `os.environ` to the new node before creating the new engine
+when it moved. Settings of the engine's global configuration (`MC_HANDSHAKE_*`,
+the RPC port range, `MC_SLICE_*`, ...) are read once per process.
+
+`cudaIpcGetMemHandle` has been called on the engine's `cudaMalloc` blocks
+before the checkpoint; nothing on the exporting side can undo that, and
+whether `cuda-checkpoint` accepts such allocations (no importer left) is a
+property of the driver.
+
 ## Counters
 
 Engine side, logged by each engine every `MC_NVLINK_PROXY_STATS_INTERVAL`
@@ -419,7 +473,10 @@ reply carries the daemon epoch),
 `REGISTER` (block base, size, GPU UUID, IPC handle), `UNREGISTER`, `COPY`
 (list of `(src client, src base, src offset, dst client, dst base,
 dst offset, length)` plus a start budget; replied after the copies completed),
-`PING`, `STATS`.
+`PING`, `STATS`, `RELEASE` (control connection: drop the client's
+registrations; replied once no mapping of its memory is left, or with
+`DEADLINE_EXCEEDED` and the count of those still in use after the wait it
+names).
 
 ## Testing
 
@@ -427,7 +484,15 @@ dst offset, length)` plus a start budget; replied after the copies completed),
 initiator process (e.g. two one-GPU containers on one node plus the daemon) and
 verifies large and paged writes, reads, sub-allocated buffers, guard regions
 and host memory byte by byte. `nvlink_proxy_transport_test` covers the
-protocol helpers and the no-daemon path without GPUs;
+protocol helpers and the no-daemon path without GPUs, and `shutdown()`
+against a stand-in daemon: no socket, epoll / eventfd descriptor, pipe or
+thread of the engine left, `RELEASE` waited for (and reported unconfirmed
+by an older or slow daemon), new client id and process token for the next
+engine. `transfer_engine_shutdown_test.py` checks the same through the
+Python API (calls after `shutdown()` raise, a batch left unfreed, a thread
+still transferring); with `--gpu` it writes through a running daemon,
+shuts down, finds no mapping left in the daemon, and does it again with new
+engines in the same process;
 `nvlink_proxy_policy_test` the self-test plans, the verifier, bus id parsing
 and the deny matrix; `nvlink_proxy_daemon_test` the paced issue against the
 deadline, the IPC mapping table, the socket and the start-up checks.
@@ -439,6 +504,8 @@ configurable link rate), and plays engines over its socket: copies stopped
 before their deadline with no write after the refusal, a slow link at the
 default chunk size, chunked copies byte-exact, host staging, socket
 permissions, mappings closed when an engine disconnects or restarts,
-mappings shared within a process and refused to another,
+mappings shared within a process and refused to another, `RELEASE`
+answered only once no mapping is left (also while a copy holds one, and
+over a connection opened for it),
 `--min-visible-gpus` (CMake target `mooncake_nvlink_proxy_cpu`, CTest
 `nvlink_proxy_cpu_test`).
