@@ -39,6 +39,10 @@ are worker threads) and plays engines over its socket:
                      registrations and is answered only once no mapping of
                      its memory is left, also while a copy holds one or
                      over a connection opened just for it
+  vmm                REGISTER_FD: virtual memory management memory imported
+                     from a file descriptor, copied from and to, mapped
+                     once, released by RELEASE and by a disconnect; a GPU
+                     that cannot be granted access refuses the copy
   gpus               --min-visible-gpus, REGISTER of a GPU the daemon cannot
                      see, a client pid equal to the daemon's
 
@@ -59,7 +63,8 @@ import time
 
 MAGIC, VERSION = 0x504E434D, 1
 HELLO, REGISTER, UNREGISTER, COPY, PING, STATS, RELEASE = 1, 2, 3, 4, 5, 6, 7
-OK, UNKNOWN_DEVICE, UNKNOWN_SOURCE = 0, 3, 4
+REGISTER_FD = 8
+OK, BAD_REQUEST, UNKNOWN_DEVICE, UNKNOWN_SOURCE = 0, 1, 3, 4
 NO_PEER_ACCESS, CUDA_ERROR, DEADLINE_EXCEEDED = 7, 8, 9
 NOT_CONTROL_CONNECTION = 10
 MiB = 1 << 20
@@ -93,13 +98,18 @@ class Conn:
         )
         assert st == OK, st
 
-    def rpc(self, typ, payload=b""):
+    def rpc(self, typ, payload=b"", fds=()):
         with Conn._lock:
             Conn._seq += 1
             seq = Conn._seq
-        self.s.sendall(
+        msg = (
             struct.pack("<IHHIIQ", MAGIC, VERSION, typ, 0, len(payload), seq) + payload
         )
+        if fds:
+            sent = socket.send_fds(self.s, [msg], list(fds))
+            self.s.sendall(msg[sent:])
+        else:
+            self.s.sendall(msg)
         h = b""
         while len(h) < 24:
             chunk = self.s.recv(24 - len(h))
@@ -159,6 +169,31 @@ def register(conn, base, seg, gpu, pid=0):
         REGISTER, struct.pack("<QQ", base, seg.size) + uuid(gpu) + seg.handle(gpu, pid)
     )
     return st, body.decode(errors="replace")
+
+
+def register_fd(conn, base, seg, gpu, buffer_id, with_fd=True):
+    """REGISTER_FD of |seg| as virtual memory management memory: the
+    descriptor of its shared memory file stands for the exported one."""
+    ident = (b"MCVMMFD1" + struct.pack("<Q", buffer_id)).ljust(64, b"\0")
+    payload = struct.pack("<QQ", base, seg.size) + uuid(gpu) + ident
+    fd = os.open("/dev/shm/" + seg.name, os.O_RDWR) if with_fd else None
+    try:
+        st, body = conn.rpc(REGISTER_FD, payload, [fd] if with_fd else ())
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return st, body.decode(errors="replace")
+
+
+def daemon_fds(d, name):
+    """Descriptors of the daemon that refer to shared memory file |name|."""
+    n = 0
+    for fd in os.listdir(f"/proc/{d.proc.pid}/fd"):
+        try:
+            n += name in os.readlink(f"/proc/{d.proc.pid}/fd/{fd}")
+        except OSError:
+            pass
+    return n
 
 
 def release(conn, wait_ms):
@@ -940,6 +975,88 @@ def release_memory():
         unlink_segments("nvlp-a1", "nvlp-a2", "nvlp-b")
 
 
+def vmm():
+    print("== vmm: a block registered by file descriptor (REGISTER_FD)")
+    d = Daemon()
+    try:
+        v = Segment("nvlp-v1", 16 * MiB, 51)  # A's VMM block, gpu 0
+        b = Segment("nvlp-b", 16 * MiB, 52)  # B's cudaMalloc block, gpu 1
+        ca = Conn(d.sock, 0xA, True)
+        cb = Conn(d.sock, 0xB, True)
+        st, msg = register_fd(ca, 0x10000000, v, 0, 7, with_fd=False)
+        check(st == BAD_REQUEST, f"refused without a descriptor ({msg[:50]})")
+        st, _ = register_fd(ca, 0x10000000, v, 0, 7)
+        check(st == OK and daemon_fds(d, "nvlp-v1") == 1, "registered, one import held")
+        assert register(cb, 0x20000000, b, 1)[0] == OK
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        want = v.m[: 4 * MiB]
+        st, _, _, _ = copy(d.sock, runs(1, 4 * MiB))
+        check(st == OK and b.m[: 4 * MiB] == want, "copy from imported memory")
+        st, _, _, _ = copy(
+            d.sock, [(0xB, 0x20000000, 0, 0xA, 0x10000000, 8 * MiB, 2 * MiB)]
+        )
+        check(
+            st == OK and v.m[8 * MiB : 10 * MiB] == b.m[: 2 * MiB],
+            "copy into imported memory",
+        )
+        s = stats(d.sock)
+        check(
+            s["vmm_imports"] == "1" and mapped(d, "nvlp-v1"),
+            "mapped once (vmm_imports=1)",
+        )
+        st, _ = register_fd(ca, 0x10000000, v, 0, 7)  # a reconnect re-registers
+        check(
+            st == OK
+            and d.wait_log("[imported] [unchanged]", 2)
+            and daemon_fds(d, "nvlp-v1") == 1
+            and stats(d.sock)["vmm_imports"] == "1",
+            "the same allocation again: unchanged, the new import released",
+        )
+        st, _, left, _ = release(ca, 2000)
+        check(
+            st == OK
+            and left == 0
+            and not mapped(d, "nvlp-v1")
+            and daemon_fds(d, "nvlp-v1") == 0
+            and stats(d.sock)["vmm_imports"] == "0",
+            "RELEASE: unmapped and released before the answer",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+    print("== vmm: a GPU that cannot be granted access, then a disconnect")
+    d = Daemon([], {"MOCK_VMM_ACCESS_FAIL": "1"})
+    try:
+        v = Segment("nvlp-v1", 16 * MiB, 53)
+        b = Segment("nvlp-b", 16 * MiB)
+        ca = Conn(d.sock, 0xA, True)
+        cb = Conn(d.sock, 0xB, True)
+        assert register_fd(ca, 0x10000000, v, 0, 9)[0] == OK
+        assert register(cb, 0x20000000, b, 1)[0] == OK
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        st, msg, _, _ = copy(d.sock, runs(1, 4 * MiB))  # gpu 1's copy engines
+        check(
+            st == CUDA_ERROR
+            and "imported memory" in msg
+            and b.m[: 4 * MiB] == bytes(4 * MiB)
+            and d.proc.poll() is None,
+            f"copy refused, nothing written, daemon up ({msg[:60]})",
+        )
+        ca.close()
+        end = time.time() + 2
+        while time.time() < end and (mapped(d, "nvlp-v1") or daemon_fds(d, "nvlp-v1")):
+            time.sleep(0.02)
+        check(
+            not mapped(d, "nvlp-v1") and daemon_fds(d, "nvlp-v1") == 0,
+            "the disconnect released the import",
+        )
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-v1", "nvlp-b")
+
+
 def gpus():
     print("== gpus: --min-visible-gpus")
     for n, need, expect in ((1, 2, 78), (0, 1, 78)):
@@ -986,6 +1103,7 @@ SCENARIOS = {
     "restart": restart,
     "share": share,
     "release": release_memory,
+    "vmm": vmm,
     "gpus": gpus,
 }
 

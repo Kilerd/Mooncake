@@ -61,6 +61,7 @@ enum class MsgType : uint16_t {
     kPing = 5,
     kStats = 6,
     kRelease = 7,
+    kRegisterFd = 8,
 };
 
 enum class ProxyStatus : uint32_t {
@@ -149,6 +150,19 @@ struct RegisterReq {
     uint8_t gpu_uuid[kUuidSize];
     uint8_t ipc_handle[kIpcHandleSize];
 };
+
+// REGISTER_FD, on a control connection: REGISTER for a block of virtual
+// memory management memory (cuMemCreate + cuMemMap), which has no legacy
+// IPC handle. The message carries one file descriptor (SCM_RIGHTS, sent
+// with the header) exported with cuMemExportToShareableHandle(
+// CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR); the daemon imports it and maps
+// [0, size) of the allocation (cuMemMap always maps from offset 0). The
+// payload is a RegisterReq whose ipc_handle holds kVmmHandleTag and the
+// allocation's CU_POINTER_ATTRIBUTE_BUFFER_ID: it tells a re-registration
+// of the same allocation from a new one at the same address. Daemons that
+// do not know the message reply BAD_REQUEST (the kernel discards the
+// descriptor they do not receive).
+constexpr char kVmmHandleTag[8] = {'M', 'C', 'V', 'M', 'M', 'F', 'D', '1'};
 
 struct UnregisterReq {
     uint64_t base;

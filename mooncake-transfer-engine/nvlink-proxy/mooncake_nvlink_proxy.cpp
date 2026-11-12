@@ -30,6 +30,8 @@
 // kNoPeerAccess and the engines move them to their base transport (see
 // p2p_policy.h).
 
+#include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -152,6 +154,59 @@ bool readAll(int fd, void *buf, size_t len) {
     return true;
 }
 
+// File descriptors received with a message (SCM_RIGHTS); those not taken
+// are closed with it.
+struct PassedFds {
+    std::vector<int> fds;
+    PassedFds() = default;
+    PassedFds(const PassedFds &) = delete;
+    PassedFds &operator=(const PassedFds &) = delete;
+    ~PassedFds() { closeAll(); }
+    void closeAll() {
+        for (int f : fds)
+            if (f >= 0) close(f);
+        fds.clear();
+    }
+    int take(size_t i) {
+        const int f = fds[i];
+        fds[i] = -1;
+        return f;
+    }
+};
+
+// readAll() that keeps the descriptors arriving with the bytes.
+bool readAllFds(int fd, void *buf, size_t len, PassedFds &passed) {
+    char *p = static_cast<char *>(buf);
+    while (len > 0) {
+        iovec iov{p, len};
+        alignas(cmsghdr) char ctrl[CMSG_SPACE(4 * sizeof(int))];
+        msghdr m{};
+        m.msg_iov = &iov;
+        m.msg_iovlen = 1;
+        m.msg_control = ctrl;
+        m.msg_controllen = sizeof(ctrl);
+        const ssize_t n = recvmsg(fd, &m, MSG_CMSG_CLOEXEC);
+        if (n == 0) return false;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        for (cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
+            if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+                continue;
+            const size_t k = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            for (size_t i = 0; i < k; ++i) {
+                int f;
+                memcpy(&f, CMSG_DATA(c) + i * sizeof(int), sizeof(int));
+                passed.fds.push_back(f);
+            }
+        }
+        p += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
 bool sendMsg(int fd, MsgType type, uint64_t seq, ProxyStatus status,
              const void *payload, size_t len) {
     MsgHeader h{};
@@ -262,6 +317,110 @@ static_assert(kIpcHandleSize == kImportHandleBytes, "IPC handle size");
 using Imports = ImportTable<CudaIpcOpener>;
 Imports g_imports;
 
+// ------------------------------------------------------- VMM imports
+// Virtual-memory-management blocks (REGISTER_FD) arrive as POSIX file
+// descriptors of their allocation; the daemon imports one per
+// registration and maps it once in its address space. The driver calls go
+// through the runtime's entry point lookup: the runtime is linked
+// statically and only the driver is needed at run time (a CPU stand-in
+// supplies them in tests).
+struct VmmApi {
+    PFN_cuMemImportFromShareableHandle import_handle = nullptr;
+    PFN_cuMemAddressReserve reserve = nullptr;
+    PFN_cuMemMap map = nullptr;
+    PFN_cuMemSetAccess set_access = nullptr;
+    PFN_cuMemUnmap unmap = nullptr;
+    PFN_cuMemAddressFree address_free = nullptr;
+    PFN_cuMemRelease release = nullptr;
+    bool ok = false;
+};
+
+template <class F>
+bool driverEntry(const char *name, F &fn) {
+    void *p = nullptr;
+    cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+    const cudaError_t e = cudaGetDriverEntryPointByVersion(
+        name, &p, 12000, cudaEnableDefault, &q);
+    if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || !p) {
+        cudaGetLastError();
+        return false;
+    }
+    fn = reinterpret_cast<F>(p);
+    return true;
+}
+
+const VmmApi &vmmApi() {
+    static const VmmApi api = [] {
+        VmmApi a;
+        a.ok = driverEntry("cuMemImportFromShareableHandle", a.import_handle) &&
+               driverEntry("cuMemAddressReserve", a.reserve) &&
+               driverEntry("cuMemMap", a.map) &&
+               driverEntry("cuMemSetAccess", a.set_access) &&
+               driverEntry("cuMemUnmap", a.unmap) &&
+               driverEntry("cuMemAddressFree", a.address_free) &&
+               driverEntry("cuMemRelease", a.release);
+        if (!a.ok)
+            LOGW(
+                "the driver offers no virtual memory management calls: "
+                "REGISTER_FD is refused");
+        return a;
+    }();
+    return api;
+}
+
+// Imported VMM allocations per client (registrations that hold one).
+std::mutex g_vmm_mu;
+std::map<uint64_t, size_t> g_vmm_imports;
+
+void noteVmmImport(uint64_t client, int delta) {
+    std::lock_guard<std::mutex> lock(g_vmm_mu);
+    size_t &n = g_vmm_imports[client];
+    n = delta > 0 ? n + 1 : (n ? n - 1 : 0);
+    if (n == 0) g_vmm_imports.erase(client);
+}
+
+size_t vmmImports(uint64_t client) {
+    std::lock_guard<std::mutex> lock(g_vmm_mu);
+    auto it = g_vmm_imports.find(client);
+    return it == g_vmm_imports.end() ? 0 : it->second;
+}
+
+size_t vmmImportsTotal() {
+    std::lock_guard<std::mutex> lock(g_vmm_mu);
+    size_t n = 0;
+    for (auto &kv : g_vmm_imports) n += kv.second;
+    return n;
+}
+
+// Imports the allocation behind |fd| (exported by an engine with
+// cuMemExportToShareableHandle) in |dev|'s context. Closes |fd|.
+bool vmmImport(int dev, int fd, CUmemGenericAllocationHandle *handle,
+               std::string *error) {
+    const VmmApi &api = vmmApi();
+    bool ok = false;
+    if (!api.ok) {
+        *error = "the daemon's driver has no virtual memory management";
+    } else if (cudaSetDevice(dev) != cudaSuccess) {
+        cudaGetLastError();
+        *error = "cudaSetDevice failed";
+    } else {
+        const CUresult r = api.import_handle(
+            handle, reinterpret_cast<void *>(static_cast<intptr_t>(fd)),
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+        ok = r == CUDA_SUCCESS;
+        if (!ok)
+            *error = "cuMemImportFromShareableHandle failed (CUresult " +
+                     std::to_string(static_cast<int>(r)) + ")";
+    }
+    close(fd);
+    return ok;
+}
+
+// Every IPC mapping or VMM import of |client|'s memory the daemon holds.
+size_t mappingsHeld(uint64_t client) {
+    return g_imports.mappingsOf(client) + vmmImports(client);
+}
+
 // Clients with an open control connection (client id -> connections): a
 // mapping is shared with another client of the same process only while one
 // of its holders is still connected.
@@ -302,11 +461,40 @@ struct Registration {
     std::mutex mu;
     std::unordered_map<int, char *> mapped;  // pulling device -> mapped base
 
+    // A virtual-memory-management block (REGISTER_FD): its imported
+    // allocation, mapped once (all contexts share the address) and made
+    // accessible to each GPU that copies from or to it.
+    bool vmm = false;
+    CUmemGenericAllocationHandle vmm_handle = 0;
+    char *vmm_ptr = nullptr;
+    std::set<int> vmm_access;
+
     // The last reference is gone: the block was unregistered or replaced,
     // or its engine's control connection closed, and no copy in flight uses
     // it any more. Its mappings are closed now unless another registration
     // of the same engine (a re-registration) still uses them.
     ~Registration() {
+        if (vmm) {
+            const VmmApi &api = vmmApi();
+            cudaSetDevice(device);
+            CUresult r = CUDA_SUCCESS;
+            if (vmm_ptr) {
+                const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(vmm_ptr);
+                r = api.unmap(va, size);
+                if (r == CUDA_SUCCESS) r = api.address_free(va, size);
+            }
+            if (r == CUDA_SUCCESS) r = api.release(vmm_handle);
+            noteVmmImport(client_id, -1);
+            if (r != CUDA_SUCCESS)
+                LOGW("releasing the imported memory of client=%016" PRIx64
+                     " base=%#" PRIx64 ": CUresult %d",
+                     client_id, base, static_cast<int>(r));
+            else
+                LOGI("closed client=%016" PRIx64 " base=%#" PRIx64
+                     " (gpu %d, imported memory)",
+                     client_id, base, device);
+            return;
+        }
         for (auto &kv : mapped) {
             int err = 0;
             const bool closed =
@@ -331,6 +519,7 @@ struct Registration {
                        Imports::Acquired *conflict) {
         std::lock_guard<std::mutex> lock(mu);
         *opened = false;
+        if (vmm) return mapVmmLocked(dev, out, opened);
         auto it = mapped.find(dev);
         if (it != mapped.end()) {
             *out = it->second;
@@ -357,6 +546,51 @@ struct Registration {
         mapped[dev] = static_cast<char *>(a.ptr);
         *out = static_cast<char *>(a.ptr);
         *opened = a.opened;
+        return cudaSuccess;
+    }
+
+    // Maps the imported allocation (once) and grants |dev| access to it.
+    // Failures are not sticky CUDA errors: the copy is refused.
+    cudaError_t mapVmmLocked(int dev, char **out, bool *opened) {
+        const VmmApi &api = vmmApi();
+        if (!vmm_ptr) {
+            const uint64_t t0 = nowUs();
+            cudaSetDevice(device);
+            CUdeviceptr va = 0;
+            CUresult r = api.reserve(&va, size, 0, 0, 0);
+            if (r == CUDA_SUCCESS) {
+                r = api.map(va, size, 0, vmm_handle, 0);
+                if (r != CUDA_SUCCESS) api.address_free(va, size);
+            }
+            if (r != CUDA_SUCCESS) {
+                LOGW("mapping the imported memory of client=%016" PRIx64
+                     " base=%#" PRIx64 " size=%" PRIu64 ": CUresult %d",
+                     client_id, base, size, static_cast<int>(r));
+                return cudaErrorMapBufferObjectFailed;
+            }
+            vmm_ptr = reinterpret_cast<char *>(va);
+            *opened = true;
+            LOGI("mapped client=%016" PRIx64 " base=%#" PRIx64 " size=%" PRIu64
+                 " (gpu %d, imported memory) in %.1f ms",
+                 client_id, base, size, device, (nowUs() - t0) / 1000.0);
+        }
+        if (!vmm_access.count(dev)) {
+            CUmemAccessDesc access{};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id = dev;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            const CUresult r = api.set_access(
+                reinterpret_cast<CUdeviceptr>(vmm_ptr), size, &access, 1);
+            if (r != CUDA_SUCCESS) {
+                LOGW(
+                    "granting gpu %d access to the imported memory of "
+                    "client=%016" PRIx64 " base=%#" PRIx64 ": CUresult %d",
+                    dev, client_id, base, static_cast<int>(r));
+                return cudaErrorMapBufferObjectFailed;
+            }
+            vmm_access.insert(dev);
+        }
+        *out = vmm_ptr;
         return cudaSuccess;
     }
 };
@@ -459,7 +693,8 @@ std::string statsText() {
         std::to_string(g_stats.register_refusals.load());
     out += " ipc_mappings=" + std::to_string(g_imports.mappings()) +
            " ipc_closes=" + std::to_string(g_imports.closes()) +
-           " ipc_conflicts=" + std::to_string(g_imports.conflicts());
+           " ipc_conflicts=" + std::to_string(g_imports.conflicts()) +
+           " vmm_imports=" + std::to_string(vmmImportsTotal());
     // Measured rates of the work served so far (GB/s): gpu.ce, gpu.kernel,
     // and src>dst for host-staged pairs.
     std::string rates;
@@ -1178,6 +1413,11 @@ class MapResolver {
                          ", which has disconnected (copies in flight still "
                          "use the mapping); not served from that mapping",
                          failed_->client_id, failed_->base, c.other);
+        } else if (failed_ && failed_->vmm) {
+            snprintf(m, sizeof(m),
+                     "mapping the imported memory of block client=%016" PRIx64
+                     " base=%#" PRIx64 " failed (see daemon log)",
+                     failed_->client_id, failed_->base);
         } else {
             snprintf(m, sizeof(m), "cudaIpcOpenMemHandle: %s",
                      cudaGetErrorString(e));
@@ -1672,7 +1912,7 @@ size_t dropOwned(Connection &c, const char *what = "disconnected") {
     // open mapping would keep the engine's GPU memory allocated after it
     // exited.
     c.owned.clear();
-    const size_t held = g_imports.mappingsOf(c.client_id);
+    const size_t held = mappingsHeld(c.client_id);
     LOGI("client %016" PRIx64
          " (pid %u, node %s) %s; released %zu registrations, %s",
          c.client_id, c.pid, c.node.c_str(), what, dropped,
@@ -1692,7 +1932,10 @@ void handleConnection(int fd) {
     std::vector<char> payload;
     while (true) {
         MsgHeader h;
-        if (!readAll(fd, &h, sizeof(h))) break;
+        // Descriptors come with the header (REGISTER_FD); any other message
+        // closes those it brought.
+        PassedFds passed;
+        if (!readAllFds(fd, &h, sizeof(h), passed)) break;
         if (h.magic != kMagic) {
             LOGW("bad magic on fd %d, closing", fd);
             break;
@@ -1774,16 +2017,21 @@ void handleConnection(int fd) {
                              sizeof(resp));
                 break;
             }
-            case MsgType::kRegister: {
+            case MsgType::kRegister:
+            case MsgType::kRegisterFd: {
+                const bool vmm = type == MsgType::kRegisterFd;
                 if (!c.control) {
                     replyError(fd, type, h.seq,
                                ProxyStatus::kNotControlConnection,
                                "REGISTER requires a control connection");
                     break;
                 }
-                if (payload.size() != sizeof(RegisterReq)) {
+                if (payload.size() != sizeof(RegisterReq) ||
+                    (vmm && passed.fds.size() != 1)) {
                     replyError(fd, type, h.seq, ProxyStatus::kBadRequest,
-                               "bad REGISTER");
+                               vmm ? "bad REGISTER_FD (one RegisterReq and "
+                                     "one file descriptor)"
+                                   : "bad REGISTER");
                     break;
                 }
                 RegisterReq req;
@@ -1825,6 +2073,23 @@ void handleConnection(int fd) {
                                "bad block range");
                     break;
                 }
+                // The allocation behind the descriptor; released again when
+                // an identical registration already holds one.
+                CUmemGenericAllocationHandle imported = 0;
+                if (vmm) {
+                    std::string err;
+                    if (!vmmImport(dev, passed.take(0), &imported, &err)) {
+                        g_stats.register_refusals++;
+                        LOGE("client %016" PRIx64
+                             " registers imported memory at base=%#" PRIx64
+                             ": %s; its transfers use the engine's base "
+                             "transport",
+                             c.client_id, req.base, err.c_str());
+                        replyError(fd, type, h.seq, ProxyStatus::kCudaError,
+                                   err);
+                        break;
+                    }
+                }
                 // An engine's first block on this GPU: test the GPU's pairs
                 // that have not passed yet (in the background; until then,
                 // in enforce mode, copies between them are refused), before
@@ -1837,6 +2102,7 @@ void handleConnection(int fd) {
                     if (it != g_regs.end()) {
                         auto &old = it->second;
                         same = old->size == req.size && old->device == dev &&
+                               old->vmm == vmm &&
                                memcmp(old->handle, req.ipc_handle,
                                       kIpcHandleSize) == 0;
                         replaced = !same;
@@ -1851,6 +2117,12 @@ void handleConnection(int fd) {
                         reg->size = req.size;
                         reg->device = dev;
                         memcpy(reg->handle, req.ipc_handle, kIpcHandleSize);
+                        if (vmm) {
+                            reg->vmm = true;
+                            reg->vmm_handle = imported;
+                            imported = 0;
+                            noteVmmImport(c.client_id, +1);
+                        }
                         reg->owner_conn = c.conn_id;
                         g_regs[{c.client_id, req.base}] = reg;
                         c.owned[req.base] = reg;
@@ -1860,10 +2132,11 @@ void handleConnection(int fd) {
                         c.owned[req.base] = it->second;
                     }
                 }
+                if (imported) vmmApi().release(imported);
                 LOGI("register client=%016" PRIx64 " base=%#" PRIx64
-                     " size=%" PRIu64 " gpu=%d (%s)%s",
+                     " size=%" PRIu64 " gpu=%d (%s)%s%s",
                      c.client_id, req.base, req.size, dev,
-                     g_devices[dev].pci.c_str(),
+                     g_devices[dev].pci.c_str(), vmm ? " [imported]" : "",
                      same ? " [unchanged]" : (replaced ? " [replaced]" : ""));
                 ok = sendMsg(fd, type, h.seq, ProxyStatus::kOk, nullptr, 0);
                 break;
@@ -2024,7 +2297,7 @@ void handleConnection(int fd) {
                     t0 +
                     uint64_t(std::min<uint32_t>(req.wait_ms, 600000)) * 1000;
                 size_t held;
-                while ((held = g_imports.mappingsOf(c.client_id)) > 0 &&
+                while ((held = mappingsHeld(c.client_id)) > 0 &&
                        nowUs() < until)
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 ReleaseResp resp{};
@@ -3679,7 +3952,8 @@ void usage(const char *argv0) {
         "rate_gbps (measured rates the deadline predictions use),\n"
         "register_refusals, ipc_mappings (IPC handles open now), ipc_closes\n"
         "and ipc_conflicts (copies refused because a handle was still mapped\n"
-        "for another engine).\n",
+        "for another engine), vmm_imports (virtual memory management\n"
+        "allocations imported from engines' file descriptors now).\n",
         argv0);
 }
 
