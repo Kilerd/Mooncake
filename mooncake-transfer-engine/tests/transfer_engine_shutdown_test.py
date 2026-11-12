@@ -347,6 +347,24 @@ def cpu_mode():
         b = None
         check(wait_until(daemon.idle, 2), "the daemon saw every connection close")
 
+        print("== an engine handed out with get_engine()")
+        e = tcp_engine()
+        inner = e.get_engine()
+        try:
+            e.shutdown()
+            check(False, "shutdown() refused while get_engine()'s engine lives")
+        except RuntimeError as err:
+            check(
+                "still referenced" in str(err),
+                f"shutdown() refused while get_engine()'s engine lives ({err})",
+            )
+        ok, _ = loopback_write(e, seed=7)
+        check(ok, "the engine still works after the refusal")
+        del inner  # the only other reference
+        check(e.shutdown() == 0, "shutdown() once it is released")
+        e = None
+        check(wait_until(daemon.idle, 2), "the daemon saw every connection close")
+
         print("== a thread still calling the engine")
         c = tcp_engine()
         ok, (src, dst, session) = loopback_write(c)

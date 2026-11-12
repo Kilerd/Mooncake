@@ -215,7 +215,9 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                    << "Use 'hip' instead.";
         return -1;
     }
-    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mu_);
+    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mu_,
+                                                  std::defer_lock);
+    lockWithoutGil(lifecycle);
     if (shut_down_)
         throw std::runtime_error(
             "TransferEngine is shut down: create a new TransferEngine");
@@ -350,7 +352,8 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 }
 
 std::shared_lock<std::shared_mutex> TransferEnginePy::useEngine() {
-    std::shared_lock<std::shared_mutex> lock(lifecycle_mu_);
+    std::shared_lock<std::shared_mutex> lock(lifecycle_mu_, std::defer_lock);
+    lockWithoutGil(lock);
     if (!engine_)
         throw std::runtime_error(
             shut_down_ ? "TransferEngine is shut down: create a new "
@@ -380,6 +383,13 @@ int TransferEnginePy::shutdown() {
             std::to_string(cuda_pending_->load()) +
             " transfer(s) queued on CUDA streams have not run yet; "
             "synchronize those streams first");
+    // An engine handed out (get_engine(), e.g. to a Store) would be used
+    // after it is gone.
+    if (engine_.use_count() > 1)
+        throw std::runtime_error(
+            "TransferEngine.shutdown: the engine is still referenced " +
+            std::to_string(engine_.use_count() - 1) +
+            " more time(s) (get_engine(), a Store); release those first");
     shut_down_ = true;
 
     // Batches still known (not freed by the caller, or kept by failed sync
@@ -401,10 +411,14 @@ int TransferEnginePy::shutdown() {
         if (!waitBatchQuiesced(*engine_, batch, left_ms, &p)) ++unquiesced;
         if (batchSettled(p)) engine_->freeBatchID(batch);
     }
+    // The requests of a batch that did not settle stay alive until the
+    // transports that may still read them are gone.
+    std::unordered_map<batch_id_t, LiveBatch> live;
+    std::vector<LeftBatch> left;
     {
         std::lock_guard<std::mutex> guard(batches_mu_);
-        live_batches_.clear();
-        left_batches_.clear();
+        live.swap(live_batches_);
+        left.swap(left_batches_);
     }
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1237,8 +1251,11 @@ void CUDART_CB transfer_on_cuda_callback(void* data) {
     }
 
     ctx->engine->freeBatchID(ctx->batch_id);
-    ctx->pending->fetch_sub(1);
-    delete ctx;
+    {
+        auto pending = std::move(ctx->pending);
+        delete ctx;  // gives up its reference to the engine first
+        pending->fetch_sub(1);
+    }
     return;
 
 error_exit:
@@ -1467,7 +1484,12 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
     pybind11::gil_scoped_release release;
     std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mu_);
-    if (!engine_) return -1;
+    if (!engine_) {
+        if (shut_down_)
+            throw std::runtime_error(
+                "TransferEngine is shut down: create a new TransferEngine");
+        return -1;
+    }
     return engine_->getMetadata()->sendProbe(peer_server_name);
 }
 

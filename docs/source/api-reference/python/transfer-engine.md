@@ -117,9 +117,10 @@ is checkpointed next and restored elsewhere (see
 
 Transfers queued on CUDA streams (`*_on_cuda`) must have run: `shutdown()`
 waits for them as long as `MC_TRANSFER_QUIESCE_WAIT_MS` and raises
-`RuntimeError` (without shutting down) if some have not. An engine returned by
-`get_engine()` is unusable afterwards too. Managed buffers stay allocated until
-the object is destroyed.
+`RuntimeError` (without shutting down) if some have not. It also raises,
+changing nothing, while an engine returned by `get_engine()` is still
+referenced (e.g. by a Store); a pointer from `get_engine_ptr()` is invalid
+afterwards. Managed buffers stay allocated until the object is destroyed.
 
 To transfer again, create a new `TransferEngine` and initialize it. The new
 engine reads `MC_NODE_ID` / `NODE_NAME` and its transports' variables again,

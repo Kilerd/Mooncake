@@ -34,6 +34,20 @@
 
 using namespace mooncake;
 
+// Takes |lock| (on TransferEnginePy's lifecycle mutex) without holding the
+// GIL while it waits: the thread holding the mutex may need the GIL to
+// finish its call, and a shutdown() waiting for it must not freeze Python.
+template <class Lock>
+void lockWithoutGil(Lock &lock) {
+    if (lock.try_lock()) return;
+    if (PyGILState_Check()) {
+        pybind11::gil_scoped_release release;
+        lock.lock();
+    } else {
+        lock.lock();
+    }
+}
+
 const static size_t kDefaultBufferCapacity = 2ull * 1024 * 1024 * 1024;
 const static size_t kSlabSizeKBTabLen = 16;
 const static size_t kMaxClassId = kSlabSizeKBTabLen - 1;
@@ -73,6 +87,8 @@ class TransferEnginePy {
     // Idempotent: later calls return the first result. 0, or -1 when not all
     // of it was confirmed (a batch not quiesced, or the nvlink_proxy daemon
     // did not confirm it closed its mappings of this engine's memory).
+    // Raises, changing nothing, while transfers queued on CUDA streams have
+    // not run or the engine is still referenced (get_engine(), a Store).
     int shutdown();
 
     int getRpcPort();
@@ -220,15 +236,19 @@ class TransferEnginePy {
 
     int sendProbe(const std::string &peer_server_name);
 
-    // None / 0 once shut down. An engine handed out is unusable after
-    // shutdown() too.
+    // None / 0 once shut down. shutdown() refuses while an engine handed out
+    // is still referenced; a pointer handed out is invalid after it.
     std::shared_ptr<TransferEngine> getEngine() const {
-        std::shared_lock<std::shared_mutex> lock(lifecycle_mu_);
+        std::shared_lock<std::shared_mutex> lock(lifecycle_mu_,
+                                                 std::defer_lock);
+        lockWithoutGil(lock);
         return engine_;
     }
 
     uintptr_t getEnginePtr() const {
-        std::shared_lock<std::shared_mutex> lock(lifecycle_mu_);
+        std::shared_lock<std::shared_mutex> lock(lifecycle_mu_,
+                                                 std::defer_lock);
+        lockWithoutGil(lock);
         return (uintptr_t)engine_.get();
     }
 
@@ -240,9 +260,8 @@ class TransferEnginePy {
     int doBuddyAllocate(int class_id);
 
     // A use of engine_ for one call (lifecycle_mu_ shared): shutdown() waits
-    // for it. Raises when the engine is shut down or not initialized. Taken
-    // with the GIL held only by calls that keep it; others take it after
-    // releasing the GIL and drop it before taking the GIL back.
+    // for it. Raises when the engine is shut down or not initialized. Never
+    // waited for with the GIL held (lockWithoutGil).
     std::shared_lock<std::shared_mutex> useEngine();
 
    private:
