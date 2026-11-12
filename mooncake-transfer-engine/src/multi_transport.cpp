@@ -91,7 +91,30 @@ MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string& local_server_name)
     : metadata_(metadata), local_server_name_(local_server_name) {}
 
-MultiTransport::~MultiTransport() {}
+MultiTransport::~MultiTransport() {
+#ifdef USE_NVLINK_PROXY
+    // nvlink_proxy before its base transport: it moves work onto it.
+    nvlink_proxy_ = nullptr;
+    transport_map_.erase("nvlink_proxy");
+#endif
+}
+
+int MultiTransport::shutdown() {
+    int rc = 0;
+#ifdef USE_NVLINK_PROXY
+    auto proxy = transport_map_.find("nvlink_proxy");
+    if (proxy != transport_map_.end()) {
+        if (proxy->second->shutdown() != 0) rc = -1;
+        nvlink_proxy_ = nullptr;
+        transport_map_.erase(proxy);
+    }
+#endif
+    for (auto& entry : transport_map_)
+        if (entry.second->shutdown() != 0) rc = -1;
+    transport_map_.clear();
+    ++install_generation_;  // routes cached by threads name those transports
+    return rc;
+}
 
 MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     auto batch_desc = new BatchDesc();

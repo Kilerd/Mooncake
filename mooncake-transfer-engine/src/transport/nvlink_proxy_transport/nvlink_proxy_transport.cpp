@@ -31,11 +31,11 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
-#include <random>
 #include <thread>
 
 #include "common.h"
 #include "error.h"
+#include "fresh_random.h"
 
 namespace mooncake {
 
@@ -119,43 +119,31 @@ std::string resolveNodeId() {
     return id;
 }
 
-// Random per process (the same for every engine in it), never 0.
-uint64_t processToken() {
-    static const uint64_t token = [] {
-        std::random_device rd;
-        uint64_t t = (uint64_t(rd()) << 32) ^ rd() ^ uint64_t(nowNs());
-        return t ? t : 1;
-    }();
-    return token;
+uint64_t nonZeroRandom() {
+    uint64_t v;
+    do v = freshRandom64();
+    while (v == 0);
+    return v;
 }
 
-uint64_t randomClientId() {
-    std::random_device rd;
-    uint64_t id = (uint64_t(rd()) << 32) ^ rd() ^ (uint64_t(getpid()) << 16) ^
-                  uint64_t(nowNs());
-    return id ? id : 1;
+// The process token of HELLO: the engines of a process share it while any
+// of them is installed, and one installed when none is draws a new one.
+// Processes restored from one snapshot (same memory, same pid) therefore
+// report different tokens once their engines were shut down before the
+// checkpoint and recreated after the restore.
+std::mutex g_token_mu;
+uint64_t g_token = 0;
+size_t g_token_users = 0;
+
+uint64_t acquireProcessToken() {
+    std::lock_guard<std::mutex> lock(g_token_mu);
+    if (g_token_users++ == 0) g_token = nonZeroRandom();
+    return g_token;
 }
 
-bool deviceUuid(int dev, uint8_t out[kUuidSize]) {
-    static std::mutex mu;
-    static std::unordered_map<int, std::array<uint8_t, kUuidSize>> cache;
-    std::lock_guard<std::mutex> lock(mu);
-    auto it = cache.find(dev);
-    if (it == cache.end()) {
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, dev);
-        if (err != cudaSuccess) {
-            cudaGetLastError();
-            LOG(WARNING) << "nvlink_proxy: cudaGetDeviceProperties(" << dev
-                         << "): " << cudaGetErrorString(err);
-            return false;
-        }
-        std::array<uint8_t, kUuidSize> u;
-        memcpy(u.data(), prop.uuid.bytes, kUuidSize);
-        it = cache.emplace(dev, u).first;
-    }
-    memcpy(out, it->second.data(), kUuidSize);
-    return true;
+void releaseProcessToken() {
+    std::lock_guard<std::mutex> lock(g_token_mu);
+    if (g_token_users > 0) --g_token_users;
 }
 
 const char *reasonName(int reason) {
@@ -173,16 +161,29 @@ const char *reasonName(int reason) {
 
 NvlinkProxyTransport::NvlinkProxyTransport() = default;
 
-NvlinkProxyTransport::~NvlinkProxyTransport() {
+NvlinkProxyTransport::~NvlinkProxyTransport() { stop(false); }
+
+int NvlinkProxyTransport::shutdown() { return stop(true) ? 0 : -1; }
+
+bool NvlinkProxyTransport::stop(bool release) {
     {
         std::lock_guard<std::mutex> lock(health_mu_);
+        if (stopped_) return release_confirmed_;
+        stopped_ = true;
         stop_ = true;
     }
     health_cv_.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(state_mu_);
+        shut_down_ = true;
+    }
+    state_cv_.notify_all();
     if (health_thread_.joinable()) health_thread_.join();
     maybeLogStats(true);
+    bool confirmed = true;
     {
         std::lock_guard<std::mutex> lock(control_mu_);
+        if (release) confirmed = releaseLocked();
         closeControlLocked();
     }
     {
@@ -190,12 +191,131 @@ NvlinkProxyTransport::~NvlinkProxyTransport() {
         for (auto &c : idle_) close(c.fd);
         idle_.clear();
     }
-    // Unconfirmed attempts stay counted (their batches never quiesce);
-    // abandoned fallback batches are leaked: the base transport may still
-    // reference them.
-    std::lock_guard<std::mutex> lock(unconfirmed_mu_);
-    for (auto &u : unconfirmed_)
-        if (u.fd >= 0) close(u.fd);
+    {
+        // Unconfirmed attempts stay counted (their batches never quiesce);
+        // abandoned fallback batches are leaked: the base transport may
+        // still reference them.
+        std::lock_guard<std::mutex> lock(unconfirmed_mu_);
+        for (auto &u : unconfirmed_) {
+            if (u.fd >= 0) close(u.fd);
+            u.fd = -1;
+        }
+    }
+    if (process_token_) releaseProcessToken();
+    std::lock_guard<std::mutex> lock(health_mu_);
+    release_confirmed_ = confirmed;
+    return confirmed;
+}
+
+// Requires control_mu_.
+bool NvlinkProxyTransport::releaseLocked() {
+    // No daemon ever accepted a block: none can have mapped this memory.
+    if (!ever_registered_) return true;
+    char id[32];
+    snprintf(id, sizeof(id), "%016" PRIx64, client_id_);
+    int fd = control_fd_;
+    const bool own = fd < 0;
+    if (own) {
+        // The control connection is gone (the daemon drops what it
+        // registered by itself); one opened for RELEASE waits for the
+        // mappings of that memory to be closed.
+        fd = connectSocket(2000);
+        if (fd < 0) {
+            const int err = errno;
+            if (err == ENOENT || err == ECONNREFUSED) {
+                LOG(WARNING) << "nvlink_proxy: client " << id
+                             << ": no daemon listens at " << socket_path_
+                             << " (" << strerror(err)
+                             << "); a daemon that exited holds no mapping "
+                                "of this engine's memory";
+                return true;
+            }
+            LOG(ERROR) << "nvlink_proxy: client " << id
+                       << ": cannot reach the daemon at " << socket_path_
+                       << " to release this engine's memory (" << strerror(err)
+                       << ")";
+            return false;
+        }
+        uint64_t epoch = 0;
+        if (!hello(fd, true, epoch)) {
+            const int err = errno;
+            close(fd);
+            LOG(ERROR) << "nvlink_proxy: client " << id
+                       << ": HELLO to release this engine's memory failed ("
+                       << strerror(err) << ")";
+            return false;
+        }
+    }
+    // The daemon answers once the mappings are closed: wait longer than it.
+    const int wait_ms = release_wait_ms_ + 2000;
+    struct timeval tv;
+    tv.tv_sec = wait_ms / 1000;
+    tv.tv_usec = (wait_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ReleaseReq req{};
+    req.wait_ms = static_cast<uint32_t>(release_wait_ms_);
+    ProxyStatus st = ProxyStatus::kOk;
+    std::string reply;
+    const int64_t t0 = nowNs();
+    const bool answered =
+        rpc(fd, MsgType::kRelease, &req, sizeof(req), st, reply);
+    const int err = errno;
+    if (own) close(fd);
+    const int64_t ms = (nowNs() - t0) / 1000000;
+    ReleaseResp resp{};
+    const bool sized = answered && reply.size() == sizeof(resp);
+    if (sized) memcpy(&resp, reply.data(), sizeof(resp));
+    if (sized && st == ProxyStatus::kOk) {
+        LOG(INFO) << "nvlink_proxy: client " << id << " released "
+                  << resp.dropped
+                  << " registration(s); the daemon holds no IPC mapping of "
+                     "this engine's memory ("
+                  << ms << " ms)";
+        return true;
+    }
+    if (!answered) {
+        LOG(ERROR) << "nvlink_proxy: client " << id
+                   << ": no answer to RELEASE (" << strerror(err)
+                   << "); the daemon drops this engine's registrations once "
+                      "it is disconnected and closes their mappings when "
+                      "the copies using them end, unconfirmed";
+    } else if (sized && st == ProxyStatus::kDeadlineExceeded) {
+        LOG(ERROR) << "nvlink_proxy: client " << id << ": " << resp.mappings
+                   << " IPC mapping(s) of this engine's memory still used by "
+                      "copies in flight after "
+                   << ms << " ms (MC_NVLINK_PROXY_RELEASE_WAIT_MS="
+                   << release_wait_ms_ << ")";
+    } else {
+        LOG(ERROR) << "nvlink_proxy: client " << id
+                   << ": the daemon refused RELEASE: " << proxyStatusName(st)
+                   << (sized ? "" : " " + reply)
+                   << (st == ProxyStatus::kBadRequest
+                           ? " (a daemon older than this engine: it closes "
+                             "the mappings of this engine's memory after "
+                             "the disconnect, unconfirmed)"
+                           : "");
+    }
+    return false;
+}
+
+bool NvlinkProxyTransport::deviceUuid(int dev, uint8_t out[kUuidSize]) {
+    std::lock_guard<std::mutex> lock(uuid_mu_);
+    auto it = uuids_.find(dev);
+    if (it == uuids_.end()) {
+        cudaDeviceProp prop;
+        cudaError_t err = cudaGetDeviceProperties(&prop, dev);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            LOG(WARNING) << "nvlink_proxy: cudaGetDeviceProperties(" << dev
+                         << "): " << cudaGetErrorString(err);
+            return false;
+        }
+        std::array<uint8_t, kUuidSize> u;
+        memcpy(u.data(), prop.uuid.bytes, kUuidSize);
+        it = uuids_.emplace(dev, u).first;
+    }
+    memcpy(out, it->second.data(), kUuidSize);
+    return true;
 }
 
 int NvlinkProxyTransport::install(std::string &local_server_name,
@@ -211,11 +331,14 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
     }
     socket_path_ = sock;
     node_id_ = resolveNodeId();
-    client_id_ = randomClientId();
+    client_id_ = nonZeroRandom();
+    process_token_ = acquireProcessToken();
     timeout_ms_ = std::max(100, envInt("MC_NVLINK_PROXY_TIMEOUT_MS", 30000));
     reconnect_wait_ms_ = std::min(
         timeout_ms_, std::max(0, envInt("MC_NVLINK_PROXY_RECONNECT_WAIT_MS",
                                         timeout_ms_ / 2)));
+    release_wait_ms_ = std::min(
+        600000, std::max(0, envInt("MC_NVLINK_PROXY_RELEASE_WAIT_MS", 10000)));
     stats_interval_s_ = envInt("MC_NVLINK_PROXY_STATS_INTERVAL", 60);
     outage_since_ns_ = nowNs();  // until the first connection succeeds
 
@@ -246,7 +369,8 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
     LOG(INFO) << "nvlink_proxy: installed (socket=" << socket_path_
               << ", node_id=" << node_id_ << ", client_id=" << id
               << ", timeout_ms=" << timeout_ms_
-              << ", reconnect_wait_ms=" << reconnect_wait_ms_ << ", daemon "
+              << ", reconnect_wait_ms=" << reconnect_wait_ms_
+              << ", release_wait_ms=" << release_wait_ms_ << ", daemon "
               << (connected ? "connected" : "not reachable yet") << ")";
     return 0;
 }
@@ -330,8 +454,8 @@ bool NvlinkProxyTransport::hello(int fd, bool control, uint64_t &epoch) {
     req.pid = static_cast<uint32_t>(getpid());
     req.flags = (control ? kHelloFlagControl : 0) | kHelloFlagProcessToken;
     strncpy(req.node_id, node_id_.c_str(), kHelloTokenOffset - 1);
-    const uint64_t token = processToken();
-    memcpy(req.node_id + kHelloTokenOffset, &token, sizeof(token));
+    memcpy(req.node_id + kHelloTokenOffset, &process_token_,
+           sizeof(process_token_));
     ProxyStatus st;
     std::string reply;
     if (!rpc(fd, MsgType::kHello, &req, sizeof(req), st, reply)) return false;
@@ -373,6 +497,7 @@ void NvlinkProxyTransport::markHealthy(bool reconnected) {
 bool NvlinkProxyTransport::waitForDaemon(int64_t limit_ns) {
     std::unique_lock<std::mutex> lock(state_mu_);
     while (!healthy_) {
+        if (shut_down_) return false;
         const int64_t now = nowNs();
         const int64_t since = outage_since_ns_.load();
         // Requests stop waiting once the outage itself is older than the
@@ -399,10 +524,10 @@ bool NvlinkProxyTransport::ensureControlLocked() {
     }
     if (fd < 0) {
         const int err = errno;
-        static std::atomic<int64_t> last_log{0};
         int64_t now = nowNs();
-        if (now - last_log.load() > 30LL * 1000 * 1000 * 1000) {
-            last_log = now;
+        if (last_unreachable_log_ns_ == 0 ||
+            now - last_unreachable_log_ns_ > 30LL * 1000 * 1000 * 1000) {
+            last_unreachable_log_ns_ = now;
             if (err == EACCES || err == EPERM) {
                 // Not a daemon that is down or restarting: this engine may
                 // not use the socket at all, and never will by retrying.
@@ -504,6 +629,7 @@ bool NvlinkProxyTransport::registerBlockLocked(Block &block) {
         return false;
     }
     block.registered_epoch = epoch_.load();
+    ever_registered_ = true;
     return true;
 }
 

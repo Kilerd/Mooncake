@@ -162,12 +162,21 @@ static inline bool v3FinalStatus(uint64_t frame) {
            frame == kStatusCanceled || frame == kStatusAddrRejected;
 }
 
+// Request ids of this process. A receiver tells requests apart by id alone,
+// whoever sent them, so every TcpTransport moves the counter to a random
+// start drawn when it is installed: processes restored from one snapshot
+// (same counter in memory) then use different ids.
+static std::atomic<uint64_t>& tcpRequestIdCounter() {
+    static std::atomic<uint64_t> next{freshRandom64()};
+    return next;
+}
+
+static void reseedTcpRequestIds() {
+    tcpRequestIdCounter().store(freshRandom64(), std::memory_order_relaxed);
+}
+
 static uint64_t nextTcpRequestId() {
-    static std::atomic<uint64_t> next{[] {
-        std::random_device rd;
-        uint64_t v = (uint64_t(rd()) << 32) ^ rd();
-        return v ? v : 1;
-    }()};
+    auto& next = tcpRequestIdCounter();
     uint64_t id = next.fetch_add(1, std::memory_order_relaxed);
     while (id == 0 || id == kUnprovableRequest)
         id = next.fetch_add(1, std::memory_order_relaxed);

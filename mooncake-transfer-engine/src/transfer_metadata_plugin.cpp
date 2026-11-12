@@ -632,6 +632,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     virtual ~SocketHandShakePlugin() {
         if (listener_running_) {
             listener_running_ = false;
+            // Wakes the listener blocked in accept() now instead of at its
+            // next receive timeout.
+            if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);
             listener_.join();
         }
         closeListen();
@@ -733,7 +736,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 socklen_t addr_len = sizeof(sockaddr_in);
                 int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
-                    if (errno != EWOULDBLOCK && errno != EINTR)
+                    if (errno != EWOULDBLOCK && errno != EINTR &&
+                        listener_running_)
                         PLOG(ERROR) << "SocketHandShakePlugin: accept()";
                     continue;
                 }

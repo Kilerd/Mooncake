@@ -106,6 +106,16 @@ class TransferEngine {
 
     int freeEngine();
 
+    // Tears the engine down now, for a process that lives on (e.g. one that
+    // is checkpointed next and may be restored elsewhere): every transport
+    // closes its connections, listeners and threads -- nvlink_proxy first,
+    // once the copy daemon confirmed that it holds no IPC mapping of this
+    // engine's memory any more -- then the metadata service stops.
+    // Transfers must be finished. Idempotent; the engine is unusable
+    // afterwards (as after freeEngine()): create a new one. 0, or -1 when a
+    // part of that could not be confirmed (logged).
+    int shutdown();
+
     Transport* installTransport(const std::string& proto, void** args);
 
     int uninstallTransport(const std::string& proto);

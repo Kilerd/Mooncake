@@ -15,6 +15,7 @@
 #ifndef NVLINK_PROXY_TRANSPORT_H_
 #define NVLINK_PROXY_TRANSPORT_H_
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <map>
@@ -64,7 +65,19 @@ class NvlinkProxyTransport : public Transport {
     bool canRoute(const TransferRequest &request,
                   const BufferDesc &target_buffer);
 
+    // TransferEngine::shutdown(): stops the health thread, asks the daemon
+    // to drop this engine's registrations and waits until it holds no IPC
+    // mapping of this engine's memory (RELEASE, at most
+    // MC_NVLINK_PROXY_RELEASE_WAIT_MS), then closes every connection to it.
+    // 0 when the daemon confirmed that, when this engine never registered a
+    // block, or when no daemon listens (one that exited holds nothing); -1
+    // otherwise. Idempotent. The destructor only closes the connections
+    // (the daemon then drops the registrations on its own).
+    int shutdown() override;
+
     const std::string &nodeId() const { return node_id_; }
+    uint64_t clientId() const { return client_id_; }
+    uint64_t processToken() const { return process_token_; }
 
    protected:
     int install(std::string &local_server_name,
@@ -123,6 +136,13 @@ class NvlinkProxyTransport : public Transport {
     bool ensureControlLocked();
     void closeControlLocked();
     bool registerBlockLocked(Block &block);
+    // Teardown (shutdown(), destructor); with |release|, RELEASE first
+    // (releaseLocked). True when shutdown() may report success.
+    bool stop(bool release);
+    bool releaseLocked();
+    // GPU UUID of device |dev|, read once per transport (not per process:
+    // a process restored from a checkpoint may run on another GPU).
+    bool deviceUuid(int dev, uint8_t out[nvlink_proxy::kUuidSize]);
     bool acquireCopyConnection(Connection &conn);
     void releaseCopyConnection(Connection &conn, bool reusable);
     using UnconfirmedCounters =
@@ -204,8 +224,15 @@ class NvlinkProxyTransport : public Transport {
 
     std::string socket_path_;
     std::string node_id_;
+    // Drawn from the kernel at install (fresh_random.h).
     uint64_t client_id_ = 0;
+    // HELLO's process token (kHelloFlagProcessToken), held from install to
+    // teardown.
+    uint64_t process_token_ = 0;
     int timeout_ms_ = 30000;
+    // How long shutdown() waits for the daemon to close the mappings of this
+    // engine's memory (MC_NVLINK_PROXY_RELEASE_WAIT_MS).
+    int release_wait_ms_ = 10000;
     // How long same-node requests wait for the daemon to come back before
     // they use the base transport (MC_NVLINK_PROXY_RECONNECT_WAIT_MS).
     int reconnect_wait_ms_ = 15000;
@@ -219,9 +246,16 @@ class NvlinkProxyTransport : public Transport {
     std::map<uint64_t, Block> blocks_;
     std::unordered_map<uint64_t, uint64_t> buffers_;
 
+    std::mutex uuid_mu_;
+    std::unordered_map<int, std::array<uint8_t, nvlink_proxy::kUuidSize>>
+        uuids_;
+
     // Control connection: HELLO(control) + REGISTER/UNREGISTER/PING.
     std::mutex control_mu_;
     int control_fd_ = -1;
+    // A daemon accepted a block of this engine (it may map its memory).
+    bool ever_registered_ = false;
+    int64_t last_unreachable_log_ns_ = 0;
     std::atomic<uint64_t> epoch_{0};  // 0 = daemon not reachable
     std::atomic<bool> healthy_{false};
     // Start of the current outage (steady clock ns, 0 while healthy) and
@@ -245,6 +279,10 @@ class NvlinkProxyTransport : public Transport {
     std::condition_variable health_cv_;
     bool stop_ = false;
     bool recheck_ = false;  // a copy failed: re-validate the daemon now
+    // Teardown began (stop()); requests stop waiting for the daemon.
+    std::atomic<bool> shut_down_{false};
+    bool stopped_ = false;           // guarded by health_mu_
+    bool release_confirmed_ = true;  // stop()'s result, guarded by health_mu_
 
     struct Counters {
         std::atomic<uint64_t> proxy_requests{0};

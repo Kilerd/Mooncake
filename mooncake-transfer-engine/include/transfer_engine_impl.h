@@ -101,6 +101,11 @@ class TransferEngineImpl {
 
     int freeEngine();
 
+    // TransferEngine::shutdown(): shuts the transports down and destroys
+    // them, then frees the engine (freeEngine()) and the metadata service
+    // with them. Only the destructor may follow.
+    int shutdown();
+
     // Only for testing.
     Transport* installTransport(const std::string& proto, void** args);
 
