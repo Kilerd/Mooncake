@@ -110,6 +110,7 @@ class NvlinkProxyTransport : public Transport {
         // Virtual memory management memory, exported as a POSIX file
         // descriptor at each registration (MC_NVLINK_PROXY_VMM).
         bool vmm = false;
+        int device = -1;                // CUDA device of the memory
         size_t users = 0;               // registered buffers inside the block
         uint64_t registered_epoch = 0;  // daemon epoch it is registered in
     };

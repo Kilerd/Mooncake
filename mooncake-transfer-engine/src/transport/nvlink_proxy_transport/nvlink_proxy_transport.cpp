@@ -186,6 +186,46 @@ int exportVmmFd(uint64_t base, CUresult *error) {
     return fd;
 }
 
+// Makes GPU |dev|'s primary context current until it goes out of scope,
+// then restores the caller's. cuMemGetAddressRange answers in the current
+// context only, and a process may register buffers of several GPUs from
+// one thread (or from the health thread, which has no context). Does
+// nothing when a context of |dev| is current already.
+class DeviceScope {
+   public:
+    explicit DeviceScope(int dev) {
+        result_ = cuDeviceGet(&dev_, dev);
+        if (result_ != CUDA_SUCCESS) return;
+        CUcontext cur = nullptr;
+        CUdevice cur_dev = 0;
+        if (cuCtxGetCurrent(&cur) == CUDA_SUCCESS && cur &&
+            cuCtxGetDevice(&cur_dev) == CUDA_SUCCESS && cur_dev == dev_)
+            return;
+        result_ = cuDevicePrimaryCtxRetain(&ctx_, dev_);
+        if (result_ != CUDA_SUCCESS) return;
+        retained_ = true;
+        result_ = cuCtxPushCurrent(ctx_);
+        pushed_ = result_ == CUDA_SUCCESS;
+    }
+    ~DeviceScope() {
+        CUcontext popped;
+        if (pushed_) cuCtxPopCurrent(&popped);
+        if (retained_) cuDevicePrimaryCtxRelease(dev_);
+    }
+    DeviceScope(const DeviceScope &) = delete;
+    DeviceScope &operator=(const DeviceScope &) = delete;
+
+    // CUDA_SUCCESS when a context of the GPU is current.
+    CUresult result() const { return result_; }
+
+   private:
+    CUdevice dev_ = 0;
+    CUcontext ctx_ = nullptr;
+    CUresult result_ = CUDA_SUCCESS;
+    bool retained_ = false;
+    bool pushed_ = false;
+};
+
 const char *reasonName(int reason) {
     switch (reason) {
         case 0:
@@ -722,8 +762,9 @@ bool NvlinkProxyTransport::registerBlockLocked(Block &block) {
     memcpy(req.ipc_handle, block.handle, kIpcHandleSize);
     int fd = -1;
     if (block.vmm) {
-        CUresult error;
-        fd = exportVmmFd(block.base, &error);
+        DeviceScope scope(block.device);
+        CUresult error = scope.result();
+        if (error == CUDA_SUCCESS) fd = exportVmmFd(block.base, &error);
         if (fd < 0) {
             counters_.register_refusals++;
             LOG(ERROR) << "nvlink_proxy: cannot export block "
@@ -1536,6 +1577,15 @@ int NvlinkProxyTransport::registerLocalMemory(void *addr, size_t length,
         return 0;
     }
     if (attr.type != cudaMemoryTypeDevice) return 0;
+    // The buffer's GPU context is current for the driver calls below.
+    DeviceScope scope(attr.device);
+    if (scope.result() != CUDA_SUCCESS) {
+        LOG(WARNING) << "nvlink_proxy: cannot make the context of GPU "
+                     << attr.device << " current for buffer " << addr
+                     << " (CUresult " << scope.result()
+                     << "); it stays on the base transport";
+        return 0;
+    }
     CUdeviceptr base_ptr = 0;
     size_t alloc_size = 0;
     CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
@@ -1547,6 +1597,7 @@ int NvlinkProxyTransport::registerLocalMemory(void *addr, size_t length,
         return 0;
     }
     Block fresh;
+    fresh.device = attr.device;
     fresh.base = static_cast<uint64_t>(base_ptr);
     fresh.size = alloc_size;
     if (!deviceUuid(attr.device, fresh.uuid)) return 0;

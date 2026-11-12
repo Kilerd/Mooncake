@@ -121,6 +121,9 @@ together with the exact address range in which that set is unchanged.
   transport, unless it is registered by file descriptor
   (`MC_NVLINK_PROXY_VMM=1`, see
   [Virtual memory management memory](#virtual-memory-management-memory)).
+- A buffer is looked up and exported with its GPU's primary context
+  current (then the caller's context is current again), so one thread may
+  register buffers of several GPUs whatever device it has selected.
 - A request uses `nvlink_proxy` when the target buffer was published with the
   same `MC_NODE_ID`, the local buffer is registered with the daemon and the
   daemon is healthy. Otherwise it uses the base transport.
