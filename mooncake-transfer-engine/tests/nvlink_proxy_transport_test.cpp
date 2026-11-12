@@ -21,6 +21,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -570,6 +571,14 @@ struct NvlinkProxyTransportTestAccess {
         std::lock_guard<std::mutex> lock(t.control_mu_);
         t.ever_registered_ = true;
     }
+    // A REGISTER_FD round trip on |fd| that passes |pass_fd|.
+    static bool registerFd(NvlinkProxyTransport &t, int fd, int pass_fd,
+                           ProxyStatus &st) {
+        RegisterReq req{};
+        std::string reply;
+        return t.rpc(fd, MsgType::kRegisterFd, &req, sizeof(req), st, reply,
+                     nullptr, pass_fd);
+    }
     // RELEASE of a transport that has no control connection.
     static bool releaseWithoutControl(NvlinkProxyTransport &t,
                                       const std::string &socket,
@@ -631,6 +640,60 @@ TEST(NvlinkProxyTransport, UnansweredCopyConfirmedOnlyAfterItsConnectionEnds) {
     Access::reap(proxy);
     EXPECT_EQ(counter->load(), 0);
     close(fds[1]);
+}
+
+// REGISTER_FD passes the block's descriptor with the header: the daemon
+// receives one that refers to the same file, with the request intact.
+TEST(NvlinkProxyTransport, RegisterFdPassesTheDescriptor) {
+    using Access = NvlinkProxyTransportTestAccess;
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    char path[] = "/tmp/mc-nvlp-fd-XXXXXX";
+    const int file = mkstemp(path);
+    ASSERT_GE(file, 0);
+    unlink(path);
+    struct stat want;
+    ASSERT_EQ(fstat(file, &want), 0);
+    ino_t got = 0;
+    uint16_t type = 0;
+    std::thread daemon([&] {
+        MsgHeader h;
+        iovec iov{&h, sizeof(h)};
+        alignas(cmsghdr) char ctrl[CMSG_SPACE(sizeof(int))];
+        msghdr m{};
+        m.msg_iov = &iov;
+        m.msg_iovlen = 1;
+        m.msg_control = ctrl;
+        m.msg_controllen = sizeof(ctrl);
+        if (recvmsg(sv[1], &m, MSG_WAITALL) != sizeof(h)) return;
+        type = h.type;
+        cmsghdr *c = CMSG_FIRSTHDR(&m);
+        if (c && c->cmsg_type == SCM_RIGHTS) {
+            int fd;
+            memcpy(&fd, CMSG_DATA(c), sizeof(fd));
+            struct stat st;
+            if (fstat(fd, &st) == 0) got = st.st_ino;
+            close(fd);
+        }
+        std::vector<char> payload(h.payload_len);
+        if (h.payload_len &&
+            recv(sv[1], payload.data(), payload.size(), MSG_WAITALL) !=
+                static_cast<ssize_t>(payload.size()))
+            return;
+        h.payload_len = 0;
+        h.status = static_cast<uint32_t>(ProxyStatus::kOk);
+        (void)send(sv[1], &h, sizeof(h), MSG_NOSIGNAL);
+    });
+    NvlinkProxyTransport proxy;
+    ProxyStatus st = ProxyStatus::kBadRequest;
+    EXPECT_TRUE(Access::registerFd(proxy, sv[0], file, st));
+    daemon.join();
+    EXPECT_EQ(st, ProxyStatus::kOk);
+    EXPECT_EQ(type, static_cast<uint16_t>(MsgType::kRegisterFd));
+    EXPECT_EQ(got, want.st_ino);
+    close(file);
+    close(sv[0]);
+    close(sv[1]);
 }
 
 #if defined(USE_NVLINK_PROXY) && defined(USE_TCP)

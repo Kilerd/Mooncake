@@ -105,7 +105,11 @@ class NvlinkProxyTransport : public Transport {
         uint64_t base = 0;
         uint64_t size = 0;
         uint8_t uuid[nvlink_proxy::kUuidSize] = {};
+        // Legacy IPC handle, or for |vmm| its identity (REGISTER_FD).
         uint8_t handle[nvlink_proxy::kIpcHandleSize] = {};
+        // Virtual memory management memory, exported as a POSIX file
+        // descriptor at each registration (MC_NVLINK_PROXY_VMM).
+        bool vmm = false;
         size_t users = 0;               // registered buffers inside the block
         uint64_t registered_epoch = 0;  // daemon epoch it is registered in
     };
@@ -128,10 +132,11 @@ class NvlinkProxyTransport : public Transport {
     // Daemon I/O.
     int connectSocket(int timeout_ms);
     // |sent| (optional): the request was written in full, so a failure was
-    // in waiting for the reply.
+    // in waiting for the reply. |pass_fd| >= 0: sent with the header
+    // (SCM_RIGHTS).
     bool rpc(int fd, nvlink_proxy::MsgType type, const void *payload,
              size_t len, nvlink_proxy::ProxyStatus &status, std::string &reply,
-             bool *sent = nullptr);
+             bool *sent = nullptr, int pass_fd = -1);
     bool hello(int fd, bool control, uint64_t &epoch);
     bool ensureControlLocked();
     void closeControlLocked();
@@ -143,6 +148,10 @@ class NvlinkProxyTransport : public Transport {
     // GPU UUID of device |dev|, read once per transport (not per process:
     // a process restored from a checkpoint may run on another GPU).
     bool deviceUuid(int dev, uint8_t out[nvlink_proxy::kUuidSize]);
+    // Fills |block|'s identity when [base, base + size) is one allocation
+    // of virtual memory management memory created exportable as a POSIX
+    // file descriptor; |why| otherwise. *is_vmm: it is such memory at all.
+    static bool vmmBlock(Block &block, bool *is_vmm, std::string &why);
     bool acquireCopyConnection(Connection &conn);
     void releaseCopyConnection(Connection &conn, bool reusable);
     using UnconfirmedCounters =
@@ -233,6 +242,8 @@ class NvlinkProxyTransport : public Transport {
     // How long shutdown() waits for the daemon to close the mappings of this
     // engine's memory (MC_NVLINK_PROXY_RELEASE_WAIT_MS).
     int release_wait_ms_ = 10000;
+    // Register virtual memory management memory too (MC_NVLINK_PROXY_VMM).
+    bool vmm_enabled_ = false;
     // How long same-node requests wait for the daemon to come back before
     // they use the base transport (MC_NVLINK_PROXY_RECONNECT_WAIT_MS).
     int reconnect_wait_ms_ = 15000;

@@ -67,6 +67,29 @@ bool writeAll(int fd, const void *buf, size_t len) {
     return true;
 }
 
+// writeAll() of |len| bytes that carries |pass_fd| (SCM_RIGHTS) with the
+// first of them.
+bool sendWithFd(int fd, const void *buf, size_t len, int pass_fd) {
+    iovec iov{const_cast<void *>(buf), len};
+    alignas(cmsghdr) char ctrl[CMSG_SPACE(sizeof(int))] = {};
+    msghdr m{};
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = ctrl;
+    m.msg_controllen = sizeof(ctrl);
+    cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &pass_fd, sizeof(int));
+    ssize_t n;
+    do n = sendmsg(fd, &m, MSG_NOSIGNAL);
+    while (n < 0 && errno == EINTR);
+    if (n < 0) return false;
+    return static_cast<size_t>(n) == len ||
+           writeAll(fd, static_cast<const char *>(buf) + n, len - n);
+}
+
 bool readAll(int fd, void *buf, size_t len) {
     char *p = static_cast<char *>(buf);
     while (len > 0) {
@@ -144,6 +167,20 @@ uint64_t acquireProcessToken() {
 void releaseProcessToken() {
     std::lock_guard<std::mutex> lock(g_token_mu);
     if (g_token_users > 0) --g_token_users;
+}
+
+// A POSIX file descriptor of the allocation mapped at |base| (REGISTER_FD);
+// -1 when it cannot be exported. Exported anew at every registration, so
+// that the engine keeps no such descriptor open.
+int exportVmmFd(uint64_t base, CUresult *error) {
+    CUmemGenericAllocationHandle h;
+    *error = cuMemRetainAllocationHandle(&h, reinterpret_cast<void *>(base));
+    if (*error != CUDA_SUCCESS) return -1;
+    int fd = -1;
+    *error = cuMemExportToShareableHandle(
+        &fd, h, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
+    cuMemRelease(h);
+    return *error == CUDA_SUCCESS ? fd : -1;
 }
 
 const char *reasonName(int reason) {
@@ -298,6 +335,49 @@ bool NvlinkProxyTransport::releaseLocked() {
     return false;
 }
 
+bool NvlinkProxyTransport::vmmBlock(Block &block, bool *is_vmm,
+                                    std::string &why) {
+    *is_vmm = false;
+    CUmemGenericAllocationHandle h;
+    if (cuMemRetainAllocationHandle(&h, reinterpret_cast<void *>(block.base)) !=
+        CUDA_SUCCESS) {
+        why = "not virtual memory management memory";
+        return false;
+    }
+    *is_vmm = true;
+    CUmemAllocationProp prop{};
+    const CUresult r = cuMemGetAllocationPropertiesFromHandle(&prop, h);
+    cuMemRelease(h);
+    if (r != CUDA_SUCCESS) {
+        why = "cuMemGetAllocationPropertiesFromHandle: CUresult " +
+              std::to_string(static_cast<int>(r));
+        return false;
+    }
+    if (!(prop.requestedHandleTypes &
+          CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)) {
+        why =
+            "allocated without CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR in "
+            "requestedHandleTypes";
+        return false;
+    }
+    // One allocation from the first byte of the block to its last: the
+    // daemon maps [0, size) of the allocation it imports.
+    unsigned long long first = 0, last = 0;
+    if (cuPointerGetAttribute(&first, CU_POINTER_ATTRIBUTE_BUFFER_ID,
+                              block.base) != CUDA_SUCCESS ||
+        cuPointerGetAttribute(&last, CU_POINTER_ATTRIBUTE_BUFFER_ID,
+                              block.base + block.size - 1) != CUDA_SUCCESS ||
+        first != last) {
+        why = "the address range spans several allocations";
+        return false;
+    }
+    memset(block.handle, 0, kIpcHandleSize);
+    memcpy(block.handle, kVmmHandleTag, sizeof(kVmmHandleTag));
+    memcpy(block.handle + sizeof(kVmmHandleTag), &first, sizeof(first));
+    block.vmm = true;
+    return true;
+}
+
 bool NvlinkProxyTransport::deviceUuid(int dev, uint8_t out[kUuidSize]) {
     std::lock_guard<std::mutex> lock(uuid_mu_);
     auto it = uuids_.find(dev);
@@ -339,6 +419,7 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
                                         timeout_ms_ / 2)));
     release_wait_ms_ = std::min(
         600000, std::max(0, envInt("MC_NVLINK_PROXY_RELEASE_WAIT_MS", 10000)));
+    vmm_enabled_ = envInt("MC_NVLINK_PROXY_VMM", 0) != 0;
     stats_interval_s_ = envInt("MC_NVLINK_PROXY_STATS_INTERVAL", 60);
     outage_since_ns_ = nowNs();  // until the first connection succeeds
 
@@ -370,7 +451,8 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
               << ", node_id=" << node_id_ << ", client_id=" << id
               << ", timeout_ms=" << timeout_ms_
               << ", reconnect_wait_ms=" << reconnect_wait_ms_
-              << ", release_wait_ms=" << release_wait_ms_ << ", daemon "
+              << ", release_wait_ms=" << release_wait_ms_
+              << ", vmm=" << (vmm_enabled_ ? 1 : 0) << ", daemon "
               << (connected ? "connected" : "not reachable yet") << ")";
     return 0;
 }
@@ -423,7 +505,7 @@ int NvlinkProxyTransport::connectSocket(int timeout_ms) {
 
 bool NvlinkProxyTransport::rpc(int fd, MsgType type, const void *payload,
                                size_t len, ProxyStatus &status,
-                               std::string &reply, bool *sent) {
+                               std::string &reply, bool *sent, int pass_fd) {
     static std::atomic<uint64_t> seq{1};
     MsgHeader h{};
     h.magic = kMagic;
@@ -432,7 +514,11 @@ bool NvlinkProxyTransport::rpc(int fd, MsgType type, const void *payload,
     h.payload_len = static_cast<uint32_t>(len);
     h.seq = seq++;
     if (sent) *sent = false;
-    if (!writeAll(fd, &h, sizeof(h))) return false;
+    if (pass_fd >= 0) {
+        if (!sendWithFd(fd, &h, sizeof(h), pass_fd)) return false;
+    } else if (!writeAll(fd, &h, sizeof(h))) {
+        return false;
+    }
     if (len && !writeAll(fd, payload, len)) return false;
     if (sent) *sent = true;
     MsgHeader r;
@@ -591,12 +677,30 @@ bool NvlinkProxyTransport::registerBlockLocked(Block &block) {
     req.size = block.size;
     memcpy(req.gpu_uuid, block.uuid, kUuidSize);
     memcpy(req.ipc_handle, block.handle, kIpcHandleSize);
+    int fd = -1;
+    if (block.vmm) {
+        CUresult error;
+        fd = exportVmmFd(block.base, &error);
+        if (fd < 0) {
+            counters_.register_refusals++;
+            LOG(ERROR) << "nvlink_proxy: cannot export block "
+                       << reinterpret_cast<void *>(block.base)
+                       << " as a POSIX file descriptor (CUresult " << error
+                       << "); transfers from/to it use the base transport";
+            return false;
+        }
+    }
     ProxyStatus st;
     std::string reply;
-    if (!rpc(control_fd_, MsgType::kRegister, &req, sizeof(req), st, reply)) {
+    const bool answered =
+        rpc(control_fd_, block.vmm ? MsgType::kRegisterFd : MsgType::kRegister,
+            &req, sizeof(req), st, reply, nullptr, fd);
+    const int err = errno;
+    if (fd >= 0) close(fd);  // the daemon has its own once it got it
+    if (!answered) {
         LOG(WARNING) << "nvlink_proxy: lost daemon connection while "
                         "registering: "
-                     << strerror(errno);
+                     << strerror(err);
         closeControlLocked();
         return false;
     }
@@ -1402,15 +1506,31 @@ int NvlinkProxyTransport::registerLocalMemory(void *addr, size_t length,
     if (!deviceUuid(attr.device, fresh.uuid)) return 0;
     cudaIpcMemHandle_t handle;
     err = cudaIpcGetMemHandle(&handle, reinterpret_cast<void *>(base_ptr));
-    if (err != cudaSuccess) {
+    if (err == cudaSuccess) {
+        memcpy(fresh.handle, &handle, kIpcHandleSize);
+    } else {
         cudaGetLastError();
-        LOG(WARNING) << "nvlink_proxy: buffer " << addr
-                     << " cannot be exported with cudaIpcGetMemHandle ("
-                     << cudaGetErrorString(err)
-                     << "); it stays on the base transport";
-        return 0;
+        // Virtual memory management memory has no legacy IPC handle: the
+        // daemon imports it from a file descriptor (REGISTER_FD).
+        bool is_vmm = false;
+        std::string why;
+        const bool exportable = vmmBlock(fresh, &is_vmm, why);
+        if (!exportable || !vmm_enabled_) {
+            LOG(WARNING)
+                << "nvlink_proxy: buffer " << addr
+                << " cannot be exported with cudaIpcGetMemHandle ("
+                << cudaGetErrorString(err) << ")"
+                << (!is_vmm ? std::string()
+                    : exportable
+                        ? std::string(
+                              "; it is virtual memory management memory, "
+                              "which the daemon imports with "
+                              "MC_NVLINK_PROXY_VMM=1")
+                        : "; as virtual memory management memory: " + why)
+                << "; it stays on the base transport";
+            return 0;
+        }
     }
-    memcpy(fresh.handle, &handle, kIpcHandleSize);
 
     BufferDesc desc;
     desc.name = location.empty() ? "*" : location;

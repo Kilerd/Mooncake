@@ -83,6 +83,7 @@ the wheel with the console entry point `mooncake_nvlink_proxy`. The workflow
    | `MC_NVLINK_PROXY_FALLBACK_INFLIGHT` | Maximum requests the proxy has in flight on the base transport at a time, across all threads (default 512; with TCP at most half of `MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER`). |
    | `MC_NVLINK_PROXY_STATS_INTERVAL` | Seconds between counter log lines (default 60, 0 = off). |
    | `MC_NVLINK_PROXY_RELEASE_WAIT_MS` | How long `shutdown()` waits for the daemon to close its mappings of the engine's memory (default 10000). |
+   | `MC_NVLINK_PROXY_VMM` | `1`: also register virtual memory management memory, exported as POSIX file descriptors (default 0, see [Virtual memory management memory](#virtual-memory-management-memory)). |
 
    The Python API is unchanged, apart from `TransferEngine.shutdown()` (see
    [Shutdown and process snapshots](#shutdown-and-process-snapshots)).
@@ -117,7 +118,9 @@ together with the exact address range in which that set is unchanged.
   host memory only under the base transport (`register_memory` returns 0).
   Device memory that cannot be exported with `cudaIpcGetMemHandle` (for
   example virtual-memory-management allocations) also stays on the base
-  transport.
+  transport, unless it is registered by file descriptor
+  (`MC_NVLINK_PROXY_VMM=1`, see
+  [Virtual memory management memory](#virtual-memory-management-memory)).
 - A request uses `nvlink_proxy` when the target buffer was published with the
   same `MC_NODE_ID`, the local buffer is registered with the daemon and the
   daemon is healthy. Otherwise it uses the base transport.
@@ -364,6 +367,46 @@ P2P self-test gpu 2 (0000:5e:00) <-> gpu 3 (0000:b1:00): FAILED -> P2P denied ->
 followed by a summary per batch and, when every pair tested so far failed,
 `P2P unusable on this node: N/N GPU pairs tested so far failed the self-test`.
 
+## Virtual memory management memory
+
+Memory allocated with `cuMemCreate` and mapped with `cuMemMap` -- for example
+a KV cache whose physical memory an engine releases and creates again at the
+same addresses -- has no legacy IPC handle. With `MC_NVLINK_PROXY_VMM=1` the
+engine registers such a block with `REGISTER_FD` instead: it exports the
+allocation with `cuMemExportToShareableHandle(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)`
+and passes the descriptor over the control connection (`SCM_RIGHTS`); the
+daemon imports it (`cuMemImportFromShareableHandle`), maps it once in its
+address space when a copy first needs it and grants each GPU that copies
+from or to it access (`cuMemSetAccess`). The descriptor is exported again at
+every registration (also after a daemon restart) and closed right after
+sending, so the engine keeps none open. Copies, deadlines, host staging and
+quiescence work as for `cudaMalloc` blocks.
+
+The allocator must:
+
+1. create the allocation with `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR` in
+   `CUmemAllocationProp::requestedHandleTypes` (it may be combined with
+   other types, e.g. `CU_MEM_HANDLE_TYPE_FABRIC`);
+2. map whole allocations: the block of a registered buffer
+   (`cuMemGetAddressRange`) must be one mapping of one allocation, which the
+   daemon maps from offset 0 (`cuMemMap` maps from offset 0 only). A buffer
+   whose range spans two allocations is refused and stays on the base
+   transport, as is memory without the POSIX file descriptor handle type;
+   the engine logs why;
+3. keep the memory mapped while it is registered. To release it, call
+   `TransferEngine.shutdown()` first (the daemon then has released its
+   import, see below), then `cuMemUnmap` / `cuMemRelease`; after creating
+   new memory, register it with a new engine (a new allocation is told apart
+   from the old one by its `CU_POINTER_ATTRIBUTE_BUFFER_ID`).
+
+The daemon must see the allocation's GPU, as for `cudaMalloc` blocks.
+A daemon older than `REGISTER_FD`, or one whose driver lacks virtual memory
+management, refuses the block (`register_refusals`) and its transfers use
+the base transport. The daemon resolves the driver calls through
+`cudaGetDriverEntryPointByVersion` and reports the allocations it holds as
+`vmm_imports`. The option is off by default until it has been validated on
+the target GPUs and drivers.
+
 ## Shutdown and process snapshots
 
 An engine process can be checkpointed (CRIU with `cuda-checkpoint`) and
@@ -413,7 +456,10 @@ the RPC port range, `MC_SLICE_*`, ...) are read once per process.
 `cudaIpcGetMemHandle` has been called on the engine's `cudaMalloc` blocks
 before the checkpoint; nothing on the exporting side can undo that, and
 whether `cuda-checkpoint` accepts such allocations (no importer left) is a
-property of the driver.
+property of the driver. Virtual memory management blocks have no legacy IPC
+export: once `shutdown()` returned, the engine can release their physical
+memory itself (see
+[Virtual memory management memory](#virtual-memory-management-memory)).
 
 ## Counters
 
@@ -462,7 +508,8 @@ measured rates the deadline predictions use: `<gpu>.ce`, `<gpu>.kernel`,
 `<src>><dst>.staged`), `register_refusals`,
 `ipc_mappings` (IPC handles open now; falls back when engines exit),
 `ipc_closes` and `ipc_conflicts` (copies refused because a handle was mapped
-for another process or a disconnected engine).
+for another process or a disconnected engine), `vmm_imports` (virtual memory
+management allocations imported from engines' file descriptors now).
 
 ## Wire protocol
 
@@ -476,7 +523,9 @@ dst offset, length)` plus a start budget; replied after the copies completed),
 `PING`, `STATS`, `RELEASE` (control connection: drop the client's
 registrations; replied once no mapping of its memory is left, or with
 `DEADLINE_EXCEEDED` and the count of those still in use after the wait it
-names).
+names), `REGISTER_FD` (`REGISTER` of a virtual memory management block whose
+handle field carries the allocation's buffer id; the allocation's POSIX file
+descriptor comes with the message header as `SCM_RIGHTS`).
 
 ## Testing
 
@@ -488,11 +537,13 @@ protocol helpers and the no-daemon path without GPUs, and `shutdown()`
 against a stand-in daemon: no socket, epoll / eventfd descriptor, pipe or
 thread of the engine left, `RELEASE` waited for (and reported unconfirmed
 by an older or slow daemon), new client id and process token for the next
-engine. `transfer_engine_shutdown_test.py` checks the same through the
+engine, and a `REGISTER_FD` that carries its descriptor.
+`transfer_engine_shutdown_test.py` checks the same through the
 Python API (calls after `shutdown()` raise, a batch left unfreed, a thread
 still transferring); with `--gpu` it writes through a running daemon,
 shuts down, finds no mapping left in the daemon, and does it again with new
-engines in the same process;
+engines in the same process (`--gpu --vmm`: with virtual memory management
+pools whose physical memory is released and created again in between);
 `nvlink_proxy_policy_test` the self-test plans, the verifier, bus id parsing
 and the deny matrix; `nvlink_proxy_daemon_test` the paced issue against the
 deadline, the IPC mapping table, the socket and the start-up checks.
@@ -506,6 +557,9 @@ default chunk size, chunked copies byte-exact, host staging, socket
 permissions, mappings closed when an engine disconnects or restarts,
 mappings shared within a process and refused to another, `RELEASE`
 answered only once no mapping is left (also while a copy holds one, and
-over a connection opened for it),
+over a connection opened for it), `REGISTER_FD` (imported once, copied from
+and to, released by `RELEASE` and by a disconnect, a GPU that cannot be
+granted access refusing the copy; the stand-in also implements the driver's
+virtual memory management calls),
 `--min-visible-gpus` (CMake target `mooncake_nvlink_proxy_cpu`, CTest
 `nvlink_proxy_cpu_test`).

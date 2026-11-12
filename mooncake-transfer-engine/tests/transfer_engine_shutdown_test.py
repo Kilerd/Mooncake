@@ -34,11 +34,15 @@ MC_NVLINK_PROXY_SOCKET pointing at it and MC_NODE_ID set. Two engines of
 this process register cudaMalloc memory (on --dev0 / --dev1), write through
 the daemon and are shut down: the daemon then holds no IPC mapping of their
 memory (--stats). Two new engines in the same process do it again, through
-the daemon again. Each round checks every byte.
+the daemon again. Each round checks every byte. With --vmm the memory is
+two virtual memory management pools (cuMemCreate, exportable as POSIX file
+descriptors, MC_NVLINK_PROXY_VMM=1), whose physical memory is released
+after each shutdown and created again at the same addresses -- the flow of
+an engine that releases its KV cache before a checkpoint.
 
 Usage:
   PYTHONPATH=<dir of the mooncake package> transfer_engine_shutdown_test.py
-  transfer_engine_shutdown_test.py --gpu [--dev0 0] [--dev1 1]
+  transfer_engine_shutdown_test.py --gpu [--vmm] [--dev0 0] [--dev1 1]
 Linux only (/proc/self).
 """
 
@@ -382,39 +386,146 @@ def cpu_mode():
 
 
 # ------------------------------------------------------------- GPU mode
-def gpu_mode(dev0, dev1):
-    cudart = ctypes.CDLL("libcudart.so.12")
-    cudart.cudaGetErrorString.restype = ctypes.c_char_p
+class Cuda:
+    """The few runtime and driver calls the GPU mode needs (ctypes)."""
 
-    def ck(rc, what):
+    def __init__(self):
+        self.rt = ctypes.CDLL("libcudart.so.12")
+        self.rt.cudaGetErrorString.restype = ctypes.c_char_p
+        self.drv = ctypes.CDLL("libcuda.so.1")
+        u64, sz = ctypes.c_ulonglong, ctypes.c_size_t
+        d = self.drv
+        d.cuMemGetAllocationGranularity.argtypes = [
+            ctypes.POINTER(sz),
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        d.cuMemAddressReserve.argtypes = [ctypes.POINTER(u64), sz, sz, u64, u64]
+        d.cuMemCreate.argtypes = [ctypes.POINTER(u64), sz, ctypes.c_void_p, u64]
+        d.cuMemMap.argtypes = [u64, sz, sz, u64, u64]
+        d.cuMemSetAccess.argtypes = [u64, sz, ctypes.c_void_p, sz]
+        d.cuMemUnmap.argtypes = [u64, sz]
+        d.cuMemRelease.argtypes = [u64]
+
+    def ck(self, rc, what):
         if rc != 0:
-            raise RuntimeError(f"{what}: {cudart.cudaGetErrorString(rc).decode()}")
+            raise RuntimeError(f"{what}: {self.rt.cudaGetErrorString(rc).decode()}")
 
-    def gpu_alloc(dev, n):
-        ck(cudart.cudaSetDevice(dev), "cudaSetDevice")
+    def cu(self, rc, what):
+        if rc != 0:
+            raise RuntimeError(f"{what}: CUresult {rc}")
+
+    def device(self, dev):
+        self.ck(self.rt.cudaSetDevice(dev), "cudaSetDevice")
+        self.ck(self.rt.cudaFree(None), "context")  # current for driver calls
+
+    def malloc(self, dev, n):
+        self.device(dev)
         p = ctypes.c_void_p()
-        ck(cudart.cudaMalloc(ctypes.byref(p), ctypes.c_size_t(n)), "cudaMalloc")
+        self.ck(self.rt.cudaMalloc(ctypes.byref(p), ctypes.c_size_t(n)), "cudaMalloc")
         return p.value
 
-    def h2d(dev, ptr, data):
-        ck(cudart.cudaSetDevice(dev), "cudaSetDevice")
-        ck(
-            cudart.cudaMemcpy(
+    def h2d(self, dev, ptr, data):
+        self.device(dev)
+        self.ck(
+            self.rt.cudaMemcpy(
                 ctypes.c_void_p(ptr), data, ctypes.c_size_t(len(data)), 1
             ),
             "H2D",
         )
 
-    def d2h(dev, ptr, n):
-        ck(cudart.cudaSetDevice(dev), "cudaSetDevice")
+    def d2h(self, dev, ptr, n):
+        self.device(dev)
         out = ctypes.create_string_buffer(n)
-        ck(cudart.cudaMemcpy(out, ctypes.c_void_p(ptr), ctypes.c_size_t(n), 2), "D2H")
+        self.ck(
+            self.rt.cudaMemcpy(out, ctypes.c_void_p(ptr), ctypes.c_size_t(n), 2), "D2H"
+        )
         return out.raw
 
+
+class AllocProp(ctypes.Structure):  # CUmemAllocationProp
+    _fields_ = [
+        ("type", ctypes.c_int),  # CU_MEM_ALLOCATION_TYPE_PINNED = 1
+        ("requested_handle_types", ctypes.c_int),  # POSIX_FILE_DESCRIPTOR = 1
+        ("location_type", ctypes.c_int),  # CU_MEM_LOCATION_TYPE_DEVICE = 1
+        ("location_id", ctypes.c_int),
+        ("win32_metadata", ctypes.c_void_p),
+        ("compression_type", ctypes.c_ubyte),
+        ("gpu_direct_rdma_capable", ctypes.c_ubyte),
+        ("usage", ctypes.c_ushort),
+        ("reserved", ctypes.c_ubyte * 4),
+    ]
+
+
+class AccessDesc(ctypes.Structure):  # CUmemAccessDesc
+    _fields_ = [
+        ("location_type", ctypes.c_int),
+        ("location_id", ctypes.c_int),
+        ("flags", ctypes.c_int),  # CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
+    ]
+
+
+class VmmPool:
+    """A releasable pool, as an engine would allocate its KV cache: the
+    virtual range stays reserved, the physical allocation (created
+    exportable as a POSIX file descriptor) is released and created again."""
+
+    def __init__(self, cuda, dev, n):
+        self.cuda, self.dev = cuda, dev
+        self.prop = AllocProp(
+            type=1, requested_handle_types=1, location_type=1, location_id=dev
+        )
+        gran = ctypes.c_size_t()
+        cuda.device(dev)
+        cuda.cu(
+            cuda.drv.cuMemGetAllocationGranularity(
+                ctypes.byref(gran), ctypes.byref(self.prop), 0
+            ),
+            "granularity",
+        )
+        self.size = -(-n // gran.value) * gran.value
+        va = ctypes.c_ulonglong()
+        cuda.cu(
+            cuda.drv.cuMemAddressReserve(ctypes.byref(va), self.size, 0, 0, 0),
+            "cuMemAddressReserve",
+        )
+        self.ptr = va.value
+        self.handle = None
+
+    def create(self):
+        cuda = self.cuda
+        cuda.device(self.dev)
+        h = ctypes.c_ulonglong()
+        cuda.cu(
+            cuda.drv.cuMemCreate(
+                ctypes.byref(h), self.size, ctypes.byref(self.prop), 0
+            ),
+            "cuMemCreate",
+        )
+        cuda.cu(cuda.drv.cuMemMap(self.ptr, self.size, 0, h.value, 0), "cuMemMap")
+        access = AccessDesc(location_type=1, location_id=self.dev, flags=3)
+        cuda.cu(
+            cuda.drv.cuMemSetAccess(self.ptr, self.size, ctypes.byref(access), 1),
+            "cuMemSetAccess",
+        )
+        self.handle = h.value
+
+    def release(self):
+        cuda = self.cuda
+        cuda.device(self.dev)
+        cuda.cu(cuda.drv.cuMemUnmap(self.ptr, self.size), "cuMemUnmap")
+        cuda.cu(cuda.drv.cuMemRelease(self.handle), "cuMemRelease")
+        self.handle = None
+
+
+def gpu_mode(dev0, dev1, vmm):
     sock = os.environ.get("MC_NVLINK_PROXY_SOCKET")
     if not sock or not os.environ.get("MC_NODE_ID"):
         print("--gpu needs MC_NVLINK_PROXY_SOCKET (a running daemon) and MC_NODE_ID")
+        FAILURES.append("not configured")
         return
+    if vmm:
+        os.environ["MC_NVLINK_PROXY_VMM"] = "1"
     daemon_bin = shutil.which("mooncake_nvlink_proxy")
 
     def daemon_stats():
@@ -433,12 +544,20 @@ def gpu_mode(dev0, dev1):
                 stats[k] = v.split("(")[0]
         return stats
 
+    cuda = Cuda()
     host = os.environ.get("POD_IP", "127.0.0.1")
     n = 64 * MiB
-    src = gpu_alloc(dev0, n)
-    dst = gpu_alloc(dev1, n)
+    if vmm:
+        src_pool, dst_pool = VmmPool(cuda, dev0, n), VmmPool(cuda, dev1, n)
+        src, dst = src_pool.ptr, dst_pool.ptr
+    else:
+        src, dst = cuda.malloc(dev0, n), cuda.malloc(dev1, n)
+    kind = "virtual memory management pools" if vmm else "cudaMalloc blocks"
     for rnd in (1, 2):
-        print(f"== round {rnd}: two engines write through the daemon, then shut down")
+        print(f"== round {rnd}: {kind}, written through the daemon, then shut down")
+        if vmm:  # new physical memory at the same addresses
+            src_pool.create()
+            dst_pool.create()
         before = daemon_stats()
         target, initiator = TransferEngine(), TransferEngine()
         assert target.initialize(host, "P2PHANDSHAKE", "tcp", "") == 0
@@ -446,27 +565,34 @@ def gpu_mode(dev0, dev1):
         assert target.register_memory(dst, n) == 0
         assert initiator.register_memory(src, n) == 0
         pattern = bytes((i * (rnd + 2) + 1) & 0xFF for i in range(256)) * (n // 256)
-        h2d(dev0, src, pattern)
-        h2d(dev1, dst, bytes(n))
+        cuda.h2d(dev0, src, pattern)
+        cuda.h2d(dev1, dst, bytes(n))
         session = f"{host}:{target.get_rpc_port()}"
         rc = initiator.batch_transfer_sync_write(session, [src], [dst], [n])
-        check(rc == 0 and d2h(dev1, dst, n) == pattern, f"round {rnd}: write verified")
+        check(
+            rc == 0 and cuda.d2h(dev1, dst, n) == pattern,
+            f"round {rnd}: write verified",
+        )
         during = daemon_stats()
         if during:
             check(
                 int(during.get("copy_requests", 0))
                 > int(before.get("copy_requests", 0)),
                 f"round {rnd}: the write went through the daemon "
-                f"(copy_requests {before.get('copy_requests')} -> {during.get('copy_requests')})",
+                f"(copy_requests {before.get('copy_requests')} -> "
+                f"{during.get('copy_requests')}, vmm_imports="
+                f"{during.get('vmm_imports')})",
             )
         check(initiator.shutdown() == 0, f"round {rnd}: initiator shutdown() == 0")
         check(target.shutdown() == 0, f"round {rnd}: target shutdown() == 0")
         after = daemon_stats()
         if after:
             check(
-                after.get("ipc_mappings") == before.get("ipc_mappings", "0"),
-                f"round {rnd}: no IPC mapping of this process left in the daemon "
-                f"(ipc_mappings={after.get('ipc_mappings')})",
+                after.get("ipc_mappings") == before.get("ipc_mappings", "0")
+                and after.get("vmm_imports", "0") == before.get("vmm_imports", "0"),
+                f"round {rnd}: nothing of this process left in the daemon "
+                f"(ipc_mappings={after.get('ipc_mappings')}, "
+                f"vmm_imports={after.get('vmm_imports')})",
             )
         socks = [
             fd
@@ -475,6 +601,9 @@ def gpu_mode(dev0, dev1):
         ]
         check(not socks, f"round {rnd}: no socket left in this process ({len(socks)})")
         target = initiator = None
+        if vmm:  # the pools are released as before a checkpoint
+            src_pool.release()
+            dst_pool.release()
 
 
 def main():
@@ -482,12 +611,13 @@ def main():
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--dev0", type=int, default=0)
     ap.add_argument("--dev1", type=int, default=0)
+    ap.add_argument("--vmm", action="store_true")
     args = ap.parse_args()
     if not sys.platform.startswith("linux"):
         print("skipped: Linux only")
         return 0
     if args.gpu:
-        gpu_mode(args.dev0, args.dev1)
+        gpu_mode(args.dev0, args.dev1, args.vmm)
     else:
         cpu_mode()
     print(f"{len(FAILURES)} failure(s)")
