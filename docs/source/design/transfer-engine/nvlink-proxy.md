@@ -84,6 +84,7 @@ the wheel with the console entry point `mooncake_nvlink_proxy`. The workflow
    | `MC_NVLINK_PROXY_STATS_INTERVAL` | Seconds between counter log lines (default 60, 0 = off). |
    | `MC_NVLINK_PROXY_RELEASE_WAIT_MS` | How long `shutdown()` waits for the daemon to close its mappings of the engine's memory (default 10000). |
    | `MC_NVLINK_PROXY_VMM` | `1`: also register virtual memory management memory, exported as POSIX file descriptors (default 0, see [Virtual memory management memory](#virtual-memory-management-memory)). |
+   | `MC_NVLINK_PROXY_REQUIRE_VMM` | `1`: device memory must be virtual memory management memory the daemon can import; registering other device memory (`cudaMalloc` blocks, allocations without the POSIX file descriptor handle type) fails, and nothing is exported with `cudaIpcGetMemHandle`. Implies `MC_NVLINK_PROXY_VMM=1`. For processes that are checkpointed (see [Shutdown and process snapshots](#shutdown-and-process-snapshots)). Default 0. |
 
    The Python API is unchanged, apart from `TransferEngine.shutdown()` (see
    [Shutdown and process snapshots](#shutdown-and-process-snapshots)).
@@ -116,11 +117,15 @@ together with the exact address range in which that set is unchanged.
 
 - Device memory is published under both `nvlink_proxy` and the base transport;
   host memory only under the base transport (`register_memory` returns 0).
-  Device memory that cannot be exported with `cudaIpcGetMemHandle` (for
-  example virtual-memory-management allocations) also stays on the base
-  transport, unless it is registered by file descriptor
+  Virtual memory management allocations are recognized first
+  (`cuMemRetainAllocationHandle`) and never exported with
+  `cudaIpcGetMemHandle`: they are registered by file descriptor
   (`MC_NVLINK_PROXY_VMM=1`, see
-  [Virtual memory management memory](#virtual-memory-management-memory)).
+  [Virtual memory management memory](#virtual-memory-management-memory)) or
+  stay on the base transport. Other device memory that cannot be exported
+  with `cudaIpcGetMemHandle` stays on the base transport too; the engine
+  logs why. With `MC_NVLINK_PROXY_REQUIRE_VMM=1` such memory, and
+  `cudaMalloc` memory, is refused instead (`register_memory` fails).
 - A buffer is looked up and exported with its GPU's primary context
   current (then the caller's context is current again), so one thread may
   register buffers of several GPUs whatever device it has selected.
@@ -461,11 +466,16 @@ when it moved. Settings of the engine's global configuration (`MC_HANDSHAKE_*`,
 the RPC port range, `MC_SLICE_*`, ...) are read once per process.
 
 `cudaIpcGetMemHandle` has been called on the engine's `cudaMalloc` blocks
-before the checkpoint; nothing on the exporting side can undo that, and
-whether `cuda-checkpoint` accepts such allocations (no importer left) is a
-property of the driver. Virtual memory management blocks have no legacy IPC
-export: once `shutdown()` returned, the engine can release their physical
-memory itself (see
+before the checkpoint, and nothing on the exporting side can undo that. On
+RTX 5090 (2026-11) `cuda-checkpoint` then fails
+(`CUDA_ERROR_OPERATING_SYSTEM`) even when no importer is left, while a
+process whose registered memory was virtual memory management memory,
+released after `shutdown()`, is checkpointed and restored. Processes that
+are checkpointed therefore register only virtual memory management memory
+and set `MC_NVLINK_PROXY_REQUIRE_VMM=1`, which turns any other device
+buffer into a registration error instead of a legacy export. Virtual memory
+management blocks have no legacy IPC export: once `shutdown()` returned,
+the engine can release their physical memory itself (see
 [Virtual memory management memory](#virtual-memory-management-memory)).
 
 ## Counters

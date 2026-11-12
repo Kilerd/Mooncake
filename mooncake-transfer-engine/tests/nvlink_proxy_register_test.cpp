@@ -556,8 +556,42 @@ TEST(NvlinkProxyRegister, ThreadWithoutContext) {
     EXPECT_EQ(engine->shutdown(), 0);
 }
 
-// cudaMalloc memory is exported with cudaIpcGetMemHandle.
-TEST(NvlinkProxyRegister, CudaMallocMemoryUsesLegacyIpc) {
+// Virtual memory management memory is never asked for a legacy IPC handle:
+// with MC_NVLINK_PROXY_VMM it is registered by descriptor, without it it
+// stays on the base transport.
+TEST(NvlinkProxyRegister, VmmMemoryIsNeverExportedAsLegacyIpc) {
+    for (const char *vmm_on : {"0", "1"}) {
+        SCOPED_TRACE(std::string("MC_NVLINK_PROXY_VMM=") + vmm_on);
+        Env env({{"MC_NVLINK_PROXY_VMM", vmm_on}});
+        FakeDaemon daemon;
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        DeviceMemory vmm(0, Kind::kVmm, 4 * kMiB);
+        DeviceMemory no_fd(0, Kind::kVmmWithoutFd, 4 * kMiB);
+        auto engine = proxyEngine(daemon);
+        g_ipc_exports = 0;
+        g_fd_exports = 0;
+        EXPECT_EQ(engine->registerLocalMemory(vmm.at(0), kMiB, "*"), 0);
+        EXPECT_EQ(engine->registerLocalMemory(no_fd.at(0), kMiB, "*"), 0);
+        EXPECT_EQ(g_ipc_exports.load(), 0);
+        const auto regs = daemon.registrations();
+        if (vmm_on[0] == '1') {
+            ASSERT_EQ(regs.size(), 1u);
+            EXPECT_EQ(regs[0].type, MsgType::kRegisterFd);
+            EXPECT_EQ(regs[0].base, vmm.region.base);
+            EXPECT_EQ(g_fd_exports.load(), 1);
+        } else {
+            EXPECT_TRUE(regs.empty());
+            EXPECT_EQ(g_fd_exports.load(), 0);
+        }
+        EXPECT_EQ(engine->unregisterLocalMemory(vmm.at(0)), 0);
+        EXPECT_EQ(engine->unregisterLocalMemory(no_fd.at(0)), 0);
+        EXPECT_EQ(engine->shutdown(), 0);
+        t_ctx.clear();
+    }
+}
+
+// cudaMalloc memory keeps the legacy export by default.
+TEST(NvlinkProxyRegister, CudaMallocMemoryUsesLegacyIpcByDefault) {
     Env env({});
     FakeDaemon daemon;
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
@@ -574,4 +608,33 @@ TEST(NvlinkProxyRegister, CudaMallocMemoryUsesLegacyIpc) {
     t_ctx.clear();
 }
 
+// MC_NVLINK_PROXY_REQUIRE_VMM=1 (alone: it implies MC_NVLINK_PROXY_VMM):
+// device memory the daemon cannot import as virtual memory management
+// memory is refused, and nothing is exported with cudaIpcGetMemHandle;
+// importable memory and host memory register as before.
+TEST(NvlinkProxyRegister, RequireVmmRefusesOtherDeviceMemory) {
+    Env env({{"MC_NVLINK_PROXY_REQUIRE_VMM", "1"}});
+    FakeDaemon daemon;
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    DeviceMemory legacy(0, Kind::kCudaMalloc, 4 * kMiB);
+    DeviceMemory no_fd(1, Kind::kVmmWithoutFd, 4 * kMiB);
+    DeviceMemory vmm(1, Kind::kVmm, 4 * kMiB);
+    std::vector<char> host(kMiB);
+    auto engine = proxyEngine(daemon);
+    g_ipc_exports = 0;
+
+    EXPECT_NE(engine->registerLocalMemory(legacy.at(0), kMiB, "*"), 0);
+    EXPECT_NE(engine->registerLocalMemory(no_fd.at(0), kMiB, "*"), 0);
+    EXPECT_EQ(engine->registerLocalMemory(vmm.at(0), kMiB, "*"), 0);
+    EXPECT_EQ(engine->registerLocalMemory(host.data(), host.size(), "*"), 0);
+    EXPECT_EQ(g_ipc_exports.load(), 0);
+    const auto regs = daemon.registrations();
+    ASSERT_EQ(regs.size(), 1u);
+    EXPECT_EQ(regs[0].type, MsgType::kRegisterFd);
+    EXPECT_EQ(regs[0].base, vmm.region.base);
+    EXPECT_EQ(engine->unregisterLocalMemory(vmm.at(0)), 0);
+    EXPECT_EQ(engine->unregisterLocalMemory(host.data()), 0);
+    EXPECT_EQ(engine->shutdown(), 0);
+    t_ctx.clear();
+}
 #endif

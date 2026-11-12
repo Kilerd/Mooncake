@@ -474,6 +474,69 @@ bool NvlinkProxyTransport::deviceUuid(int dev, uint8_t out[kUuidSize]) {
     return true;
 }
 
+bool NvlinkProxyTransport::describeBlock(void *addr, Block &block,
+                                         std::string &why) {
+    DeviceScope scope(block.device);
+    if (scope.result() != CUDA_SUCCESS) {
+        why = "cannot make the GPU's context current (CUresult " +
+              std::to_string(static_cast<int>(scope.result())) + ")";
+        return false;
+    }
+    CUdeviceptr base_ptr = 0;
+    size_t alloc_size = 0;
+    const CUresult cu_err = cuMemGetAddressRange(
+        &base_ptr, &alloc_size, reinterpret_cast<CUdeviceptr>(addr));
+    if (cu_err != CUDA_SUCCESS) {
+        why = "cuMemGetAddressRange: CUresult " +
+              std::to_string(static_cast<int>(cu_err));
+        return false;
+    }
+    block.base = static_cast<uint64_t>(base_ptr);
+    block.size = alloc_size;
+    if (!deviceUuid(block.device, block.uuid)) {
+        why = "cannot read the GPU's UUID";
+        return false;
+    }
+    // Virtual memory management memory is imported by the daemon from a
+    // file descriptor (REGISTER_FD); it is never asked for a legacy IPC
+    // handle.
+    bool is_vmm = false;
+    if (vmmBlock(block, &is_vmm, why)) {
+        if (vmm_enabled_) return true;
+        why =
+            "virtual memory management memory, which the daemon imports "
+            "with MC_NVLINK_PROXY_VMM=1";
+        return false;
+    }
+    if (is_vmm) {
+        why =
+            "virtual memory management memory the daemon cannot import: " + why;
+        return false;
+    }
+    if (require_vmm_) {
+        // A process that exported memory with cudaIpcGetMemHandle cannot be
+        // checkpointed by cuda-checkpoint any more, even once no importer
+        // is left.
+        why =
+            "not virtual memory management memory (cuMemCreate with "
+            "CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR); it is not exported "
+            "with cudaIpcGetMemHandle, which would keep cuda-checkpoint from "
+            "checkpointing this process";
+        return false;
+    }
+    cudaIpcMemHandle_t handle;
+    const cudaError_t err =
+        cudaIpcGetMemHandle(&handle, reinterpret_cast<void *>(base_ptr));
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        why = std::string("cannot be exported with cudaIpcGetMemHandle (") +
+              cudaGetErrorString(err) + ")";
+        return false;
+    }
+    memcpy(block.handle, &handle, kIpcHandleSize);
+    return true;
+}
+
 int NvlinkProxyTransport::install(std::string &local_server_name,
                                   std::shared_ptr<TransferMetadata> meta,
                                   std::shared_ptr<Topology> topo) {
@@ -495,7 +558,8 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
                                         timeout_ms_ / 2)));
     release_wait_ms_ = std::min(
         600000, std::max(0, envInt("MC_NVLINK_PROXY_RELEASE_WAIT_MS", 10000)));
-    vmm_enabled_ = envInt("MC_NVLINK_PROXY_VMM", 0) != 0;
+    require_vmm_ = envInt("MC_NVLINK_PROXY_REQUIRE_VMM", 0) != 0;
+    vmm_enabled_ = require_vmm_ || envInt("MC_NVLINK_PROXY_VMM", 0) != 0;
     stats_interval_s_ = envInt("MC_NVLINK_PROXY_STATS_INTERVAL", 60);
     outage_since_ns_ = nowNs();  // until the first connection succeeds
 
@@ -1568,8 +1632,7 @@ int NvlinkProxyTransport::registerLocalMemory(void *addr, size_t length,
                                               bool remote_accessible,
                                               bool update_metadata) {
     (void)remote_accessible;
-    // Host memory, and device memory that cannot be exported through legacy
-    // CUDA IPC, stays on the base transport only; that is not an error.
+    // Host memory stays on the base transport only; that is not an error.
     cudaPointerAttributes attr;
     cudaError_t err = cudaPointerGetAttributes(&attr, addr);
     if (err != cudaSuccess) {
@@ -1577,56 +1640,22 @@ int NvlinkProxyTransport::registerLocalMemory(void *addr, size_t length,
         return 0;
     }
     if (attr.type != cudaMemoryTypeDevice) return 0;
-    // The buffer's GPU context is current for the driver calls below.
-    DeviceScope scope(attr.device);
-    if (scope.result() != CUDA_SUCCESS) {
-        LOG(WARNING) << "nvlink_proxy: cannot make the context of GPU "
-                     << attr.device << " current for buffer " << addr
-                     << " (CUresult " << scope.result()
-                     << "); it stays on the base transport";
-        return 0;
-    }
-    CUdeviceptr base_ptr = 0;
-    size_t alloc_size = 0;
-    CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
-                                           reinterpret_cast<CUdeviceptr>(addr));
-    if (cu_err != CUDA_SUCCESS) {
-        LOG(WARNING) << "nvlink_proxy: cuMemGetAddressRange(" << addr
-                     << ") failed (" << cu_err
-                     << "); buffer stays on the base transport";
-        return 0;
-    }
     Block fresh;
     fresh.device = attr.device;
-    fresh.base = static_cast<uint64_t>(base_ptr);
-    fresh.size = alloc_size;
-    if (!deviceUuid(attr.device, fresh.uuid)) return 0;
-    cudaIpcMemHandle_t handle;
-    err = cudaIpcGetMemHandle(&handle, reinterpret_cast<void *>(base_ptr));
-    if (err == cudaSuccess) {
-        memcpy(fresh.handle, &handle, kIpcHandleSize);
-    } else {
-        cudaGetLastError();
-        // Virtual memory management memory has no legacy IPC handle: the
-        // daemon imports it from a file descriptor (REGISTER_FD).
-        bool is_vmm = false;
-        std::string why;
-        const bool exportable = vmmBlock(fresh, &is_vmm, why);
-        if (!exportable || !vmm_enabled_) {
-            LOG(WARNING)
-                << "nvlink_proxy: buffer " << addr
-                << " cannot be exported with cudaIpcGetMemHandle ("
-                << cudaGetErrorString(err) << ")"
-                << (!is_vmm ? std::string()
-                    : exportable
-                        ? std::string(
-                              "; it is virtual memory management memory, "
-                              "which the daemon imports with "
-                              "MC_NVLINK_PROXY_VMM=1")
-                        : "; as virtual memory management memory: " + why)
-                << "; it stays on the base transport";
-            return 0;
+    std::string why;
+    if (!describeBlock(addr, fresh, why)) {
+        // Device memory the daemon cannot import stays on the base transport
+        // only; with MC_NVLINK_PROXY_REQUIRE_VMM that is an error.
+        if (require_vmm_) {
+            LOG(ERROR) << "nvlink_proxy: refusing to register buffer " << addr
+                       << " of GPU " << attr.device << ": " << why
+                       << " (MC_NVLINK_PROXY_REQUIRE_VMM=1)";
+            return ERR_INVALID_ARGUMENT;
         }
+        LOG(WARNING) << "nvlink_proxy: buffer " << addr << " of GPU "
+                     << attr.device << ": " << why
+                     << "; it stays on the base transport";
+        return 0;
     }
 
     BufferDesc desc;

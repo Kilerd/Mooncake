@@ -153,6 +153,12 @@ class NvlinkProxyTransport : public Transport {
     // of virtual memory management memory created exportable as a POSIX
     // file descriptor; |why| otherwise. *is_vmm: it is such memory at all.
     static bool vmmBlock(Block &block, bool *is_vmm, std::string &why);
+    // Fills |block| (base, size, GPU UUID, identity) for the device memory
+    // at |addr| of GPU |block.device|, with that GPU's context current;
+    // |why| when the daemon cannot import it. Virtual memory management
+    // memory is never asked for a legacy IPC handle, other memory only
+    // without MC_NVLINK_PROXY_REQUIRE_VMM.
+    bool describeBlock(void *addr, Block &block, std::string &why);
     bool acquireCopyConnection(Connection &conn);
     void releaseCopyConnection(Connection &conn, bool reusable);
     using UnconfirmedCounters =
@@ -245,6 +251,11 @@ class NvlinkProxyTransport : public Transport {
     int release_wait_ms_ = 10000;
     // Register virtual memory management memory too (MC_NVLINK_PROXY_VMM).
     bool vmm_enabled_ = false;
+    // Device memory must be virtual memory management memory the daemon
+    // imports; registering other device memory fails, and no legacy IPC
+    // handle is ever exported (MC_NVLINK_PROXY_REQUIRE_VMM, implies
+    // MC_NVLINK_PROXY_VMM).
+    bool require_vmm_ = false;
     // How long same-node requests wait for the daemon to come back before
     // they use the base transport (MC_NVLINK_PROXY_RECONNECT_WAIT_MS).
     int reconnect_wait_ms_ = 15000;
