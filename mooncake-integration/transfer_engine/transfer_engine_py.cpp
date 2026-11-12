@@ -61,8 +61,11 @@ static std::string g_protocol;
 //  Handle allocateMemory function pointer based on protocol
 void initMemoryAllocator(const char* protocol) {
     if (allocateMemory != nullptr) {
-        LOG(WARNING) << "Memory allocator already initialized with: "
-                     << g_protocol;
+        // Another engine of this process chose it (e.g. one shut down and
+        // replaced by this one).
+        if (g_protocol != protocol)
+            LOG(WARNING) << "Memory allocator already initialized with: "
+                         << g_protocol;
         return;
     }
     g_protocol = protocol;
@@ -137,7 +140,8 @@ TransferEnginePy::TransferEnginePy() {
 }
 
 TransferEnginePy::~TransferEnginePy() {
-    for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
+    if (engine_)
+        for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
     handle_map_.clear();
     engine_.reset();
     for (auto& buffer : buffer_list_) freeMemory(buffer);
@@ -211,6 +215,10 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                    << "Use 'hip' instead.";
         return -1;
     }
+    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mu_);
+    if (shut_down_)
+        throw std::runtime_error(
+            "TransferEngine is shut down: create a new TransferEngine");
 
     std::string proto = protocol ? std::string(protocol) : "";
     std::string conn_string = buildConnString(metadata_type, metadata_server);
@@ -341,7 +349,86 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     return 0;
 }
 
-int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
+std::shared_lock<std::shared_mutex> TransferEnginePy::useEngine() {
+    std::shared_lock<std::shared_mutex> lock(lifecycle_mu_);
+    if (!engine_)
+        throw std::runtime_error(
+            shut_down_ ? "TransferEngine is shut down: create a new "
+                         "TransferEngine"
+                       : "TransferEngine is not initialized");
+    return lock;
+}
+
+int TransferEnginePy::shutdown() {
+    pybind11::gil_scoped_release release;
+    // Waits for the calls in flight; later ones raise.
+    std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mu_);
+    if (shut_down_) return shutdown_result_;
+    if (!engine_) {
+        shut_down_ = true;
+        return shutdown_result_ = 0;
+    }
+    // A transfer queued on a CUDA stream submits from a driver thread when
+    // the stream reaches it: it must have run before the engine goes.
+    const int64_t until = batchQuiesceNowNs() +
+                          std::max<int64_t>(0, quiesce_wait_ms_) * 1000000LL;
+    while (cuda_pending_->load() > 0 && batchQuiesceNowNs() < until)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (cuda_pending_->load() > 0)
+        throw std::runtime_error(
+            "TransferEngine.shutdown: " +
+            std::to_string(cuda_pending_->load()) +
+            " transfer(s) queued on CUDA streams have not run yet; "
+            "synchronize those streams first");
+    shut_down_ = true;
+
+    // Batches still known (not freed by the caller, or kept by failed sync
+    // calls): canceled, then waited for together until quiesced, and freed
+    // once settled. One that never settles is left allocated (a transport
+    // may still reference it until it is destroyed below).
+    std::vector<Transport::BatchID> batches;
+    {
+        std::lock_guard<std::mutex> guard(batches_mu_);
+        for (auto& kv : live_batches_) batches.push_back(kv.second.batch);
+        for (auto& left : left_batches_) batches.push_back(left.batch);
+    }
+    for (auto batch : batches) engine_->cancelBatch(batch);
+    size_t unquiesced = 0;
+    for (auto batch : batches) {
+        Transport::BatchProgress p;
+        const int64_t left_ms =
+            std::max<int64_t>(0, (until - batchQuiesceNowNs()) / 1000000LL);
+        if (!waitBatchQuiesced(*engine_, batch, left_ms, &p)) ++unquiesced;
+        if (batchSettled(p)) engine_->freeBatchID(batch);
+    }
+    {
+        std::lock_guard<std::mutex> guard(batches_mu_);
+        live_batches_.clear();
+        left_batches_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
+        handle_map_.clear();
+    }
+    int rc = engine_->shutdown();
+    engine_.reset();
+    if (unquiesced) {
+        LOG(ERROR) << "TransferEngine.shutdown: " << unquiesced << " of "
+                   << batches.size()
+                   << " batch(es) still known were not quiesced: their "
+                      "writes may still land";
+        rc = -1;
+    }
+    LOG(INFO) << "TransferEngine shut down"
+              << (rc == 0 ? "" : " (not everything confirmed, see above)");
+    return shutdown_result_ = rc;
+}
+
+int TransferEnginePy::getRpcPort() {
+    auto use = useEngine();
+    return engine_->getRpcPort();
+}
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
     auto buffer = allocateMemory(capacity);
@@ -384,6 +471,7 @@ int TransferEnginePy::doBuddyAllocate(int class_id) {
 }
 
 uintptr_t TransferEnginePy::allocateManagedBuffer(size_t length) {
+    auto use = useEngine();
     std::lock_guard<std::mutex> guard(mutex_);
     int class_id = findClassId(length);
     if (class_id < 0) {
@@ -400,6 +488,7 @@ uintptr_t TransferEnginePy::allocateManagedBuffer(size_t length) {
 }
 
 int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
+    auto use = useEngine();
     std::lock_guard<std::mutex> guard(mutex_);
     auto buffer = (char*)buffer_addr;
     int class_id = findClassId(length);
@@ -492,6 +581,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                                    TransferNotify* notify,
                                    const std::string& transport_hint) {
     pybind11::gil_scoped_release release;
+    auto use = useEngine();
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -604,6 +694,7 @@ int TransferEnginePy::batchTransferSync(
     TransferOpcode opcode, TransferNotify* notify,
     const std::string& transport_hint) {
     pybind11::gil_scoped_release release;
+    auto use = useEngine();
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -650,6 +741,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     const std::vector<size_t>& lengths, TransferOpcode opcode,
     const std::string& transport_hint, int64_t deadline_ms) {
     pybind11::gil_scoped_release release;
+    auto use = useEngine();
     reapLeftBatches();
     Transport::SegmentHandle handle;
     {
@@ -803,14 +895,15 @@ class BatchUse {
 }  // namespace
 
 pybind11::dict TransferEnginePy::getBatchProgressPy(batch_id_t batch_id) {
-    Transport::BatchID batch;
-    if (!acquireBatch(batch_id, &batch))
-        throw pybind11::value_error("unknown or already freed batch id");
     Transport::BatchProgress p;
     Status s;
     {
-        BatchUse use([this, batch_id] { releaseBatch(batch_id); });
         pybind11::gil_scoped_release release;
+        auto use = useEngine();
+        Transport::BatchID batch;
+        if (!acquireBatch(batch_id, &batch))
+            throw pybind11::value_error("unknown or already freed batch id");
+        BatchUse batch_use([this, batch_id] { releaseBatch(batch_id); });
         s = engine_->getBatchProgress(batch, p);
     }
     if (!s.ok()) throw std::runtime_error(s.ToString());
@@ -834,11 +927,12 @@ pybind11::dict TransferEnginePy::getBatchProgressPy(batch_id_t batch_id) {
 
 bool TransferEnginePy::waitBatchQuiescedPy(batch_id_t batch_id,
                                            int64_t timeout_ms) {
+    pybind11::gil_scoped_release release;
+    auto use = useEngine();
     Transport::BatchID batch;
     if (!acquireBatch(batch_id, &batch))
         throw pybind11::value_error("unknown or already freed batch id");
-    BatchUse use([this, batch_id] { releaseBatch(batch_id); });
-    pybind11::gil_scoped_release release;
+    BatchUse batch_use([this, batch_id] { releaseBatch(batch_id); });
     Transport::BatchProgress p;
     // True only when proven: a backend that cannot prove quiescence (TENT)
     // reports terminal tasks as quiesced, but provable false.
@@ -846,22 +940,24 @@ bool TransferEnginePy::waitBatchQuiescedPy(batch_id_t batch_id,
 }
 
 int TransferEnginePy::cancelBatchPy(batch_id_t batch_id) {
+    pybind11::gil_scoped_release release;
+    auto use = useEngine();
     Transport::BatchID batch;
     if (!acquireBatch(batch_id, &batch))
         throw pybind11::value_error("unknown or already freed batch id");
-    BatchUse use([this, batch_id] { releaseBatch(batch_id); });
-    pybind11::gil_scoped_release release;
+    BatchUse batch_use([this, batch_id] { releaseBatch(batch_id); });
     return engine_->cancelBatch(batch).ok() ? 0 : -1;
 }
 
 int TransferEnginePy::freeBatchPy(batch_id_t batch_id) {
+    pybind11::gil_scoped_release release;
+    auto use = useEngine();
     {
         std::lock_guard<std::mutex> guard(batches_mu_);
         auto it = live_batches_.find(batch_id);
         if (it == live_batches_.end() || it->second.freed)
             throw pybind11::value_error("unknown or already freed batch id");
     }
-    pybind11::gil_scoped_release release;
     reapLeftBatches();
     return freeBatch(batch_id, 0);
 }
@@ -869,6 +965,7 @@ int TransferEnginePy::freeBatchPy(batch_id_t batch_id) {
 int TransferEnginePy::getBatchTransferStatus(
     const std::vector<batch_id_t>& batch_ids) {
     pybind11::gil_scoped_release release;
+    auto use = useEngine();
     reapLeftBatches();
     struct Tracked {
         batch_id_t id;
@@ -991,6 +1088,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     uintptr_t peer_buffer_address, size_t length,
     const std::string& transport_hint) {
     pybind11::gil_scoped_release release;
+    auto use = useEngine();
     reapLeftBatches();
     Transport::SegmentHandle handle;
     {
@@ -1019,6 +1117,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
 
 int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     pybind11::gil_scoped_release release;
+    auto engine_use = useEngine();
     Transport::BatchID batch;
     if (!acquireBatch(batch_id, &batch)) return -1;
     BatchUse use([this, batch_id] { releaseBatch(batch_id); });
@@ -1043,6 +1142,7 @@ int TransferEnginePy::batchRegisterMemory(
     std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities,
     const std::string& location) {
     pybind11::gil_scoped_release release;
+    auto use = useEngine();
     auto batch_size = buffer_addresses.size();
     std::vector<BufferEntry> buffers;
     for (size_t i = 0; i < batch_size; i++) {
@@ -1055,6 +1155,7 @@ int TransferEnginePy::batchRegisterMemory(
 int TransferEnginePy::batchUnregisterMemory(
     std::vector<uintptr_t> buffer_addresses) {
     pybind11::gil_scoped_release release;
+    auto use = useEngine();
     auto batch_size = buffer_addresses.size();
     std::vector<void*> buffers;
     for (size_t i = 0; i < batch_size; i++) {
@@ -1065,11 +1166,13 @@ int TransferEnginePy::batchUnregisterMemory(
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
                                      const std::string& location) {
+    auto use = useEngine();
     char* buffer = reinterpret_cast<char*>(buffer_addr);
     return engine_->registerLocalMemory(buffer, capacity, location);
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
+    auto use = useEngine();
     char* buffer = reinterpret_cast<char*>(buffer_addr);
     return engine_->unregisterLocalMemory(buffer);
 }
@@ -1087,6 +1190,9 @@ struct TransferOnCudaContext {
     Transport::BatchID batch_id;
     std::vector<Transport::TransferRequest> requests;
     uint64_t total_bytes;
+    // The binding's count of transfers queued on streams (shutdown() waits
+    // for it): released once this one no longer uses the engine.
+    std::shared_ptr<std::atomic<int64_t>> pending;
 };
 
 /**
@@ -1131,6 +1237,7 @@ void CUDART_CB transfer_on_cuda_callback(void* data) {
     }
 
     ctx->engine->freeBatchID(ctx->batch_id);
+    ctx->pending->fetch_sub(1);
     delete ctx;
     return;
 
@@ -1164,6 +1271,7 @@ void TransferEnginePy::batchTransferOnCuda(
     const std::vector<size_t>& lengths, TransferOpcode opcode,
     uintptr_t stream_ptr, const std::string& transport_hint) {
     pybind11::gil_scoped_release release;
+    auto use = useEngine();
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1204,12 +1312,14 @@ void TransferEnginePy::batchTransferOnCuda(
 
     auto batch_id = engine_->allocateBatchID(batch_size);
     auto* ctx = new TransferOnCudaContext{engine_, batch_id, std::move(entries),
-                                          total_bytes};
+                                          total_bytes, cuda_pending_};
 
+    cuda_pending_->fetch_add(1);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     cudaError_t err =
         cudaLaunchHostFunc(stream, transfer_on_cuda_callback, ctx);
     if (err != cudaSuccess) {
+        cuda_pending_->fetch_sub(1);
         delete ctx;
         engine_->freeBatchID(batch_id);
         throw std::runtime_error(std::string("cudaLaunchHostFunc failed: ") +
@@ -1273,6 +1383,7 @@ void TransferEnginePy::batchTransferReadOnCuda(
 int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
 #ifdef USE_EFA
     pybind11::gil_scoped_release release;
+    auto use = useEngine();
     auto* t = engine_->getTransport("efa");
     if (!t) return 0;  // EFA transport not installed; nothing to do.
     auto* efa = dynamic_cast<EfaTransport*>(t);
@@ -1286,6 +1397,7 @@ int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
 
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string& segment_name) {
+    auto use = useEngine();
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
     auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
@@ -1337,6 +1449,7 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
     std::vector<TransferMetadata::NotifyDesc> notifies;
     std::vector<TransferNotify> result;
 
+    auto use = useEngine();
     int ret = engine_->getNotifies(notifies);
     if (ret != 0) {
         LOG(ERROR) << "Failed to get notifies: " << ret;
@@ -1352,8 +1465,9 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 }
 
 int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
-    if (!engine_) return -1;
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mu_);
+    if (!engine_) return -1;
     return engine_->getMetadata()->sendProbe(peer_server_name);
 }
 
@@ -1426,6 +1540,15 @@ PYBIND11_MODULE(engine, m) {
             .def(py::init<>())
             .def("initialize", &TransferEnginePy::initialize)
             .def("initialize_ext", &TransferEnginePy::initializeExt)
+            .def("shutdown", &TransferEnginePy::shutdown,
+                 "Tear the engine down for a process that lives on (e.g. "
+                 "before it is checkpointed): waits for calls in flight, "
+                 "cancels the batches still known and waits for them to "
+                 "quiesce, closes every connection, listener and thread "
+                 "(the nvlink_proxy daemon first confirms it closed its "
+                 "mappings of this engine's memory). Later calls raise; "
+                 "create a new TransferEngine to transfer again. Idempotent. "
+                 "Returns 0, or -1 when not all of it was confirmed.")
             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
             .def("allocate_managed_buffer",
                  &TransferEnginePy::allocateManagedBuffer)

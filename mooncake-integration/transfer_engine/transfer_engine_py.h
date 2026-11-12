@@ -17,10 +17,12 @@
 #include <pybind11/pybind11.h>
 #include <sys/time.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <shared_mutex>
 #include <stack>
 #include <vector>
 
@@ -62,6 +64,16 @@ class TransferEnginePy {
     int initializeExt(const char *local_hostname, const char *metadata_server,
                       const char *protocol, const char *device_name,
                       const char *metadata_type);
+
+    // Tears the engine down for a process that lives on (e.g. before it is
+    // checkpointed): waits for the calls in flight, cancels the batches
+    // still known and waits for them to quiesce (MC_TRANSFER_QUIESCE_WAIT_MS),
+    // then TransferEngine::shutdown(). Every later call raises; a new
+    // TransferEngine may be created and initialized in the same process.
+    // Idempotent: later calls return the first result. 0, or -1 when not all
+    // of it was confirmed (a batch not quiesced, or the nvlink_proxy daemon
+    // did not confirm it closed its mappings of this engine's memory).
+    int shutdown();
 
     int getRpcPort();
 
@@ -208,9 +220,17 @@ class TransferEnginePy {
 
     int sendProbe(const std::string &peer_server_name);
 
-    std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
+    // None / 0 once shut down. An engine handed out is unusable after
+    // shutdown() too.
+    std::shared_ptr<TransferEngine> getEngine() const {
+        std::shared_lock<std::shared_mutex> lock(lifecycle_mu_);
+        return engine_;
+    }
 
-    uintptr_t getEnginePtr() const { return (uintptr_t)engine_.get(); }
+    uintptr_t getEnginePtr() const {
+        std::shared_lock<std::shared_mutex> lock(lifecycle_mu_);
+        return (uintptr_t)engine_.get();
+    }
 
    private:
     char *allocateRawBuffer(size_t capacity);
@@ -219,8 +239,20 @@ class TransferEnginePy {
 
     int doBuddyAllocate(int class_id);
 
+    // A use of engine_ for one call (lifecycle_mu_ shared): shutdown() waits
+    // for it. Raises when the engine is shut down or not initialized. Taken
+    // with the GIL held only by calls that keep it; others take it after
+    // releasing the GIL and drop it before taking the GIL back.
+    std::shared_lock<std::shared_mutex> useEngine();
+
    private:
     std::shared_ptr<TransferEngine> engine_;
+    mutable std::shared_mutex lifecycle_mu_;
+    bool shut_down_ = false;   // guarded by lifecycle_mu_
+    int shutdown_result_ = 0;  // guarded by lifecycle_mu_
+    // Transfers queued on CUDA streams (transfer_*_on_cuda) not run yet.
+    std::shared_ptr<std::atomic<int64_t>> cuda_pending_ =
+        std::make_shared<std::atomic<int64_t>>(0);
     Transport *xport_;
 
     std::mutex mutex_;
