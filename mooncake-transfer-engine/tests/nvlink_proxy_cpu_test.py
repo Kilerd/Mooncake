@@ -35,6 +35,10 @@ are worker threads) and plays engines over its socket:
                      mapping; a re-registering engine shares its mapping
   share              two engines of one process share a mapping while one is
                      connected; another process is refused
+  release            RELEASE (engine shutdown) drops an engine's
+                     registrations and is answered only once no mapping of
+                     its memory is left, also while a copy holds one or
+                     over a connection opened just for it
   gpus               --min-visible-gpus, REGISTER of a GPU the daemon cannot
                      see, a client pid equal to the daemon's
 
@@ -54,9 +58,10 @@ import threading
 import time
 
 MAGIC, VERSION = 0x504E434D, 1
-HELLO, REGISTER, UNREGISTER, COPY, PING, STATS = 1, 2, 3, 4, 5, 6
+HELLO, REGISTER, UNREGISTER, COPY, PING, STATS, RELEASE = 1, 2, 3, 4, 5, 6, 7
 OK, UNKNOWN_DEVICE, UNKNOWN_SOURCE = 0, 3, 4
 NO_PEER_ACCESS, CUDA_ERROR, DEADLINE_EXCEEDED = 7, 8, 9
+NOT_CONTROL_CONNECTION = 10
 MiB = 1 << 20
 
 DAEMON = None
@@ -154,6 +159,17 @@ def register(conn, base, seg, gpu, pid=0):
         REGISTER, struct.pack("<QQ", base, seg.size) + uuid(gpu) + seg.handle(gpu, pid)
     )
     return st, body.decode(errors="replace")
+
+
+def release(conn, wait_ms):
+    """RELEASE: (status, registrations dropped, mappings left, seconds)."""
+    t0 = time.monotonic()
+    st, body = conn.rpc(RELEASE, struct.pack("<II", wait_ms, 0))
+    t = time.monotonic() - t0
+    if len(body) == 16:
+        dropped, left = struct.unpack("<QQ", body)
+        return st, dropped, left, t
+    return st, None, None, t
 
 
 def copy(path, entries, budget_ms=0, client=0xC0):
@@ -815,6 +831,115 @@ def share():
         unlink_segments("nvlp-sh", "nvlp-b")
 
 
+def release_memory():
+    print("== release: an engine shuts down")
+    d = Daemon(["--gather-on", "src"])
+    try:
+        a1 = Segment("nvlp-a1", 16 * MiB, 6)
+        a2 = Segment("nvlp-a2", 16 * MiB, 7)
+        b = Segment("nvlp-b", 32 * MiB)
+        ca = Conn(d.sock, 0xA, True)
+        cb = Conn(d.sock, 0xB, True)
+        assert register(ca, 0x10000000, a1, 0)[0] == OK
+        assert register(ca, 0x18000000, a2, 0)[0] == OK
+        assert register(cb, 0x20000000, b, 1)[0] == OK
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        ents = [
+            (0xA, 0x10000000, 0, 0xB, 0x20000000, 0, 4 * MiB),
+            (0xA, 0x18000000, 0, 0xB, 0x20000000, 4 * MiB, 4 * MiB),
+        ]
+        st, _, _, _ = copy(d.sock, ents)
+        check(
+            st == OK and mapped(d, "nvlp-a1") and mapped(d, "nvlp-a2"),
+            "A's blocks mapped by a copy",
+        )
+        cn = Conn(d.sock, 0xA, False)
+        st, _, _, _ = release(cn, 1000)
+        check(st == NOT_CONTROL_CONNECTION, "RELEASE needs a control connection")
+        cn.close()
+        st, dropped, left, _ = release(ca, 2000)
+        # Nothing of A's memory is mapped any more when the answer arrives.
+        gone = not mapped(d, "nvlp-a1") and not mapped(d, "nvlp-a2")
+        check(
+            st == OK and dropped == 2 and left == 0 and gone,
+            f"answered once A's mappings were closed (status {st}, "
+            f"dropped {dropped}, left {left})",
+        )
+        check(mapped(d, "nvlp-b"), "B's mappings stay")
+        st, msg, _, _ = copy(d.sock, ents)
+        check(st == UNKNOWN_SOURCE, f"A's blocks are unknown afterwards ({msg[:50]})")
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+    print("== release: a copy in flight holds A's mapping")
+    d = Daemon(["--no-coalesce"], {"MOCK_COPY_DELAY_MS": "20"})
+    try:
+        a1 = Segment("nvlp-a1", 16 * MiB, 6)
+        b = Segment("nvlp-b", 32 * MiB)
+        ca, cb = pair(d, a1, b)
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        res = {}
+        th = threading.Thread(
+            target=lambda: res.update(r=copy(d.sock, runs(40, 256 * 1024)))
+        )
+        th.start()
+        time.sleep(0.3)
+        st, _, left, _ = release(ca, 50)
+        check(
+            st == DEADLINE_EXCEEDED and left and mapped(d, "nvlp-a1"),
+            f"short wait: DEADLINE_EXCEEDED, {left} mapping(s) still used",
+        )
+        st, _, left, t = release(ca, 10000)
+        answered = time.monotonic()
+        th.join(10)
+        last = d.last_write_us("nvlp-b")
+        check(
+            st == OK and left == 0 and not mapped(d, "nvlp-a1"),
+            f"then answered OK after {t * 1000:.0f} ms, A's mapping closed",
+        )
+        check(
+            res["r"][0] == OK and last is not None and last / 1e6 <= answered,
+            "the copy finished, no write of it after the answer",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+    print("== release: over a connection opened for it")
+    d = Daemon(["--no-coalesce"], {"MOCK_COPY_DELAY_MS": "20"})
+    try:
+        a1 = Segment("nvlp-a1", 16 * MiB, 6)
+        b = Segment("nvlp-b", 32 * MiB)
+        ca, cb = pair(d, a1, b)
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        res = {}
+        th = threading.Thread(
+            target=lambda: res.update(r=copy(d.sock, runs(40, 256 * 1024)))
+        )
+        th.start()
+        time.sleep(0.3)
+        ca.close()  # the engine lost its control connection
+        cr = Conn(d.sock, 0xA, True)
+        st, dropped, left, t = release(cr, 10000)
+        answered = time.monotonic()
+        th.join(10)
+        last = d.last_write_us("nvlp-b")
+        check(
+            st == OK and dropped == 0 and left == 0 and not mapped(d, "nvlp-a1"),
+            f"answered OK after {t * 1000:.0f} ms, the old mapping closed",
+        )
+        check(
+            res["r"][0] == OK and last is not None and last / 1e6 <= answered,
+            "no write of the copy after the answer",
+        )
+        cr.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-a1", "nvlp-a2", "nvlp-b")
+
+
 def gpus():
     print("== gpus: --min-visible-gpus")
     for n, need, expect in ((1, 2, 78), (0, 1, 78)):
@@ -860,6 +985,7 @@ SCENARIOS = {
     "disconnect": disconnect,
     "restart": restart,
     "share": share,
+    "release": release_memory,
     "gpus": gpus,
 }
 

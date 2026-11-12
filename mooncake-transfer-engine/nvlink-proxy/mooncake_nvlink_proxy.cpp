@@ -1648,8 +1648,10 @@ void replyError(int fd, MsgType type, uint64_t seq, ProxyStatus st,
     sendMsg(fd, type, seq, st, msg.data(), msg.size());
 }
 
-void dropOwned(Connection &c) {
-    if (c.owned.empty()) return;
+// Drops the registrations this connection owns; |what| says why (for the
+// log). The number dropped.
+size_t dropOwned(Connection &c, const char *what = "disconnected") {
+    if (c.owned.empty()) return 0;
     size_t dropped = 0;
     {
         std::lock_guard<std::mutex> lock(g_reg_mu);
@@ -1672,13 +1674,14 @@ void dropOwned(Connection &c) {
     c.owned.clear();
     const size_t held = g_imports.mappingsOf(c.client_id);
     LOGI("client %016" PRIx64
-         " (pid %u, node %s) disconnected; released %zu registrations, %s",
-         c.client_id, c.pid, c.node.c_str(), dropped,
+         " (pid %u, node %s) %s; released %zu registrations, %s",
+         c.client_id, c.pid, c.node.c_str(), what, dropped,
          held == 0 ? "all of its IPC mappings are closed"
                    : (std::to_string(held) +
                       " IPC mapping(s) still used by copies in flight, closed "
                       "when they finish")
                          .c_str());
+    return dropped;
 }
 
 void handleConnection(int fd) {
@@ -1997,6 +2000,50 @@ void handleConnection(int fd) {
                 std::string s = statsText();
                 ok = sendMsg(fd, type, h.seq, ProxyStatus::kOk, s.data(),
                              s.size());
+                break;
+            }
+            case MsgType::kRelease: {
+                if (!c.control) {
+                    replyError(fd, type, h.seq,
+                               ProxyStatus::kNotControlConnection,
+                               "RELEASE requires a control connection");
+                    break;
+                }
+                if (payload.size() != sizeof(ReleaseReq)) {
+                    replyError(fd, type, h.seq, ProxyStatus::kBadRequest,
+                               "bad RELEASE");
+                    break;
+                }
+                ReleaseReq req;
+                memcpy(&req, payload.data(), sizeof(req));
+                const size_t dropped = dropOwned(c, "releases its memory");
+                // Copies in flight that use a mapping close it when they
+                // finish, bounded by their deadline.
+                const uint64_t t0 = nowUs();
+                const uint64_t until =
+                    t0 +
+                    uint64_t(std::min<uint32_t>(req.wait_ms, 600000)) * 1000;
+                size_t held;
+                while ((held = g_imports.mappingsOf(c.client_id)) > 0 &&
+                       nowUs() < until)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                ReleaseResp resp{};
+                resp.dropped = dropped;
+                resp.mappings = held;
+                if (held == 0)
+                    LOGI("client %016" PRIx64
+                         " released its memory: %zu registration(s) dropped, "
+                         "no IPC mapping of it left (%.1f ms)",
+                         c.client_id, dropped, (nowUs() - t0) / 1000.0);
+                else
+                    LOGW("client %016" PRIx64
+                         " releases its memory: %zu IPC mapping(s) of it "
+                         "still used by copies in flight after %u ms",
+                         c.client_id, held, req.wait_ms);
+                ok = sendMsg(fd, type, h.seq,
+                             held == 0 ? ProxyStatus::kOk
+                                       : ProxyStatus::kDeadlineExceeded,
+                             &resp, sizeof(resp));
                 break;
             }
             default:

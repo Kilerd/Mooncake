@@ -60,6 +60,7 @@ enum class MsgType : uint16_t {
     kCopy = 4,
     kPing = 5,
     kStats = 6,
+    kRelease = 7,
 };
 
 enum class ProxyStatus : uint32_t {
@@ -111,7 +112,9 @@ constexpr uint32_t kHelloFlagControl = 1u << 0;
 // kHelloTokenOffset - 1 bytes) and, at kHelloTokenOffset, a random 64-bit
 // token of the engine's process. The daemon tells processes apart by it:
 // pid and node alone repeat across PID namespaces (containers of a pod).
-// Daemons that do not know the flag read only the text.
+// Engines of one process share it while any of them lives; one created when
+// none is left draws a new one, so processes restored from one snapshot
+// differ. Daemons that do not know the flag read only the text.
 constexpr uint32_t kHelloFlagProcessToken = 1u << 1;
 constexpr size_t kHelloTokenOffset = 56;
 
@@ -181,12 +184,33 @@ struct PingResp {
     uint64_t daemon_epoch;
     uint64_t uptime_ms;
 };
+
+// RELEASE, on a control connection: the daemon drops every registration of
+// that connection, then answers once it holds no IPC mapping of the client's
+// memory (OK), or when |wait_ms| passed (DEADLINE_EXCEEDED: copies in flight
+// still use |mappings| of them). An engine sends it before it disconnects
+// for good (TransferEngine::shutdown), so that no other process imports the
+// memory it exported once shutdown returned, e.g. before it is checkpointed.
+// Any control connection of the client id may ask: one opened only for this
+// drops nothing and waits for the mappings of an earlier connection. Daemons
+// that do not know it reply BAD_REQUEST.
+struct ReleaseReq {
+    uint32_t wait_ms;
+    uint32_t reserved;
+};
+
+struct ReleaseResp {
+    uint64_t dropped;   // registrations dropped
+    uint64_t mappings;  // IPC mappings of the client's memory still open
+};
 #pragma pack(pop)
 
 static_assert(sizeof(MsgHeader) == 24, "MsgHeader layout");
 static_assert(sizeof(HelloReq) == 80, "HelloReq layout");
 static_assert(sizeof(RegisterReq) == 96, "RegisterReq layout");
 static_assert(sizeof(CopyEntry) == 56, "CopyEntry layout");
+static_assert(sizeof(ReleaseReq) == 8, "ReleaseReq layout");
+static_assert(sizeof(ReleaseResp) == 16, "ReleaseResp layout");
 
 // ---------------------------------------------------------------------------
 // Segment metadata. A device buffer registered under nvlink_proxy is
