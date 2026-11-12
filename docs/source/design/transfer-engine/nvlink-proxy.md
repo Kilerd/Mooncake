@@ -421,9 +421,10 @@ checkpoint and creates a new one after the restore:
    transport is shut down, `nvlink_proxy` first. It stops its health thread
    and sends `RELEASE` on its control connection (on one opened for it when
    that connection was lost): the daemon drops the engine's registrations
-   and answers once it holds no IPC mapping of the engine's memory any more
-   -- at once, or when the copies in flight that use one finished, at most
-   `MC_NVLINK_PROXY_RELEASE_WAIT_MS`. Then every connection to the daemon is
+   and answers once none of them is alive any more -- at once, or when the
+   copies in flight that use one (and may still map it) finished, at most
+   `MC_NVLINK_PROXY_RELEASE_WAIT_MS` -- so that no mapping or import of the
+   engine's memory is left. Then every connection to the daemon is
    closed, and the base transport (TCP) closes its acceptor, lanes, server
    sessions and io threads; last the metadata service closes its handshake
    listener (woken at once, not at its next receive timeout). When it
@@ -432,8 +433,11 @@ checkpoint and creates a new one after the restore:
    `shutdown()` returns -1 (and logs why) when that was not confirmed: the
    daemon kept a mapping past the wait, cannot be reached although it
    listens, or predates `RELEASE` (it then closes the mappings only after
-   the disconnect, unconfirmed). An engine that never had a block accepted
-   by a daemon, or whose daemon no longer listens, has nothing to release.
+   the disconnect, unconfirmed); or a daemon this engine lost less than
+   `MC_NVLINK_PROXY_TIMEOUT_MS` (at least 10 s) ago, which may still be
+   draining copies that use its memory, is not the one answering. An engine
+   that never sent a block to a daemon, or whose daemon no longer listens
+   (and was lost longer ago than that), has nothing to release.
 2. After the restore, a new `TransferEngine` reads the variables its
    transports read at start (`MC_FORCE_TCP`, `MC_NVLINK_PROXY_*`,
    `MC_NODE_ID` / `NODE_NAME`, `MC_TCP_*`), queries the GPU UUID of every
@@ -521,9 +525,9 @@ reply carries the daemon epoch),
 (list of `(src client, src base, src offset, dst client, dst base,
 dst offset, length)` plus a start budget; replied after the copies completed),
 `PING`, `STATS`, `RELEASE` (control connection: drop the client's
-registrations; replied once no mapping of its memory is left, or with
-`DEADLINE_EXCEEDED` and the count of those still in use after the wait it
-names), `REGISTER_FD` (`REGISTER` of a virtual memory management block whose
+registrations; replied once none of them is alive -- a copy in flight may
+still map one it resolved -- or with `DEADLINE_EXCEEDED` and the count of
+those still in use after the wait it names), `REGISTER_FD` (`REGISTER` of a virtual memory management block whose
 handle field carries the allocation's buffer id; the allocation's POSIX file
 descriptor comes with the message header as `SCM_RIGHTS`).
 
@@ -536,11 +540,12 @@ and host memory byte by byte. `nvlink_proxy_transport_test` covers the
 protocol helpers and the no-daemon path without GPUs, and `shutdown()`
 against a stand-in daemon: no socket, epoll / eventfd descriptor, pipe or
 thread of the engine left, `RELEASE` waited for (and reported unconfirmed
-by an older or slow daemon), new client id and process token for the next
-engine, and a `REGISTER_FD` that carries its descriptor.
+by an older or slow daemon, and while a daemon lost a moment ago may
+still drain), new client id and process token for the next engine, and a
+`REGISTER_FD` that carries its descriptor.
 `transfer_engine_shutdown_test.py` checks the same through the
 Python API (calls after `shutdown()` raise, a batch left unfreed, a thread
-still transferring); with `--gpu` it writes through a running daemon,
+still transferring, refused while `get_engine()`'s engine is referenced); with `--gpu` it writes through a running daemon,
 shuts down, finds no mapping left in the daemon, and does it again with new
 engines in the same process (`--gpu --vmm`: with virtual memory management
 pools whose physical memory is released and created again in between);
@@ -556,8 +561,9 @@ before their deadline with no write after the refusal, a slow link at the
 default chunk size, chunked copies byte-exact, host staging, socket
 permissions, mappings closed when an engine disconnects or restarts,
 mappings shared within a process and refused to another, `RELEASE`
-answered only once no mapping is left (also while a copy holds one, and
-over a connection opened for it), `REGISTER_FD` (imported once, copied from
+answered only once no mapping is left (also while a copy holds one, while a
+copy has resolved a block it has not mapped yet, and over a connection
+opened for it), `REGISTER_FD` (imported once, copied from
 and to, released by `RELEASE` and by a disconnect, a GPU that cannot be
 granted access refusing the copy; the stand-in also implements the driver's
 virtual memory management calls),

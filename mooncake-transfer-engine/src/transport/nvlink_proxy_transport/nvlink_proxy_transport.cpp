@@ -17,6 +17,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <glog/logging.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -180,7 +181,9 @@ int exportVmmFd(uint64_t base, CUresult *error) {
     *error = cuMemExportToShareableHandle(
         &fd, h, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
     cuMemRelease(h);
-    return *error == CUDA_SUCCESS ? fd : -1;
+    if (*error != CUDA_SUCCESS) return -1;
+    fcntl(fd, F_SETFD, FD_CLOEXEC);  // no child keeps the allocation alive
+    return fd;
 }
 
 const char *reasonName(int reason) {
@@ -198,15 +201,27 @@ const char *reasonName(int reason) {
 
 NvlinkProxyTransport::NvlinkProxyTransport() = default;
 
-NvlinkProxyTransport::~NvlinkProxyTransport() { stop(false); }
+NvlinkProxyTransport::~NvlinkProxyTransport() {
+    stop(false);
+    // stop() may have run before (shutdown()); nothing reopens a connection
+    // after it, these only close what a misuse could have left.
+    {
+        std::lock_guard<std::mutex> lock(control_mu_);
+        closeControlLocked();
+    }
+    std::lock_guard<std::mutex> lock(pool_mu_);
+    for (auto &c : idle_) close(c.fd);
+    idle_.clear();
+}
 
 int NvlinkProxyTransport::shutdown() { return stop(true) ? 0 : -1; }
 
 bool NvlinkProxyTransport::stop(bool release) {
+    std::lock_guard<std::mutex> stop_lock(stop_mu_);
+    if (stopped_) return release_confirmed_;
+    stopped_ = true;
     {
         std::lock_guard<std::mutex> lock(health_mu_);
-        if (stopped_) return release_confirmed_;
-        stopped_ = true;
         stop_ = true;
     }
     health_cv_.notify_all();
@@ -239,18 +254,25 @@ bool NvlinkProxyTransport::stop(bool release) {
         }
     }
     if (process_token_) releaseProcessToken();
-    std::lock_guard<std::mutex> lock(health_mu_);
     release_confirmed_ = confirmed;
     return confirmed;
 }
 
 // Requires control_mu_.
 bool NvlinkProxyTransport::releaseLocked() {
-    // No daemon ever accepted a block: none can have mapped this memory.
+    // No block was ever sent to a daemon: none can have mapped this memory.
     if (!ever_registered_) return true;
     char id[32];
     snprintf(id, sizeof(id), "%016" PRIx64, client_id_);
+    // A daemon this engine lost after registering may still map its memory
+    // until the copies in flight that use it drained (each within its
+    // request budget, the daemon's drain within 10 s by default): neither
+    // its absence nor another daemon's answer proves it gone before that.
+    const int64_t lost_ago_ms = lost_ns_ ? (nowNs() - lost_ns_) / 1000000 : -1;
+    const bool lost_recently =
+        lost_ns_ != 0 && lost_ago_ms < std::max(timeout_ms_, 10000);
     int fd = control_fd_;
+    uint64_t epoch = epoch_.load();
     const bool own = fd < 0;
     if (own) {
         // The control connection is gone (the daemon drops what it
@@ -259,7 +281,7 @@ bool NvlinkProxyTransport::releaseLocked() {
         fd = connectSocket(2000);
         if (fd < 0) {
             const int err = errno;
-            if (err == ENOENT || err == ECONNREFUSED) {
+            if ((err == ENOENT || err == ECONNREFUSED) && !lost_recently) {
                 LOG(WARNING) << "nvlink_proxy: client " << id
                              << ": no daemon listens at " << socket_path_
                              << " (" << strerror(err)
@@ -270,10 +292,15 @@ bool NvlinkProxyTransport::releaseLocked() {
             LOG(ERROR) << "nvlink_proxy: client " << id
                        << ": cannot reach the daemon at " << socket_path_
                        << " to release this engine's memory (" << strerror(err)
-                       << ")";
+                       << ")"
+                       << (lost_recently
+                               ? "; the daemon lost " +
+                                     std::to_string(lost_ago_ms) +
+                                     " ms ago may still be draining copies "
+                                     "that use it"
+                               : std::string());
             return false;
         }
-        uint64_t epoch = 0;
         if (!hello(fd, true, epoch)) {
             const int err = errno;
             close(fd);
@@ -303,6 +330,15 @@ bool NvlinkProxyTransport::releaseLocked() {
     const bool sized = answered && reply.size() == sizeof(resp);
     if (sized) memcpy(&resp, reply.data(), sizeof(resp));
     if (sized && st == ProxyStatus::kOk) {
+        if (lost_recently && lost_epoch_ != epoch) {
+            LOG(ERROR) << "nvlink_proxy: client " << id
+                       << ": the daemon holds no mapping of this engine's "
+                          "memory, but the previous daemon, lost "
+                       << lost_ago_ms
+                       << " ms ago, may still be draining copies that use "
+                          "it; unconfirmed";
+            return false;
+        }
         LOG(INFO) << "nvlink_proxy: client " << id << " released "
                   << resp.dropped
                   << " registration(s); the daemon holds no IPC mapping of "
@@ -558,7 +594,13 @@ bool NvlinkProxyTransport::hello(int fd, bool control, uint64_t &epoch) {
 }
 
 void NvlinkProxyTransport::closeControlLocked() {
-    if (control_fd_ >= 0) close(control_fd_);
+    if (control_fd_ >= 0) {
+        close(control_fd_);
+        if (ever_registered_ && epoch_.load() != 0) {
+            lost_epoch_ = epoch_.load();
+            lost_ns_ = nowNs();
+        }
+    }
     control_fd_ = -1;
     markUnhealthy();
     epoch_ = 0;
@@ -600,6 +642,7 @@ bool NvlinkProxyTransport::waitForDaemon(int64_t limit_ns) {
 
 bool NvlinkProxyTransport::ensureControlLocked() {
     if (control_fd_ >= 0) return true;
+    if (shut_down_) return false;
     int fd = connectSocket(2000);
     uint64_t epoch = 0;
     if (fd >= 0 && !hello(fd, true, epoch)) {
@@ -692,10 +735,13 @@ bool NvlinkProxyTransport::registerBlockLocked(Block &block) {
     }
     ProxyStatus st;
     std::string reply;
+    bool sent = false;
     const bool answered =
         rpc(control_fd_, block.vmm ? MsgType::kRegisterFd : MsgType::kRegister,
-            &req, sizeof(req), st, reply, nullptr, fd);
+            &req, sizeof(req), st, reply, &sent, fd);
     const int err = errno;
+    // Sent: the daemon may hold it even if its answer got lost.
+    if (sent) ever_registered_ = true;
     if (fd >= 0) close(fd);  // the daemon has its own once it got it
     if (!answered) {
         LOG(WARNING) << "nvlink_proxy: lost daemon connection while "
@@ -739,7 +785,7 @@ bool NvlinkProxyTransport::registerBlockLocked(Block &block) {
 
 bool NvlinkProxyTransport::acquireCopyConnection(Connection &conn) {
     const uint64_t epoch = epoch_.load();
-    if (epoch == 0) return false;
+    if (epoch == 0 || shut_down_) return false;
     {
         std::lock_guard<std::mutex> lock(pool_mu_);
         while (!idle_.empty()) {
@@ -763,7 +809,7 @@ bool NvlinkProxyTransport::acquireCopyConnection(Connection &conn) {
 
 void NvlinkProxyTransport::releaseCopyConnection(Connection &conn,
                                                  bool reusable) {
-    if (!reusable || conn.epoch != epoch_.load()) {
+    if (!reusable || shut_down_ || conn.epoch != epoch_.load()) {
         close(conn.fd);
         conn.fd = -1;
         return;

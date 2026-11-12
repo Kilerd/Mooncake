@@ -579,6 +579,12 @@ struct NvlinkProxyTransportTestAccess {
         return t.rpc(fd, MsgType::kRegisterFd, &req, sizeof(req), st, reply,
                      nullptr, pass_fd);
     }
+    // As if this engine had lost daemon |epoch| at |ns| after registering.
+    static void setLost(NvlinkProxyTransport &t, uint64_t epoch, int64_t ns) {
+        std::lock_guard<std::mutex> lock(t.control_mu_);
+        t.lost_epoch_ = epoch;
+        t.lost_ns_ = ns;
+    }
     // RELEASE of a transport that has no control connection.
     static bool releaseWithoutControl(NvlinkProxyTransport &t,
                                       const std::string &socket,
@@ -1153,5 +1159,38 @@ TEST(NvlinkProxyShutdown, NewEngineDrawsNewIdentity) {
     EXPECT_EQ(tokens, std::set<uint64_t>{p3->processToken()});
     EXPECT_EQ(e3->shutdown(), 0);
     clearEnv();
+}
+// A daemon lost a moment ago may still be draining copies that use this
+// engine's memory: neither the absence of a daemon nor another daemon's
+// answer confirms the release then; the same daemon's answer does, and so
+// does either once the drain window passed.
+TEST(NvlinkProxyShutdown, ReleaseAfterLosingADaemon) {
+    using Access = NvlinkProxyTransportTestAccess;
+    const std::string nobody = "/tmp/mc-nvlp-nobody-listens.sock";
+    const int64_t now = steadyNowNs();
+    const int64_t long_ago = now - 120LL * 1000 * 1000 * 1000;
+    FakeDaemon daemon;  // epoch 0x5eed
+    struct Case {
+        uint64_t lost_epoch;
+        int64_t lost_ns;
+        bool listening;
+        bool confirmed;
+    };
+    const Case cases[] = {
+        {0x1234, now, true, false},       // another daemon answers
+        {0x5eed, now, true, true},        // the daemon that was lost answers
+        {0x1234, now, false, false},      // nobody listens yet
+        {0x1234, long_ago, false, true},  // nobody listens, drained by now
+        {0x1234, long_ago, true, true},
+    };
+    uint64_t client = 0xac0;
+    for (const Case &c : cases) {
+        NvlinkProxyTransport proxy;
+        Access::setLost(proxy, c.lost_epoch, c.lost_ns);
+        EXPECT_EQ(Access::releaseWithoutControl(
+                      proxy, c.listening ? daemon.path() : nobody, client++),
+                  c.confirmed)
+            << "lost epoch " << c.lost_epoch << ", listening " << c.listening;
+    }
 }
 #endif

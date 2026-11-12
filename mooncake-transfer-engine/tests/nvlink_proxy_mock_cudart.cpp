@@ -46,6 +46,8 @@
 //   cuMemMap maps the file over a reserved range, cuMemUnmap gives the range
 //   back to the reservation. MOCK_VMM_ACCESS_FAIL=k: cuMemSetAccess for
 //   gpu k fails.
+// - MOCK_IPC_OPEN_DELAY_MS with MOCK_IPC_OPEN_DELAY_SEGMENT=/<name>: opening
+//   that segment's handle takes this long.
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -588,6 +590,9 @@ cudaError_t cudaIpcOpenMemHandle(void **p, cudaIpcMemHandle_t h, unsigned int) {
             return cudaSuccess;
         }
     }
+    const char *slow = getenv("MOCK_IPC_OPEN_DELAY_SEGMENT");
+    if (slow && strcmp(slow, name) == 0)
+        usleep(envInt("MOCK_IPC_OPEN_DELAY_MS", 0) * 1000);
     const int fd = shm_open(name, O_RDWR, 0);
     if (fd < 0) return cudaErrorInvalidResourceHandle;
     struct stat st;

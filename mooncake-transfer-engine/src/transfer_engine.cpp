@@ -124,10 +124,10 @@ int TransferEngine::freeEngine() {
 
 int TransferEngine::shutdown() {
     detachShutdownToken(shutdown_token_);
-    if (!impl_) return 0;
-    const int rc = impl_->shutdown();
+    if (!impl_) return shutdown_result_;
+    shutdown_result_ = impl_->shutdown();
     impl_.reset();
-    return rc;
+    return shutdown_result_;
 }
 
 Transport* TransferEngine::installTransport(const std::string& proto,
@@ -520,12 +520,12 @@ int TransferEngine::freeEngine() {
 int TransferEngine::shutdown() {
     detachShutdownToken(shutdown_token_);
     if (!use_tent_ && impl_) {
-        const int rc = impl_->shutdown();
+        shutdown_result_ = impl_->shutdown();
         impl_.reset();
-        return rc;
+        return shutdown_result_;
     }
     impl_tent_.reset();
-    return 0;
+    return shutdown_result_;
 }
 
 Transport* TransferEngine::installTransport(const std::string& proto,

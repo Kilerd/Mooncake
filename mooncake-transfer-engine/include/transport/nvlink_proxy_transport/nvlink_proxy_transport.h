@@ -264,8 +264,12 @@ class NvlinkProxyTransport : public Transport {
     // Control connection: HELLO(control) + REGISTER/UNREGISTER/PING.
     std::mutex control_mu_;
     int control_fd_ = -1;
-    // A daemon accepted a block of this engine (it may map its memory).
+    // A block of this engine was sent to a daemon (it may map its memory).
     bool ever_registered_ = false;
+    // The last daemon this engine lost (epoch and when) after registering:
+    // until its copies in flight drained, it may still map that memory.
+    uint64_t lost_epoch_ = 0;
+    int64_t lost_ns_ = 0;
     int64_t last_unreachable_log_ns_ = 0;
     std::atomic<uint64_t> epoch_{0};  // 0 = daemon not reachable
     std::atomic<bool> healthy_{false};
@@ -290,10 +294,12 @@ class NvlinkProxyTransport : public Transport {
     std::condition_variable health_cv_;
     bool stop_ = false;
     bool recheck_ = false;  // a copy failed: re-validate the daemon now
-    // Teardown began (stop()); requests stop waiting for the daemon.
+    // Teardown began (stop()); requests stop waiting for the daemon and no
+    // connection to it is opened any more.
     std::atomic<bool> shut_down_{false};
-    bool stopped_ = false;           // guarded by health_mu_
-    bool release_confirmed_ = true;  // stop()'s result, guarded by health_mu_
+    std::mutex stop_mu_;             // one stop() at a time
+    bool stopped_ = false;           // guarded by stop_mu_
+    bool release_confirmed_ = true;  // stop()'s result, guarded by stop_mu_
 
     struct Counters {
         std::atomic<uint64_t> proxy_requests{0};

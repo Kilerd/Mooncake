@@ -941,6 +941,54 @@ def release_memory():
         cb.close()
     finally:
         d.stop()
+    print("== release: a copy resolved the block but has not mapped it yet")
+    d = Daemon(
+        ["--no-coalesce"],
+        {"MOCK_IPC_OPEN_DELAY_MS": "600", "MOCK_IPC_OPEN_DELAY_SEGMENT": "/nvlp-x"},
+    )
+    try:
+        x = Segment("nvlp-x", 4 * MiB, 61)  # another engine's block, slow to map
+        a1 = Segment("nvlp-a1", 4 * MiB, 62)
+        b = Segment("nvlp-b", 8 * MiB)
+        cx = Conn(d.sock, 0xD, True)
+        ca = Conn(d.sock, 0xA, True)
+        cb = Conn(d.sock, 0xB, True)
+        assert register(cx, 0x30000000, x, 0)[0] == OK
+        assert register(ca, 0x10000000, a1, 0)[0] == OK
+        assert register(cb, 0x20000000, b, 1)[0] == OK
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        res = {}
+        ents = [
+            (0xD, 0x30000000, 0, 0xB, 0x20000000, 0, MiB),  # mapped first, slowly
+            (0xA, 0x10000000, 0, 0xB, 0x20000000, 2 * MiB, MiB),
+        ]
+        th = threading.Thread(target=lambda: res.update(r=copy(d.sock, ents)))
+        th.start()
+        time.sleep(0.2)  # resolved both blocks, opening X's handle
+        check(not mapped(d, "nvlp-a1"), "A's block not mapped yet")
+        st, _, left, t = release(ca, 5000)
+        answered = time.monotonic()
+        th.join(10)
+        writes = []
+        with open(d.writes) as f:
+            for line in f:
+                us, seg, off, _ = line.split()
+                if seg.endswith("nvlp-b") and int(off) == 2 * MiB:
+                    writes.append(int(us))
+        check(
+            st == OK and left == 0 and res["r"][0] == OK,
+            f"answered OK after {t * 1000:.0f} ms, the copy finished",
+        )
+        check(
+            writes and max(writes) / 1e6 <= answered and not mapped(d, "nvlp-a1"),
+            "A's data landed before the answer, nothing of A mapped after it",
+        )
+        cx.close()
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-x")
     print("== release: over a connection opened for it")
     d = Daemon(["--no-coalesce"], {"MOCK_COPY_DELAY_MS": "20"})
     try:
@@ -1001,8 +1049,8 @@ def vmm():
         )
         s = stats(d.sock)
         check(
-            s["vmm_imports"] == "1" and mapped(d, "nvlp-v1"),
-            "mapped once (vmm_imports=1)",
+            s["vmm_imports"] == "1" and d.maps().count("nvlp-v1") == 1,
+            "mapped once (vmm_imports=1, one mapping)",
         )
         st, _ = register_fd(ca, 0x10000000, v, 0, 7)  # a reconnect re-registers
         check(

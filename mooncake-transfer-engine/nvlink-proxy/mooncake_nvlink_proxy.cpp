@@ -368,25 +368,28 @@ const VmmApi &vmmApi() {
     return api;
 }
 
-// Imported VMM allocations per client (registrations that hold one).
-std::mutex g_vmm_mu;
+// Per client: Registration objects alive (in g_regs, or still held by a
+// copy in flight that may yet map them), and imported VMM allocations not
+// released yet (held by a registration, or whose release failed).
+std::mutex g_count_mu;
+std::map<uint64_t, size_t> g_live_regs;
 std::map<uint64_t, size_t> g_vmm_imports;
 
-void noteVmmImport(uint64_t client, int delta) {
-    std::lock_guard<std::mutex> lock(g_vmm_mu);
-    size_t &n = g_vmm_imports[client];
+void noteCount(std::map<uint64_t, size_t> &counts, uint64_t client, int delta) {
+    std::lock_guard<std::mutex> lock(g_count_mu);
+    size_t &n = counts[client];
     n = delta > 0 ? n + 1 : (n ? n - 1 : 0);
-    if (n == 0) g_vmm_imports.erase(client);
+    if (n == 0) counts.erase(client);
 }
 
-size_t vmmImports(uint64_t client) {
-    std::lock_guard<std::mutex> lock(g_vmm_mu);
-    auto it = g_vmm_imports.find(client);
-    return it == g_vmm_imports.end() ? 0 : it->second;
+size_t countOf(const std::map<uint64_t, size_t> &counts, uint64_t client) {
+    std::lock_guard<std::mutex> lock(g_count_mu);
+    auto it = counts.find(client);
+    return it == counts.end() ? 0 : it->second;
 }
 
 size_t vmmImportsTotal() {
-    std::lock_guard<std::mutex> lock(g_vmm_mu);
+    std::lock_guard<std::mutex> lock(g_count_mu);
     size_t n = 0;
     for (auto &kv : g_vmm_imports) n += kv.second;
     return n;
@@ -416,9 +419,15 @@ bool vmmImport(int dev, int fd, CUmemGenericAllocationHandle *handle,
     return ok;
 }
 
-// Every IPC mapping or VMM import of |client|'s memory the daemon holds.
+// What may still give the daemon access to |client|'s memory: its
+// registrations alive -- a copy in flight resolves them before it maps them,
+// so one dropped but still held may be mapped after this count of open
+// mappings would have read 0 -- and, once none is, imports whose release
+// failed. 0: nothing of that memory is or will be mapped.
 size_t mappingsHeld(uint64_t client) {
-    return g_imports.mappingsOf(client) + vmmImports(client);
+    const size_t regs = countOf(g_live_regs, client);
+    return regs ? regs
+                : countOf(g_vmm_imports, client) + g_imports.mappingsOf(client);
 }
 
 // Clients with an open control connection (client id -> connections): a
@@ -469,32 +478,52 @@ struct Registration {
     char *vmm_ptr = nullptr;
     std::set<int> vmm_access;
 
+    // Counted in g_live_regs (from its insertion into g_regs).
+    bool counted = false;
+
     // The last reference is gone: the block was unregistered or replaced,
     // or its engine's control connection closed, and no copy in flight uses
     // it any more. Its mappings are closed now unless another registration
     // of the same engine (a re-registration) still uses them.
     ~Registration() {
         if (vmm) {
-            const VmmApi &api = vmmApi();
-            cudaSetDevice(device);
-            CUresult r = CUDA_SUCCESS;
-            if (vmm_ptr) {
-                const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(vmm_ptr);
-                r = api.unmap(va, size);
-                if (r == CUDA_SUCCESS) r = api.address_free(va, size);
-            }
-            if (r == CUDA_SUCCESS) r = api.release(vmm_handle);
-            noteVmmImport(client_id, -1);
-            if (r != CUDA_SUCCESS)
-                LOGW("releasing the imported memory of client=%016" PRIx64
-                     " base=%#" PRIx64 ": CUresult %d",
-                     client_id, base, static_cast<int>(r));
-            else
-                LOGI("closed client=%016" PRIx64 " base=%#" PRIx64
-                     " (gpu %d, imported memory)",
-                     client_id, base, device);
+            releaseVmm();
+        } else {
+            closeMappings();
+        }
+        // Last: nothing of the client's memory is mapped through it any more.
+        if (counted) noteCount(g_live_regs, client_id, -1);
+    }
+
+    // The import stays counted (g_vmm_imports) unless every step succeeded:
+    // a failed release may keep the engine's memory allocated.
+    void releaseVmm() {
+        const VmmApi &api = vmmApi();
+        cudaSetDevice(device);
+        CUresult r = CUDA_SUCCESS;
+        if (vmm_ptr) {
+            const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(vmm_ptr);
+            r = api.unmap(va, size);
+            const CUresult f = api.address_free(va, size);
+            if (r == CUDA_SUCCESS) r = f;
+        }
+        const CUresult rel = api.release(vmm_handle);
+        if (r == CUDA_SUCCESS) r = rel;
+        if (r != CUDA_SUCCESS) {
+            LOGE("releasing the imported memory of client=%016" PRIx64
+                 " base=%#" PRIx64
+                 ": CUresult %d; it stays counted (vmm_imports) and RELEASE "
+                 "is not confirmed",
+                 client_id, base, static_cast<int>(r));
             return;
         }
+        noteCount(g_vmm_imports, client_id, -1);
+        LOGI("closed client=%016" PRIx64 " base=%#" PRIx64
+             " (gpu %d, imported memory)",
+             client_id, base, device);
+    }
+
+    void closeMappings() {
         for (auto &kv : mapped) {
             int err = 0;
             const bool closed =
@@ -549,8 +578,15 @@ struct Registration {
         return cudaSuccess;
     }
 
+    // A CUresult of a mapping step as the copy reports it: the sticky
+    // errors keep their code (the daemon exits on them, as for IPC opens);
+    // any other refuses the copy.
+    static cudaError_t vmmError(CUresult r) {
+        const cudaError_t e = static_cast<cudaError_t>(r);
+        return isStickyCudaError(e) ? e : cudaErrorMapBufferObjectFailed;
+    }
+
     // Maps the imported allocation (once) and grants |dev| access to it.
-    // Failures are not sticky CUDA errors: the copy is refused.
     cudaError_t mapVmmLocked(int dev, char **out, bool *opened) {
         const VmmApi &api = vmmApi();
         if (!vmm_ptr) {
@@ -566,7 +602,7 @@ struct Registration {
                 LOGW("mapping the imported memory of client=%016" PRIx64
                      " base=%#" PRIx64 " size=%" PRIu64 ": CUresult %d",
                      client_id, base, size, static_cast<int>(r));
-                return cudaErrorMapBufferObjectFailed;
+                return vmmError(r);
             }
             vmm_ptr = reinterpret_cast<char *>(va);
             *opened = true;
@@ -586,7 +622,7 @@ struct Registration {
                     "granting gpu %d access to the imported memory of "
                     "client=%016" PRIx64 " base=%#" PRIx64 ": CUresult %d",
                     dev, client_id, base, static_cast<int>(r));
-                return cudaErrorMapBufferObjectFailed;
+                return vmmError(r);
             }
             vmm_access.insert(dev);
         }
@@ -1918,8 +1954,8 @@ size_t dropOwned(Connection &c, const char *what = "disconnected") {
          c.client_id, c.pid, c.node.c_str(), what, dropped,
          held == 0 ? "all of its IPC mappings are closed"
                    : (std::to_string(held) +
-                      " IPC mapping(s) still used by copies in flight, closed "
-                      "when they finish")
+                      " registration(s) or mapping(s) still used by copies in "
+                      "flight, closed when they finish")
                          .c_str());
     return dropped;
 }
@@ -2121,8 +2157,10 @@ void handleConnection(int fd) {
                             reg->vmm = true;
                             reg->vmm_handle = imported;
                             imported = 0;
-                            noteVmmImport(c.client_id, +1);
+                            noteCount(g_vmm_imports, c.client_id, +1);
                         }
+                        reg->counted = true;
+                        noteCount(g_live_regs, c.client_id, +1);
                         reg->owner_conn = c.conn_id;
                         g_regs[{c.client_id, req.base}] = reg;
                         c.owned[req.base] = reg;
@@ -2310,8 +2348,9 @@ void handleConnection(int fd) {
                          c.client_id, dropped, (nowUs() - t0) / 1000.0);
                 else
                     LOGW("client %016" PRIx64
-                         " releases its memory: %zu IPC mapping(s) of it "
-                         "still used by copies in flight after %u ms",
+                         " releases its memory: %zu registration(s) or "
+                         "mapping(s) of it still used by copies in flight "
+                         "after %u ms",
                          c.client_id, held, req.wait_ms);
                 ok = sendMsg(fd, type, h.seq,
                              held == 0 ? ProxyStatus::kOk

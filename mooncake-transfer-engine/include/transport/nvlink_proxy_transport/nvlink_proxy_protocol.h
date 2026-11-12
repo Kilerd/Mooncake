@@ -200,22 +200,25 @@ struct PingResp {
 };
 
 // RELEASE, on a control connection: the daemon drops every registration of
-// that connection, then answers once it holds no IPC mapping of the client's
-// memory (OK), or when |wait_ms| passed (DEADLINE_EXCEEDED: copies in flight
-// still use |mappings| of them). An engine sends it before it disconnects
-// for good (TransferEngine::shutdown), so that no other process imports the
+// that connection, then answers once none of the client's registrations is
+// alive any more -- a copy in flight that resolved one may still map it --
+// and so no mapping or import of its memory is left (OK), or when |wait_ms|
+// passed (DEADLINE_EXCEEDED). An engine sends it before it disconnects for
+// good (TransferEngine::shutdown), so that no other process imports the
 // memory it exported once shutdown returned, e.g. before it is checkpointed.
 // Any control connection of the client id may ask: one opened only for this
-// drops nothing and waits for the mappings of an earlier connection. Daemons
-// that do not know it reply BAD_REQUEST.
+// drops nothing and waits for the registrations of an earlier connection.
+// Daemons that do not know it reply BAD_REQUEST.
 struct ReleaseReq {
     uint32_t wait_ms;
     uint32_t reserved;
 };
 
 struct ReleaseResp {
-    uint64_t dropped;   // registrations dropped
-    uint64_t mappings;  // IPC mappings of the client's memory still open
+    uint64_t dropped;  // registrations dropped
+    // Still held: registrations used by copies in flight, or (none left)
+    // mappings and imports the daemon failed to release.
+    uint64_t mappings;
 };
 #pragma pack(pop)
 
