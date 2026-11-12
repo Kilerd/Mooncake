@@ -33,16 +33,23 @@ GPU mode (--gpu): needs a running mooncake_nvlink_proxy that sees the GPUs,
 MC_NVLINK_PROXY_SOCKET pointing at it and MC_NODE_ID set. Two engines of
 this process register cudaMalloc memory (on --dev0 / --dev1), write through
 the daemon and are shut down: the daemon then holds no IPC mapping of their
-memory (--stats). Two new engines in the same process do it again, through
-the daemon again. Each round checks every byte. With --vmm the memory is
-two virtual memory management pools (cuMemCreate, exportable as POSIX file
+memory (--stats), and the process no socket the engines opened (CUDA's own
+@cuda-uvmfd-... listener aside). Two new engines in the same process do it
+again, through the daemon again. Each round checks every byte. Round 1
+registers each buffer with its GPU current, as an engine process does;
+round 2 registers both with --dev0 current (the other GPU's buffer must
+still be registered with the daemon). With --vmm the memory is two virtual
+memory management pools (cuMemCreate, exportable as POSIX file
 descriptors, MC_NVLINK_PROXY_VMM=1), whose physical memory is released
 after each shutdown and created again at the same addresses -- the flow of
-an engine that releases its KV cache before a checkpoint.
+an engine that releases its KV cache before a checkpoint. --require-vmm
+(implies --vmm) sets MC_NVLINK_PROXY_REQUIRE_VMM=1 instead and checks that
+a cudaMalloc block is refused.
 
 Usage:
   PYTHONPATH=<dir of the mooncake package> transfer_engine_shutdown_test.py
-  transfer_engine_shutdown_test.py --gpu [--vmm] [--dev0 0] [--dev1 1]
+  transfer_engine_shutdown_test.py --gpu [--vmm | --require-vmm]
+                                   [--dev0 0] [--dev1 1]
 Linux only (/proc/self).
 """
 
@@ -91,6 +98,49 @@ def resources():
                 out[kind] += 1
     out["threads"] = len(os.listdir("/proc/self/task"))
     return out
+
+
+def socket_inodes():
+    """Inode -> descriptor of every socket of this process."""
+    out = {}
+    for fd in os.listdir("/proc/self/fd"):
+        try:  # the descriptor listdir itself used is closed by now
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue
+        if target.startswith("socket:["):
+            out[target[8:-1]] = fd
+    return out
+
+
+def unix_socket_paths():
+    """Inode -> path of the unix sockets (abstract ones start with @)."""
+    paths = {}
+    try:
+        with open("/proc/net/unix") as f:
+            next(f)
+            for line in f:
+                cols = line.split()
+                if len(cols) >= 8:
+                    paths[cols[6]] = cols[7]
+    except OSError:
+        pass
+    return paths
+
+
+def sockets_opened_since(before):
+    """Sockets of this process that |before| (socket_inodes()) did not
+    have, except the driver's listener @cuda-uvmfd-<ns>-<pid>@ (opened at
+    the first IPC or virtual memory management export, it lives as long as
+    the process): one line each."""
+    paths = unix_socket_paths()
+    left = []
+    for inode, fd in sorted(socket_inodes().items()):
+        path = paths.get(inode, "")
+        if inode in before or path.startswith("@cuda-uvmfd-"):
+            continue
+        left.append(f"fd {fd} inode {inode} {path or '(not a named unix socket)'}")
+    return left
 
 
 def resources_settled(want, timeout=2.0):
@@ -536,13 +586,15 @@ class VmmPool:
         self.handle = None
 
 
-def gpu_mode(dev0, dev1, vmm):
+def gpu_mode(dev0, dev1, vmm, require_vmm):
     sock = os.environ.get("MC_NVLINK_PROXY_SOCKET")
     if not sock or not os.environ.get("MC_NODE_ID"):
         print("--gpu needs MC_NVLINK_PROXY_SOCKET (a running daemon) and MC_NODE_ID")
         FAILURES.append("not configured")
         return
-    if vmm:
+    if require_vmm:
+        os.environ["MC_NVLINK_PROXY_REQUIRE_VMM"] = "1"
+    elif vmm:
         os.environ["MC_NVLINK_PROXY_VMM"] = "1"
     daemon_bin = shutil.which("mooncake_nvlink_proxy")
 
@@ -577,10 +629,21 @@ def gpu_mode(dev0, dev1, vmm):
             src_pool.create()
             dst_pool.create()
         before = daemon_stats()
+        socks_before = socket_inodes()
         target, initiator = TransferEngine(), TransferEngine()
         assert target.initialize(host, "P2PHANDSHAKE", "tcp", "") == 0
         assert initiator.initialize(host, "P2PHANDSHAKE", "tcp", "") == 0
+        if require_vmm and rnd == 1:
+            plain = cuda.malloc(dev1, MiB)
+            check(
+                target.register_memory(plain, MiB) != 0,
+                "MC_NVLINK_PROXY_REQUIRE_VMM=1 refuses a cudaMalloc block",
+            )
+        # Round 1: each buffer with its GPU current, as an engine process
+        # registers its memory; round 2: both with dev0 current.
+        cuda.device(dev1 if rnd == 1 else dev0)
         assert target.register_memory(dst, n) == 0
+        cuda.device(dev0)
         assert initiator.register_memory(src, n) == 0
         pattern = bytes((i * (rnd + 2) + 1) & 0xFF for i in range(256)) * (n // 256)
         cuda.h2d(dev0, src, pattern)
@@ -612,12 +675,12 @@ def gpu_mode(dev0, dev1, vmm):
                 f"(ipc_mappings={after.get('ipc_mappings')}, "
                 f"vmm_imports={after.get('vmm_imports')})",
             )
-        socks = [
-            fd
-            for fd in os.listdir("/proc/self/fd")
-            if os.readlink(f"/proc/self/fd/{fd}").startswith("socket:")
-        ]
-        check(not socks, f"round {rnd}: no socket left in this process ({len(socks)})")
+        left = sockets_opened_since(socks_before)
+        check(
+            not left,
+            f"round {rnd}: no socket the engines opened is left in this process"
+            + "".join("\n          " + s for s in left),
+        )
         target = initiator = None
         if vmm:  # the pools are released as before a checkpoint
             src_pool.release()
@@ -630,12 +693,13 @@ def main():
     ap.add_argument("--dev0", type=int, default=0)
     ap.add_argument("--dev1", type=int, default=0)
     ap.add_argument("--vmm", action="store_true")
+    ap.add_argument("--require-vmm", action="store_true")
     args = ap.parse_args()
     if not sys.platform.startswith("linux"):
         print("skipped: Linux only")
         return 0
     if args.gpu:
-        gpu_mode(args.dev0, args.dev1, args.vmm)
+        gpu_mode(args.dev0, args.dev1, args.vmm or args.require_vmm, args.require_vmm)
     else:
         cpu_mode()
     print(f"{len(FAILURES)} failure(s)")
