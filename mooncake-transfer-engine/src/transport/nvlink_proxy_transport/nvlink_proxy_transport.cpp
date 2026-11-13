@@ -454,20 +454,30 @@ bool NvlinkProxyTransport::vmmBlock(Block &block, bool *is_vmm,
     return true;
 }
 
+// The driver API, not cudaGetDeviceProperties: the CUDA runtime keeps device
+// properties in process memory, so a process restored from a CRIU +
+// cuda-checkpoint snapshot onto another GPU still gets the source GPU's UUID
+// (and PCI bus id) from it, and the daemon refuses that GPU as not visible.
+// cuDeviceGetUuid_v2 asks the driver, which reports the GPU the process runs
+// on after the restore. The cache lives in this transport instance; a restore
+// creates a new one.
 bool NvlinkProxyTransport::deviceUuid(int dev, uint8_t out[kUuidSize]) {
     std::lock_guard<std::mutex> lock(uuid_mu_);
     auto it = uuids_.find(dev);
     if (it == uuids_.end()) {
-        cudaDeviceProp prop;
-        cudaError_t err = cudaGetDeviceProperties(&prop, dev);
-        if (err != cudaSuccess) {
-            cudaGetLastError();
-            LOG(WARNING) << "nvlink_proxy: cudaGetDeviceProperties(" << dev
-                         << "): " << cudaGetErrorString(err);
+        CUdevice cu_dev;
+        CUuuid uuid;
+        CUresult res = cuDeviceGet(&cu_dev, dev);
+        if (res == CUDA_SUCCESS) res = cuDeviceGetUuid_v2(&uuid, cu_dev);
+        if (res != CUDA_SUCCESS) {
+            const char *name = nullptr;
+            cuGetErrorName(res, &name);
+            LOG(WARNING) << "nvlink_proxy: cannot read the UUID of GPU " << dev
+                         << ": " << (name ? name : "unknown CUresult");
             return false;
         }
         std::array<uint8_t, kUuidSize> u;
-        memcpy(u.data(), prop.uuid.bytes, kUuidSize);
+        memcpy(u.data(), uuid.bytes, kUuidSize);
         it = uuids_.emplace(dev, u).first;
     }
     memcpy(out, it->second.data(), kUuidSize);
