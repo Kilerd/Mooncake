@@ -48,6 +48,8 @@
 //   gpu k fails.
 // - MOCK_IPC_OPEN_DELAY_MS with MOCK_IPC_OPEN_DELAY_SEGMENT=/<name>: opening
 //   that segment's handle takes this long.
+// - MOCK_SELFTEST_DELAY_MS: the P2P self-test child sleeps this long before
+//   it begins.
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -90,6 +92,23 @@ int envInt(const char *n, int d) {
     return v && *v ? atoi(v) : d;
 }
 int ngpus() { return envInt("MOCK_GPUS", 8); }
+
+// MOCK_SELFTEST_DELAY_MS: the P2P self-test child (a process started with
+// --p2p-selftest-child) sleeps this long before it begins, as a slow test.
+__attribute__((constructor)) void delaySelfTestChild() {
+    const int ms = envInt("MOCK_SELFTEST_DELAY_MS", 0);
+    if (ms <= 0) return;
+    FILE *f = fopen("/proc/self/cmdline", "r");
+    if (!f) return;
+    char buf[4096];
+    const size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    // NUL-separated arguments: look for the flag as a whole argument.
+    const std::string args(buf, n);
+    if (args.find(std::string("--p2p-selftest-child") + '\0') !=
+        std::string::npos)
+        usleep(ms * 1000);
+}
 
 bool inRanges(const std::map<uintptr_t, size_t> &m, const void *p) {
     std::lock_guard<std::mutex> l(mu);

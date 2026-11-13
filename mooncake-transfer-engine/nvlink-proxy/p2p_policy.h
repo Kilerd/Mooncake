@@ -21,7 +21,9 @@
 // both GPUs of a pair before it serves copies between them (the P2P
 // self-test) and denies a pair that fails. A copy between the GPUs of a
 // denied pair is refused with kNoPeerAccess, which the engines answer by
-// moving the request to their base transport (RDMA / TCP).
+// moving the request to their base transport (RDMA / TCP); one between the
+// GPUs of a pair whose self-test is queued or running gets kPairUnderTest,
+// and the engines send it again until the test decided (refusalStatus).
 //
 // Everything in this header is host-only, without CUDA, so that it can be
 // unit-tested without GPUs.
@@ -39,6 +41,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "transport/nvlink_proxy_transport/nvlink_proxy_protocol.h"
 
 namespace mooncake {
 namespace nvlink_proxy {
@@ -166,6 +170,9 @@ class PeerPolicy {
         kStatic = 1,          // --deny-peer / --deny-pair
         kSelfTestFailed = 2,  // the self-test read back corrupt data
         kUntested = 3,        // not (yet) verified by a self-test (enforce)
+        // Not verified yet, and a self-test of the pair is queued or running
+        // (enforce): it decides the pair soon.
+        kTestPending = 4,
     };
 
     explicit PeerPolicy(int num_devices = 0) { reset(num_devices); }
@@ -253,6 +260,9 @@ class PeerPolicy {
                 return "P2P self-test failed";
             case kUntested:
                 return "not verified by the P2P self-test (yet)";
+            case kTestPending:
+                return "not verified yet, its P2P self-test is queued or "
+                       "running";
         }
         return "?";
     }
@@ -266,6 +276,17 @@ class PeerPolicy {
     int n_ = 0;
     std::unique_ptr<std::atomic<uint8_t>[]> m_;
 };
+
+// The answer to a copy between the GPUs of a pair refused for |reason| that
+// the daemon does not host-stage. Only a pair whose self-test is queued or
+// running is decided soon: its copies are worth sending again
+// (kPairUnderTest). Any other refusal stays until a later test or a daemon
+// restart, and the engine moves the copy to its base transport
+// (kNoPeerAccess).
+inline ProxyStatus refusalStatus(PeerPolicy::Reason reason) {
+    return reason == PeerPolicy::kTestPending ? ProxyStatus::kPairUnderTest
+                                              : ProxyStatus::kNoPeerAccess;
+}
 
 // --------------------------------------------------------- self-test plan
 constexpr uint64_t kSelfTestRowBytes = 2048;  // a typical KV page row

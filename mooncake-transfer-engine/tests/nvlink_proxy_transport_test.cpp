@@ -348,8 +348,10 @@ namespace {
 class ScriptedTransport : public Transport {
    public:
     bool honour_cancel = true;
-    int confirm_after_ms = 0;  // after a cancel; < 0: never
+    int confirm_after_ms = 0;         // after a cancel; < 0: never
+    bool complete_on_submit = false;  // every transfer succeeds at once
     std::atomic<int> cancels{0};
+    std::atomic<int> submitted{0};  // requests submitted
     std::vector<Slice *> slices;
     std::mutex mu;
 
@@ -361,12 +363,17 @@ class ScriptedTransport : public Transport {
         const std::vector<TransferTask *> &task_list) override {
         std::lock_guard<std::mutex> lock(mu);
         for (auto *task : task_list) {
+            ++submitted;
             Slice *slice = getSliceCache().allocate();
             slice->task = task;
             slice->length = task->request->length;
             slice->status = Slice::PENDING;
             task->slice_list.push_back(slice);
             __sync_fetch_and_add(&task->slice_count, 1);
+            if (complete_on_submit) {
+                slice->markSuccess();
+                continue;
+            }
             slices.push_back(slice);
         }
         return Status::OK();
@@ -596,8 +603,103 @@ struct NvlinkProxyTransportTestAccess {
         t.ever_registered_ = true;
         return t.releaseLocked();
     }
+
+    using CopyOutcome = NvlinkProxyTransport::CopyOutcome;
+    static CopyOutcome copyOutcome(ProxyStatus st, bool fresh) {
+        return NvlinkProxyTransport::copyOutcome(st, fresh);
+    }
+    static int64_t pairTestWaitEnd(int64_t start_ns, int64_t deadline_ns,
+                                   int wait_ms) {
+        return NvlinkProxyTransport::pairTestWaitEnd(start_ns, deadline_ns,
+                                                     wait_ms);
+    }
+
+    // As if installed on node |node| with |meta| (the targets) and
+    // connected to the daemon at |socket| (epoch 0x5eed, a while ago), with
+    // the local block [base, base + size) registered there; |fallback|
+    // takes what the daemon does not serve.
+    static void prepareCopies(NvlinkProxyTransport &t,
+                              const std::string &socket,
+                              const std::string &node,
+                              std::shared_ptr<TransferMetadata> meta,
+                              uint64_t base, uint64_t size, Transport *fallback,
+                              int pair_test_wait_ms) {
+        t.metadata_ = std::move(meta);
+        t.socket_path_ = socket;
+        t.node_id_ = node;
+        t.client_id_ = 0xA;
+        t.pair_test_wait_ms_ = pair_test_wait_ms;
+        t.stats_interval_s_ = 0;
+        {
+            std::lock_guard<std::mutex> lock(t.blocks_mu_);
+            NvlinkProxyTransport::Block &b = t.blocks_[base];
+            b.base = base;
+            b.size = size;
+            b.registered_epoch = 0x5eed;
+        }
+        t.epoch_ = 0x5eed;
+        t.epoch_since_ns_ = steadyNowNs() - 60LL * 1000 * 1000 * 1000;
+        t.healthy_ = true;
+        t.setFallbackTransport(fallback, "scripted");
+    }
+
+    struct Counts {
+        uint64_t proxied, held, retried, fallback, fallback_pair_test,
+            fallback_daemon_error, failed;
+    };
+    static Counts counts(NvlinkProxyTransport &t) {
+        const auto &c = t.counters_;
+        return {c.proxy_requests.load(),     c.held_requests.load(),
+                c.retried_requests.load(),   c.fallback_requests.load(),
+                c.fallback_pair_test.load(), c.fallback_daemon_error.load(),
+                c.failed_requests.load()};
+    }
 };
 }  // namespace mooncake
+
+// How the engine reads a COPY reply: PAIR_UNDER_TEST is sent again (while
+// the pair-test wait lasts); a status it does not know -- what an engine
+// that predates PAIR_UNDER_TEST makes of it -- uses the base transport.
+TEST(NvlinkProxyTransport, CopyOutcomeOfEachStatus) {
+    using Access = NvlinkProxyTransportTestAccess;
+    using O = Access::CopyOutcome;
+    for (bool fresh : {false, true}) {
+        EXPECT_EQ(Access::copyOutcome(ProxyStatus::kOk, fresh), O::kOk);
+        EXPECT_EQ(Access::copyOutcome(ProxyStatus::kPairUnderTest, fresh),
+                  O::kPairUnderTest);
+        EXPECT_EQ(Access::copyOutcome(ProxyStatus::kNoPeerAccess, fresh),
+                  O::kFailed);
+        EXPECT_EQ(Access::copyOutcome(ProxyStatus::kCudaError, fresh),
+                  O::kFailed);
+        EXPECT_EQ(Access::copyOutcome(ProxyStatus::kDeadlineExceeded, fresh),
+                  O::kFailed);
+        EXPECT_EQ(Access::copyOutcome(static_cast<ProxyStatus>(12), fresh),
+                  O::kFailed);
+        for (ProxyStatus st :
+             {ProxyStatus::kUnknownSource, ProxyStatus::kUnknownDestination}) {
+            EXPECT_EQ(Access::copyOutcome(st, fresh),
+                      fresh ? O::kRetryLater : O::kFailed);
+        }
+    }
+    EXPECT_STREQ(proxyStatusName(ProxyStatus::kPairUnderTest),
+                 "PAIR_UNDER_TEST");
+    EXPECT_STREQ(proxyStatusName(static_cast<ProxyStatus>(12)),
+                 "UNKNOWN_STATUS");
+}
+
+// The pair-test wait: MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS, at most half of
+// the time the request has.
+TEST(NvlinkProxyTransport, PairTestWaitEnd) {
+    using Access = NvlinkProxyTransportTestAccess;
+    const int64_t ms = 1000000;
+    const int64_t t0 = 1000 * ms;
+    EXPECT_EQ(Access::pairTestWaitEnd(t0, t0 + 30000 * ms, 3000),
+              t0 + 3000 * ms);
+    EXPECT_EQ(Access::pairTestWaitEnd(t0, t0 + 2000 * ms, 3000),
+              t0 + 1000 * ms);
+    EXPECT_EQ(Access::pairTestWaitEnd(t0, t0 + 30000 * ms, 0), t0);
+    EXPECT_LE(Access::pairTestWaitEnd(t0, t0 - 10 * ms, 3000), t0);
+}
 
 // An unanswered COPY stays unconfirmed while its connection is open, even
 // when a new daemon epoch is up (the old daemon may still be draining it);
@@ -705,9 +807,10 @@ TEST(NvlinkProxyTransport, RegisterFdPassesTheDescriptor) {
 #if defined(USE_NVLINK_PROXY) && defined(USE_TCP)
 namespace {
 
-// A stand-in for mooncake_nvlink_proxy that answers HELLO, PING, REGISTER
-// and RELEASE (with |release_status| after |release_delay_ms|) and records
-// what the engines sent.
+// A stand-in for mooncake_nvlink_proxy that answers HELLO, PING, REGISTER,
+// COPY (OK, or PAIR_UNDER_TEST while pairUnderTestFor lasts) and RELEASE
+// (with |release_status| after |release_delay_ms|) and records what the
+// engines sent.
 class FakeDaemon {
    public:
     struct Hello {
@@ -747,6 +850,17 @@ class FakeDaemon {
     }
 
     const std::string &path() const { return path_; }
+
+    // COPY is answered PAIR_UNDER_TEST for |ms| from now (< 0: for good),
+    // as while a self-test of the pair runs, then with |then| (OK: the
+    // pair passed; NO_PEER_ACCESS: it failed).
+    void pairUnderTestFor(int ms, ProxyStatus then = ProxyStatus::kOk) {
+        then_ = static_cast<uint32_t>(then);
+        under_test_until_ns_ =
+            ms < 0 ? INT64_MAX : steadyNowNs() + int64_t(ms) * 1000000;
+    }
+
+    int copies() const { return copies_.load(); }
 
     std::vector<Hello> hellos() {
         std::lock_guard<std::mutex> lock(mu_);
@@ -855,6 +969,23 @@ class FakeDaemon {
                     reply(fd, h, ProxyStatus::kOk, &resp, sizeof(resp));
                     break;
                 }
+                case MsgType::kCopy: {
+                    ++copies_;
+                    const bool wait = steadyNowNs() < under_test_until_ns_;
+                    CopyResp resp{};
+                    std::string body(reinterpret_cast<const char *>(&resp),
+                                     sizeof(resp));
+                    const auto then = static_cast<ProxyStatus>(then_.load());
+                    if (wait)
+                        body +=
+                            "P2P from gpu 0 to gpu 1 waits for the P2P "
+                            "self-test of the pair (queued or running)";
+                    else if (then != ProxyStatus::kOk)
+                        body += "P2P from gpu 0 to gpu 1 is denied";
+                    reply(fd, h, wait ? ProxyStatus::kPairUnderTest : then,
+                          body.data(), body.size());
+                    break;
+                }
                 case MsgType::kRelease: {
                     {
                         std::lock_guard<std::mutex> lock(mu_);
@@ -887,6 +1018,9 @@ class FakeDaemon {
     static std::atomic<int> next_id_;
     const ProxyStatus release_status_;
     const int release_delay_ms_;
+    std::atomic<int64_t> under_test_until_ns_{0};
+    std::atomic<uint32_t> then_{0};
+    std::atomic<int> copies_{0};
     std::string path_;
     int listen_fd_ = -1;
     std::atomic<bool> stopping_{false};
@@ -1192,5 +1326,192 @@ TEST(NvlinkProxyShutdown, ReleaseAfterLosingADaemon) {
                   c.confirmed)
             << "lost epoch " << c.lost_epoch << ", listening " << c.listening;
     }
+}
+
+namespace {
+
+// |n| same-node writes of one batch through a transport connected to
+// |daemon| (prepareCopies): from the local block at kLocal to a buffer of
+// the target published under nvlink_proxy on the same node. The base
+// transport completes whatever it gets at once.
+struct ProxyCopies {
+    static constexpr uint64_t kLocal = 0x10000000, kRemote = 0x20000000,
+                              kSize = 1 << 20;
+    ScriptedTransport base;
+    NvlinkProxyTransport proxy;
+    std::vector<Transport::TransferRequest> requests;
+    std::unique_ptr<Transport::BatchDesc> batch;
+    std::vector<Transport::TransferTask *> tasks;
+
+    ProxyCopies(FakeDaemon &daemon, int pair_test_wait_ms, size_t n) {
+        base.complete_on_submit = true;
+        auto meta = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+        auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+        desc->name = "peer";
+        desc->protocol = "tcp,nvlink_proxy";
+        TransferMetadata::BufferDesc buf{};
+        buf.name = "cuda:1";
+        buf.addr = kRemote;
+        buf.length = kSize;
+        buf.protocol = "nvlink_proxy";
+        BufferRef ref;
+        ref.node_id = "node-t";
+        ref.client_id = 0xB;
+        ref.base = kRemote;
+        ref.size = kSize;
+        buf.shm_name = encodeBufferRef(ref);
+        desc->buffers.push_back(buf);
+        meta->addLocalSegment(LOCAL_SEGMENT_ID, "peer", std::move(desc));
+        NvlinkProxyTransportTestAccess::prepareCopies(
+            proxy, daemon.path(), "node-t", meta, kLocal, kSize, &base,
+            pair_test_wait_ms);
+        batch = std::make_unique<Transport::BatchDesc>();
+        batch->id = reinterpret_cast<Transport::BatchID>(batch.get());
+        batch->batch_size = n;
+        batch->task_list.resize(n);
+        requests.resize(n);
+        for (size_t k = 0; k < n; ++k) {
+            auto &r = requests[k];
+            r.opcode = Transport::TransferRequest::WRITE;
+            r.source = reinterpret_cast<void *>(kLocal + k * 4096);
+            r.target_id = LOCAL_SEGMENT_ID;
+            r.target_offset = kRemote + k * 4096;
+            r.length = 4096;
+            auto &task = batch->task_list[k];
+            task.batch_id = batch->id;
+            task.request = &r;
+            tasks.push_back(&task);
+        }
+    }
+
+    // Submits every request; how long that took (ms).
+    int64_t submit() {
+        const int64_t t0 = steadyNowNs();
+        EXPECT_TRUE(proxy.submitTransferTask(tasks).ok());
+        return (steadyNowNs() - t0) / 1000000;
+    }
+
+    size_t count(bool ok) const {
+        size_t n = 0;
+        for (auto *t : tasks)
+            n +=
+                ok ? (t->success_slice_count == 1 && t->failed_slice_count == 0)
+                   : (t->failed_slice_count > 0);
+        return n;
+    }
+};
+
+}  // namespace
+
+// A copy whose GPU pair is under the daemon's self-test (PAIR_UNDER_TEST)
+// is sent again until the test passed, then served by the daemon: nothing
+// goes to the base transport.
+TEST(NvlinkProxyPairTest, SentAgainUntilTheSelfTestPassed) {
+    using Access = NvlinkProxyTransportTestAccess;
+    FakeDaemon daemon;
+    const int64_t t0 = steadyNowNs();
+    daemon.pairUnderTestFor(300);
+    ProxyCopies c(daemon, 3000, 3);
+    c.submit();
+    const int64_t took_ms = (steadyNowNs() - t0) / 1000000;
+    EXPECT_GE(took_ms, 300);
+    EXPECT_LT(took_ms, 1500);
+    EXPECT_EQ(c.count(true), 3u);
+    EXPECT_EQ(c.base.submitted.load(), 0);
+    EXPECT_GT(daemon.copies(), 2);
+    const auto n = Access::counts(c.proxy);
+    EXPECT_EQ(n.proxied, 3u);
+    EXPECT_EQ(n.held, 3u);
+    EXPECT_GE(n.retried, 3u);
+    EXPECT_EQ(n.fallback, 0u);
+    EXPECT_EQ(n.failed, 0u);
+}
+
+// The test failed (NO_PEER_ACCESS): the base transport at once, counted as
+// a daemon error, not as a pair-test fallback.
+TEST(NvlinkProxyPairTest, BaseTransportOnceTheSelfTestFailed) {
+    using Access = NvlinkProxyTransportTestAccess;
+    FakeDaemon daemon;
+    const int64_t t0 = steadyNowNs();
+    daemon.pairUnderTestFor(200, ProxyStatus::kNoPeerAccess);
+    ProxyCopies c(daemon, 3000, 2);
+    c.submit();
+    const int64_t took_ms = (steadyNowNs() - t0) / 1000000;
+    EXPECT_GE(took_ms, 200);
+    EXPECT_LT(took_ms, 1500);
+    EXPECT_EQ(c.count(true), 2u);
+    EXPECT_EQ(c.base.submitted.load(), 2);
+    const auto n = Access::counts(c.proxy);
+    EXPECT_EQ(n.proxied, 0u);
+    EXPECT_EQ(n.fallback, 2u);
+    EXPECT_EQ(n.fallback_daemon_error, 2u);
+    EXPECT_EQ(n.fallback_pair_test, 0u);
+}
+
+// A test that takes longer than MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS: the base
+// transport after the wait (pair_test); with a wait of 0 at once, as an
+// engine that predates PAIR_UNDER_TEST does.
+TEST(NvlinkProxyPairTest, BaseTransportAfterThePairTestWait) {
+    using Access = NvlinkProxyTransportTestAccess;
+    for (int wait_ms : {0, 200}) {
+        SCOPED_TRACE(wait_ms);
+        FakeDaemon daemon;
+        daemon.pairUnderTestFor(-1);
+        ProxyCopies c(daemon, wait_ms, 2);
+        const int64_t took_ms = c.submit();
+        EXPECT_GE(took_ms, wait_ms);
+        EXPECT_LT(took_ms, wait_ms + 1500);
+        EXPECT_EQ(c.count(true), 2u);
+        EXPECT_EQ(c.base.submitted.load(), 2);
+        const auto n = Access::counts(c.proxy);
+        EXPECT_EQ(n.proxied, 0u);
+        EXPECT_EQ(n.fallback, 2u);
+        EXPECT_EQ(n.fallback_pair_test, 2u);
+        EXPECT_EQ(n.fallback_daemon_error, 0u);
+        if (wait_ms == 0) {
+            EXPECT_EQ(daemon.copies(), 1);
+            EXPECT_EQ(n.held, 0u);
+        } else {
+            EXPECT_EQ(n.held, 2u);
+        }
+    }
+}
+
+// The wait never takes more than half of the time a request has: with the
+// batch deadline 400 ms away the requests use the base transport after
+// about 200 ms, before that deadline.
+TEST(NvlinkProxyPairTest, WaitsAtMostHalfTheBatchTime) {
+    using Access = NvlinkProxyTransportTestAccess;
+    FakeDaemon daemon;
+    daemon.pairUnderTestFor(-1);
+    ProxyCopies c(daemon, 3000, 2);
+    c.batch->control.setDeadlineNs(steadyNowNs() + 400LL * 1000000);
+    const int64_t took_ms = c.submit();
+    EXPECT_GE(took_ms, 150);
+    EXPECT_LT(took_ms, 400);
+    EXPECT_EQ(c.count(true), 2u);
+    EXPECT_EQ(Access::counts(c.proxy).fallback_pair_test, 2u);
+}
+
+// A batch canceled while its requests wait for the pair's self-test: they
+// fail at once, and nothing of them is sent anywhere any more.
+TEST(NvlinkProxyPairTest, CanceledWhileWaiting) {
+    using Access = NvlinkProxyTransportTestAccess;
+    FakeDaemon daemon;
+    daemon.pairUnderTestFor(-1);
+    ProxyCopies c(daemon, 3000, 2);
+    std::thread cancel([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        c.batch->control.cancel();
+    });
+    const int64_t took_ms = c.submit();
+    cancel.join();
+    EXPECT_GE(took_ms, 150);
+    EXPECT_LT(took_ms, 1000);
+    EXPECT_EQ(c.count(false), 2u);
+    EXPECT_EQ(c.base.submitted.load(), 0);
+    const auto n = Access::counts(c.proxy);
+    EXPECT_EQ(n.fallback, 0u);
+    EXPECT_EQ(n.failed, 2u);
 }
 #endif

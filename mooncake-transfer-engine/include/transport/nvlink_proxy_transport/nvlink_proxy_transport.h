@@ -120,15 +120,34 @@ class NvlinkProxyTransport : public Transport {
         uint64_t epoch = 0;
     };
 
-    enum class FallbackReason { kUnhealthy, kDaemonError, kUntranslatable };
+    enum class FallbackReason {
+        kUnhealthy,
+        kDaemonError,
+        kUntranslatable,
+        kPairTest,  // the GPU pair's self-test did not decide in time
+    };
 
     // Outcome of one COPY round trip.
     enum class CopyOutcome {
         kOk,
         kNoDaemon,    // connection lost / daemon gone: wait and retry
         kRetryLater,  // a block is not registered yet under a new daemon
-        kFailed,      // anything else: use the base transport
+        // PAIR_UNDER_TEST: the daemon is self-testing the GPU pair; retry
+        // while the pair-test wait lasts (pairTestWaitEnd).
+        kPairUnderTest,
+        kFailed,  // anything else: use the base transport
     };
+    // What a COPY answered with |status| means for its requests; |fresh|:
+    // this engine connected to the daemon within the reconnect window.
+    static CopyOutcome copyOutcome(nvlink_proxy::ProxyStatus status,
+                                   bool fresh);
+    // Until when a request submitted at |start_ns| that may take until
+    // |deadline_ns| (its request budget, or its batch deadline when that is
+    // earlier) is sent again while its GPU pair is under the daemon's
+    // self-test: MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS, and at most half of the
+    // time it has, so that the other half remains for the base transport.
+    static int64_t pairTestWaitEnd(int64_t start_ns, int64_t deadline_ns,
+                                   int pair_test_wait_ms);
 
     // Daemon I/O.
     int connectSocket(int timeout_ms);
@@ -259,6 +278,10 @@ class NvlinkProxyTransport : public Transport {
     // How long same-node requests wait for the daemon to come back before
     // they use the base transport (MC_NVLINK_PROXY_RECONNECT_WAIT_MS).
     int reconnect_wait_ms_ = 15000;
+    // How long a request is sent again while its GPU pair is under the
+    // daemon's P2P self-test (PAIR_UNDER_TEST) before it uses the base
+    // transport (MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS; pairTestWaitEnd).
+    int pair_test_wait_ms_ = 3000;
     int stats_interval_s_ = 60;
     Transport *fallback_ = nullptr;
     std::unique_ptr<BoundedSubmitter> fallback_submitter_;
@@ -323,9 +346,12 @@ class NvlinkProxyTransport : public Transport {
         std::atomic<uint64_t> fallback_unhealthy{0};
         std::atomic<uint64_t> fallback_daemon_error{0};
         std::atomic<uint64_t> fallback_untranslatable{0};
+        std::atomic<uint64_t> fallback_pair_test{0};
         std::atomic<uint64_t> remote_node_requests{0};
         std::atomic<uint64_t> reconnects{0};
-        std::atomic<uint64_t> held_requests{0};  // waited for the daemon
+        // Waited for the daemon: to come back, or to decide their GPU pair
+        // with its self-test.
+        std::atomic<uint64_t> held_requests{0};
         std::atomic<uint64_t> held_us_max{0};
         std::atomic<uint64_t> retried_requests{0};  // re-sent to the daemon
         std::atomic<uint64_t> fallback_retries{0};  // re-sent to the base

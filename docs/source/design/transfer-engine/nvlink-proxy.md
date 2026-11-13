@@ -80,6 +80,7 @@ the wheel with the console entry point `mooncake_nvlink_proxy`. The workflow
    | `MC_NODE_ID` | Locality key, published in the segment metadata. Default: `NODE_NAME`, else the hostname. In Kubernetes set `NODE_NAME` from `spec.nodeName`; pod hostnames differ, so without it the proxy is never used. |
    | `MC_NVLINK_PROXY_TIMEOUT_MS` | Request budget (default 30000): upper bound for one daemon round trip and for completing a request on the base transport after a fallback. The daemon refuses to start a copy after half of it. |
    | `MC_NVLINK_PROXY_RECONNECT_WAIT_MS` | How long same-node requests wait for an unavailable daemon before they use the base transport (default: half of the request budget). |
+   | `MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS` | How long a request is sent again while the daemon's P2P self-test of its GPU pair is queued or running (`PAIR_UNDER_TEST`) before it uses the base transport (default 3000; never more than half of the time the request has, see [Routing and fallback](#routing-and-fallback); 0: at once, as before). |
    | `MC_NVLINK_PROXY_FALLBACK_INFLIGHT` | Maximum requests the proxy has in flight on the base transport at a time, across all threads (default 512; with TCP at most half of `MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER`). |
    | `MC_NVLINK_PROXY_STATS_INTERVAL` | Seconds between counter log lines (default 60, 0 = off). |
    | `MC_NVLINK_PROXY_RELEASE_WAIT_MS` | How long `shutdown()` waits for the daemon to close its mappings of the engine's memory (default 10000). |
@@ -141,6 +142,21 @@ together with the exact address range in which that set is unchanged.
 - Right after a daemon (re)start the peer may not have re-registered yet: a
   COPY that names a block unknown to a daemon this engine connected to within
   the reconnect window is retried with backoff instead of falling back.
+- A COPY between two GPUs whose P2P self-test is queued or running (enforce
+  mode; typically the first second after both engines registered, e.g. a
+  unit restored from a snapshot) is answered `PAIR_UNDER_TEST` before
+  anything of it is issued. The engine sends it again every 10-50 ms until
+  the test decided -- then it is served, or refused with `NO_PEER_ACCESS`
+  and moved to the base transport -- for at most
+  `MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS` (default 3 s) and at most half of the
+  time the request has (its budget, or its batch deadline when that is
+  earlier), so the other half remains for the base transport if the test
+  takes longer. Such requests count as held and retried; those that still
+  use the base transport count under `fallback_requests` / `pair_test`. A
+  request waits only while its submitting thread does (`submitTransfer`
+  returns after it). Engines that predate `PAIR_UNDER_TEST` take it as a
+  failed copy and use the base transport at once; older daemons never send
+  it.
 - Requests that still need the base transport (daemon away for longer than the
   window, or a non-retryable error such as a CUDA error) are moved there with
   backpressure: at most `MC_NVLINK_PROXY_FALLBACK_INFLIGHT` requests in flight,
@@ -254,7 +270,11 @@ pair before it serves copies between them.
   are never touched -- recommended in production.
 - `--p2p-selftest=enforce` (default): a pair is refused from the moment it is
   requested until its test passes, for good if it failed; while it is
-  untested it stays refused. `warn` only logs; `off` skips the test.
+  untested it stays refused. While its test is queued or running its copies
+  are answered `PAIR_UNDER_TEST` (engines send them again, see
+  [Routing and fallback](#routing-and-fallback)); after a test that could
+  not run, until the next one starts, `NO_PEER_ACCESS`. `warn` only logs;
+  `off` skips the test.
 - `--deny-peer <bus id>` (repeatable) denies every pair with that GPU and
   `--deny-pair <bus id>,<bus id>` one pair, without testing. Bus ids not
   present on the node are ignored with a warning.
@@ -270,7 +290,9 @@ command line) or of a pair without peer access -- depends on
 - `tcp`, or a pair not (yet) verified for host staging: the copy is refused
   with `kNoPeerAccess` while its entries are resolved, before anything is
   merged or mapped, and the engine moves the request to its base transport
-  (counted under `fallback_requests` / `daemon_error`).
+  (counted under `fallback_requests` / `daemon_error`) -- or, while the
+  pair's self-test is queued or running, with `kPairUnderTest`, and the
+  engine sends it again.
 
 A copy within one GPU is never refused. With `--p2p-selftest=off` nothing is
 verified, so refused pairs and pairs without peer access use TCP.
@@ -486,18 +508,21 @@ seconds when they changed (and at shutdown):
 ```
 nvlink_proxy stats: healthy=1 proxied_requests=... proxied_bytes=... proxied_batches=...
   avg_batch_us=... max_batch_us=... held_requests=... max_hold_ms=... retried_requests=...
-  fallback_requests=... (daemon_unavailable=... daemon_error=... not_servable=...)
+  fallback_requests=... (daemon_unavailable=... daemon_error=... not_servable=... pair_test=...)
   fallback_retries=... failed_requests=... remote_node_requests=...
   registered_blocks=N/M register_refusals=... (not_visible=...) connects=...
 ```
 
 - `proxied_*`: requests, bytes and daemon round trips served by the proxy;
   `avg/max_batch_us` is the round-trip latency of one batch.
-- `held_requests` / `max_hold_ms`: requests that waited for the daemon and the
+- `held_requests` / `max_hold_ms`: requests that waited for the daemon (to
+  come back, or to decide their GPU pair with its self-test) and the
   longest wait of a batch; `retried_requests`: requests re-sent to the daemon
-  (after a restart or while a peer re-registered).
+  (after a restart, while a peer re-registered, or while their GPU pair was
+  under self-test; counted per re-send).
 - `fallback_requests`: same-node GPU requests that used the base transport
-  instead, split by reason; `fallback_retries`: base-transport attempts that
+  instead, split by reason (`pair_test`: the self-test of their GPU pair did
+  not decide within the pair-test wait); `fallback_retries`: base-transport attempts that
   were retried (e.g. full TCP queue); `failed_requests`: requests that failed
   within the request budget.
 - `remote_node_requests`: requests to buffers on another node (normal base
@@ -515,7 +540,9 @@ copy latency split into `avg_plan_us` (validation, merging, mapping) and
 `denied_pairs` (the number of denied ordered `src>dst` directions -- a denied
 GPU pair counts twice -- followed by their bus ids) and
 `denied_copy_requests` (copies refused because their pair is denied; not
-counted as failures), `untested_pairs` / `untested_host_paths` /
+counted as failures), `pair_test_waits` (copies answered `PAIR_UNDER_TEST`
+because their pair's self-test was queued or running; neither failures nor
+denials), `untested_pairs` / `untested_host_paths` /
 `untested_staged_pairs` (GPU pairs, per-GPU host paths and pairs' host-staged
 copies whose last test could not run, waiting for a retry; worth an alert
 when they stay above 0),
@@ -555,15 +582,20 @@ against a stand-in daemon: no socket, epoll / eventfd descriptor, pipe or
 thread of the engine left, `RELEASE` waited for (and reported unconfirmed
 by an older or slow daemon, and while a daemon lost a moment ago may
 still drain), new client id and process token for the next engine, and a
-`REGISTER_FD` that carries its descriptor.
+`REGISTER_FD` that carries its descriptor; and the answers to
+`PAIR_UNDER_TEST`: requests sent again until the test passed, the base
+transport once it failed or after the pair-test wait (at once with a wait of
+0), at most half of a batch's time spent waiting, a canceled batch failed
+without sending anything.
 `transfer_engine_shutdown_test.py` checks the same through the
 Python API (calls after `shutdown()` raise, a batch left unfreed, a thread
 still transferring, refused while `get_engine()`'s engine is referenced); with `--gpu` it writes through a running daemon,
 shuts down, finds no mapping left in the daemon, and does it again with new
 engines in the same process (`--gpu --vmm`: with virtual memory management
 pools whose physical memory is released and created again in between);
-`nvlink_proxy_policy_test` the self-test plans, the verifier, bus id parsing
-and the deny matrix; `nvlink_proxy_daemon_test` the paced issue against the
+`nvlink_proxy_policy_test` the self-test plans, the verifier, bus id parsing,
+the deny matrix and which refusals are `PAIR_UNDER_TEST`;
+`nvlink_proxy_daemon_test` the paced issue against the
 deadline, the IPC mapping table, the socket and the start-up checks.
 `nvlink_proxy_cpu_test.py` runs the daemon itself without GPUs, linked
 against a CPU stand-in for the CUDA runtime
@@ -580,5 +612,7 @@ opened for it), `REGISTER_FD` (imported once, copied from
 and to, released by `RELEASE` and by a disconnect, a GPU that cannot be
 granted access refusing the copy; the stand-in also implements the driver's
 virtual memory management calls),
-`--min-visible-gpus` (CMake target `mooncake_nvlink_proxy_cpu`, CTest
+`--min-visible-gpus`, `PAIR_UNDER_TEST` while a pair's self-test runs (nothing
+written) and the answers once it passed, failed or could not run, and for a
+pair denied on the command line (CMake target `mooncake_nvlink_proxy_cpu`, CTest
 `nvlink_proxy_cpu_test`).

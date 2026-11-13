@@ -45,6 +45,11 @@ are worker threads) and plays engines over its socket:
                      that cannot be granted access refuses the copy
   gpus               --min-visible-gpus, REGISTER of a GPU the daemon cannot
                      see, a client pid equal to the daemon's
+  pair_test          a copy while its pair's self-test runs is answered
+                     PAIR_UNDER_TEST (nothing written), then served once the
+                     test passed or refused (NO_PEER_ACCESS) once it failed;
+                     a pair whose test could not run, or that is denied on
+                     the command line, gets NO_PEER_ACCESS
 
 Usage: nvlink_proxy_cpu_test.py <daemon binary> [scenario ...]
 Linux only (POSIX shared memory, /proc/<pid>/maps).
@@ -66,7 +71,7 @@ HELLO, REGISTER, UNREGISTER, COPY, PING, STATS, RELEASE = 1, 2, 3, 4, 5, 6, 7
 REGISTER_FD = 8
 OK, BAD_REQUEST, UNKNOWN_DEVICE, UNKNOWN_SOURCE = 0, 1, 3, 4
 NO_PEER_ACCESS, CUDA_ERROR, DEADLINE_EXCEEDED = 7, 8, 9
-NOT_CONTROL_CONNECTION = 10
+NOT_CONTROL_CONNECTION, PAIR_UNDER_TEST = 10, 11
 MiB = 1 << 20
 
 DAEMON = None
@@ -1141,6 +1146,112 @@ def gpus():
         unlink_segments("nvlp-x")
 
 
+def pair_test():
+    print("== pair_test: a copy while the pair's self-test runs, then after it")
+    d = Daemon([], {"MOCK_SELFTEST_DELAY_MS": "1500"})
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 21)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca, cb = pair(d, src, dst)
+        st, msg, _, t = copy(d.sock, runs(2, MiB))
+        check(
+            st == PAIR_UNDER_TEST
+            and "self-test" in msg
+            and dst.m[: 2 * MiB] == bytes(2 * MiB),
+            f"while the test runs: PAIR_UNDER_TEST at once ({t * 1000:.0f} ms),"
+            f" nothing written ({msg[:90]})",
+        )
+        s = stats(d.sock)
+        check(
+            s["pair_test_waits"] == "1"
+            and s["denied_copy_requests"] == "0"
+            and s["copy_failures"] == "0",
+            "counted in pair_test_waits only",
+        )
+        check(
+            d.wait_log("held back 1 copy request(s)", 2),
+            "logged: held back, waiting for the self-test",
+        )
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        st, _, _, _ = copy(d.sock, runs(2, MiB))
+        check(
+            st == OK and dst.m[: 2 * MiB] == src.m[: 2 * MiB],
+            "after it passed: OK, byte-exact",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+    print("== pair_test: the self-test fails (--p2p-fallback tcp)")
+    d = Daemon(
+        ["--p2p-fallback", "tcp"],
+        {"MOCK_SELFTEST_DELAY_MS": "1000", "MOCK_P2P": "corrupt"},
+    )
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 22)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca, cb = pair(d, src, dst)
+        st, _, _, _ = copy(d.sock, runs(1, MiB))
+        check(st == PAIR_UNDER_TEST, "while the test runs: PAIR_UNDER_TEST")
+        check(d.wait_log("FAILED"), "P2P self-test failed")
+        st, msg, _, _ = copy(d.sock, runs(1, MiB))
+        check(
+            st == NO_PEER_ACCESS and "self-test failed" in msg,
+            f"after it failed: NO_PEER_ACCESS ({msg[:90]})",
+        )
+        s = stats(d.sock)
+        check(
+            s["pair_test_waits"] == "1" and s["denied_copy_requests"] == "1",
+            "pair_test_waits=1 denied_copy_requests=1",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+    print("== pair_test: the self-test cannot run (no GPU memory for it)")
+    d = Daemon(["--p2p-fallback", "tcp"], {"MOCK_OOM_GPU": "1"})
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 23)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca, cb = pair(d, src, dst)
+        check(d.wait_log("tested again in"), "pair untested, retried later")
+        st, msg, _, _ = copy(d.sock, runs(1, MiB))
+        check(
+            st == NO_PEER_ACCESS and "not verified" in msg,
+            f"no test coming: NO_PEER_ACCESS ({msg[:90]})",
+        )
+        check(stats(d.sock)["pair_test_waits"] == "0", "pair_test_waits=0")
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+    print("== pair_test: a pair denied on the command line")
+    d = Daemon(
+        ["--p2p-fallback", "tcp", "--deny-pair", "10:00,20:00"],
+        {"MOCK_SELFTEST_DELAY_MS": "1500"},
+    )
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 24)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca, cb = pair(d, src, dst)
+        st, msg, _, _ = copy(d.sock, runs(1, MiB))
+        check(
+            st == NO_PEER_ACCESS and "command line" in msg,
+            f"NO_PEER_ACCESS at once ({msg[:90]})",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+
 SCENARIOS = {
     "p2p_deadline": p2p_deadline,
     "slow_link": slow_link,
@@ -1153,6 +1264,7 @@ SCENARIOS = {
     "release": release_memory,
     "vmm": vmm,
     "gpus": gpus,
+    "pair_test": pair_test,
 }
 
 

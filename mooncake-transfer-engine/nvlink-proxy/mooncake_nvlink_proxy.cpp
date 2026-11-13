@@ -27,7 +27,9 @@
 // some platforms report working peer access yet drop or corrupt the data. A
 // pair that fails is denied, as are pairs named with --deny-peer /
 // --deny-pair; copies between the GPUs of a denied pair are refused with
-// kNoPeerAccess and the engines move them to their base transport (see
+// kNoPeerAccess and the engines move them to their base transport. Copies
+// between the GPUs of a pair whose test is queued or running get
+// kPairUnderTest, and the engines send them again until it decided (see
 // p2p_policy.h).
 
 #include <cuda.h>
@@ -660,6 +662,8 @@ struct Stats {
     std::atomic<uint64_t> plan_us_total{0};
     std::atomic<uint64_t> exec_us_total{0};
     std::atomic<uint64_t> denied_copies{0};  // refused by the P2P policy
+    // Answered PAIR_UNDER_TEST: their pair's self-test was queued or running.
+    std::atomic<uint64_t> pair_test_waits{0};
     std::atomic<uint64_t> staged_copies{0};  // served through host memory
     std::atomic<uint64_t> staged_bytes{0};
     std::atomic<uint64_t> staged_failures{0};  // then refused (base transport)
@@ -715,6 +719,7 @@ std::string statsText() {
     if (!denied.empty()) out += "(" + denied + ")";
     out +=
         " denied_copy_requests=" + std::to_string(g_stats.denied_copies.load());
+    out += " pair_test_waits=" + std::to_string(g_stats.pair_test_waits.load());
     out +=
         " untested_pairs=" + std::to_string(g_untested_pairs.load()) +
         " untested_host_paths=" + std::to_string(g_untested_host_paths.load()) +
@@ -1354,6 +1359,8 @@ struct CopyResult {
     uint64_t bytes = 0;
     std::string message;
     bool denied = false;  // refused by the P2P policy, not a failure
+    // PAIR_UNDER_TEST: the pair's self-test decides it soon, not a failure.
+    bool pair_test_wait = false;
 };
 
 std::shared_ptr<Registration> lookupReg(uint64_t client, uint64_t base) {
@@ -1520,19 +1527,33 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
                      e.dst_client, e.dst_base);
             return fail(ProxyStatus::kUnknownDestination, i, m);
         }
-        const bool refused = src->device != dst->device &&
-                             g_policy.denied(src->device, dst->device);
+        // Read once: the self-test may decide the pair meanwhile.
+        const PeerPolicy::Reason why =
+            g_policy.reason(src->device, dst->device);
+        const bool refused = why != PeerPolicy::kAllowed;
         if (refused && !hostStageable(src->device, dst->device)) {
-            // Before any merging or mapping: the engine moves the request
-            // to its base transport.
+            // Before any merging or mapping, so nothing of the copy is
+            // issued: the engine sends it again while the pair's self-test
+            // is queued or running, else moves it to its base transport.
             const int sd = src->device, dd = dst->device;
+            const ProxyStatus st = refusalStatus(why);
             char m[192];
-            snprintf(m, sizeof(m),
-                     "P2P from gpu %d (%s) to gpu %d (%s) is denied: %s", sd,
-                     g_devices[sd].pci.c_str(), dd, g_devices[dd].pci.c_str(),
-                     PeerPolicy::reasonName(g_policy.reason(sd, dd)));
-            r.denied = true;
-            return fail(ProxyStatus::kNoPeerAccess, i, m);
+            if (st == ProxyStatus::kPairUnderTest) {
+                snprintf(m, sizeof(m),
+                         "P2P from gpu %d (%s) to gpu %d (%s) waits for the "
+                         "P2P self-test of the pair (queued or running)",
+                         sd, g_devices[sd].pci.c_str(), dd,
+                         g_devices[dd].pci.c_str());
+                r.pair_test_wait = true;
+            } else {
+                snprintf(m, sizeof(m),
+                         "P2P from gpu %d (%s) to gpu %d (%s) is denied: %s",
+                         sd, g_devices[sd].pci.c_str(), dd,
+                         g_devices[dd].pci.c_str(),
+                         PeerPolicy::reasonName(why));
+                r.denied = true;
+            }
+            return fail(st, i, m);
         }
         if (e.src_offset > src->size || e.length > src->size - e.src_offset ||
             e.dst_offset > dst->size || e.length > dst->size - e.dst_offset) {
@@ -2244,6 +2265,29 @@ void handleConnection(int fd) {
                 std::string out(reinterpret_cast<char *>(&resp), sizeof(resp));
                 if (res.status == ProxyStatus::kOk) {
                     g_stats.copy_bytes += res.bytes;
+                } else if (res.pair_test_wait) {
+                    // Expected for the copies between the GPUs of a pair
+                    // until its self-test decided (about a second): counted
+                    // apart from failures and denials, logged rarely.
+                    g_stats.pair_test_waits++;
+                    out += res.message;
+                    static std::atomic<uint64_t> last_wait_log_us{0};
+                    static std::atomic<uint64_t> waits_since_log{0};
+                    const uint64_t now_us = nowUs();
+                    uint64_t last = last_wait_log_us.load();
+                    waits_since_log++;
+                    if ((last == 0 || now_us - last >= 5000000) &&
+                        last_wait_log_us.compare_exchange_strong(last,
+                                                                 now_us)) {
+                        LOGI("held back %" PRIu64
+                             " copy request(s) from client %016" PRIx64
+                             " and others since the last report: %s; the "
+                             "engines send them again until the self-test "
+                             "decided (engines that predate PAIR_UNDER_TEST "
+                             "use their base transport)",
+                             waits_since_log.exchange(0), c.client_id,
+                             res.message.c_str());
+                    }
                 } else if (res.denied) {
                     // Expected for every copy between the GPUs of a denied
                     // pair: counted apart from failures, logged rarely.
@@ -3173,8 +3217,10 @@ bool ensureDevice(int dev) {
 // no progress for --p2p-selftest-timeout seconds. An item the child was
 // testing when it died (an unrecoverable CUDA error, a crash) or hung is
 // failed. In enforce mode a pair is refused for P2P from the moment it is
-// requested until a test passes; a test that could not run is repeated with
-// a backoff and at the next registration on either GPU.
+// requested until a test passes: kTestPending while its test is queued or
+// running (copies get PAIR_UNDER_TEST and are sent again), kUntested after a
+// test that could not run. Such a test is repeated with a backoff and at the
+// next registration on either GPU.
 //
 // Tester items: (a, a) the host path of GPU a; (a, b) with a < b the pair's
 // P2P paths (and, with --p2p-fallback=host, its host-staged copies); (b, a)
@@ -3366,6 +3412,8 @@ class SelfTester {
     void start() {
         try {
             std::thread(&SelfTester::loop, this).detach();
+            std::lock_guard<std::mutex> lock(mu_);
+            running_ = true;
         } catch (const std::system_error &e) {
             LOGE(
                 "cannot start the P2P self-test thread (%s): pairs stay "
@@ -3384,10 +3432,11 @@ class SelfTester {
         std::lock_guard<std::mutex> lock(mu_);
         bool added = false;
         auto queue = [&](std::pair<int, int> item) {
-            if (pending_.count(item)) return;
+            if (pending_.count(item)) return false;
             queue_.push_back(item);
             pending_.insert(item);
             added = true;
+            return true;
         };
         for (const auto &p : asked) {
             const int a = std::min(p.first, p.second),
@@ -3401,9 +3450,10 @@ class SelfTester {
                               g_policy.reason(b, a) == PeerPolicy::kStatic;
             if (!stat && g_test_state[a][b] == kNotTested) {
                 if (pending_.count({b, a})) continue;  // stage test queued
-                if (g_selftest == SelfTestMode::kEnforce)
-                    g_policy.setPair(a, b, PeerPolicy::kUntested);
-                queue({a, b});
+                // Only when queued now: a pair already queued or running
+                // keeps its state (kTestPending, or the verdict that its
+                // test has just recorded).
+                if (queue({a, b})) markTestPending(a, b);
             } else if (g_fallback_host && g_stage_state[a][b] == kNotTested &&
                        !pending_.count({a, b})) {
                 queue({b, a});
@@ -3436,6 +3486,16 @@ class SelfTester {
                : attempts == 2 ? 30
                : attempts == 3 ? 60
                                : 300;
+    }
+
+    // Under mu_: the P2P test of pair (a, b) was queued. In enforce mode the
+    // pair is refused until a test passes; while this one is queued or
+    // running its copies are answered PAIR_UNDER_TEST, which needs a test
+    // thread that will run it.
+    void markTestPending(int a, int b) {
+        if (g_selftest != SelfTestMode::kEnforce) return;
+        g_policy.setPair(
+            a, b, running_ ? PeerPolicy::kTestPending : PeerPolicy::kUntested);
     }
 
     static uint8_t itemState(const std::pair<int, int> &p) {
@@ -3488,6 +3548,8 @@ class SelfTester {
                 if (it->second.next_us <= now) {
                     queue_.push_back(p);
                     pending_.insert(p);
+                    if (itemKind(p) == ItemKind::kPair)
+                        markTestPending(p.first, p.second);
                 } else if (!next || it->second.next_us < next) {
                     next = it->second.next_us;
                 }
@@ -3786,6 +3848,7 @@ class SelfTester {
     std::set<std::pair<int, int>> pending_;
     std::map<std::pair<int, int>, Retry> retry_;
     bool stop_ = false;
+    bool running_ = false;  // the test thread was started
 };
 SelfTester g_tester;
 
@@ -3938,7 +4001,10 @@ void usage(const char *argv0) {
         "GPU\n"
         "                          memory for it) is repeated after 10, 30,\n"
         "                          60 s, then every 5 min, and at the next\n"
-        "                          registration on either GPU.\n"
+        "                          registration on either GPU. While a pair's\n"
+        "                          test is queued or running its copies get\n"
+        "                          PAIR_UNDER_TEST, and engines send them\n"
+        "                          again until it decided.\n"
         "                          warn: log only; off: no test\n"
         "  --no-startup-selftest   test a pair only when engines first\n"
         "                          register on both of its GPUs (recommended\n"
@@ -3984,7 +4050,9 @@ void usage(const char *argv0) {
         "avg_exec_us), coalesced_entries, kernel_entries/bytes and\n"
         "ce_entries/bytes (copy engines), handle_opens, p2p_selftest,\n"
         "denied_pairs (denied ordered src>dst directions: count and bus\n"
-        "ids), denied_copy_requests, untested_pairs and\n"
+        "ids), denied_copy_requests, pair_test_waits (copies answered\n"
+        "PAIR_UNDER_TEST while their pair's self-test was queued or\n"
+        "running), untested_pairs and\n"
         "untested_host_paths (tests that could not run, waiting for a\n"
         "retry), staged_copies, staged_bytes, staged_failures (host-staged\n"
         "copies), deadline_aborts (copies stopped at their deadline),\n"

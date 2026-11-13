@@ -232,6 +232,8 @@ const char *reasonName(int reason) {
             return "daemon unavailable";
         case 1:
             return "daemon error";
+        case 3:
+            return "GPU pair still under the daemon's P2P self-test";
         default:
             return "request not servable by the proxy";
     }
@@ -566,6 +568,9 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
     reconnect_wait_ms_ = std::min(
         timeout_ms_, std::max(0, envInt("MC_NVLINK_PROXY_RECONNECT_WAIT_MS",
                                         timeout_ms_ / 2)));
+    pair_test_wait_ms_ = std::min(
+        timeout_ms_,
+        std::max(0, envInt("MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS", 3000)));
     release_wait_ms_ = std::min(
         600000, std::max(0, envInt("MC_NVLINK_PROXY_RELEASE_WAIT_MS", 10000)));
     require_vmm_ = envInt("MC_NVLINK_PROXY_REQUIRE_VMM", 0) != 0;
@@ -601,6 +606,7 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
               << ", node_id=" << node_id_ << ", client_id=" << id
               << ", timeout_ms=" << timeout_ms_
               << ", reconnect_wait_ms=" << reconnect_wait_ms_
+              << ", pair_test_wait_ms=" << pair_test_wait_ms_
               << ", release_wait_ms=" << release_wait_ms_
               << ", vmm=" << (vmm_enabled_ ? 1 : 0) << ", daemon "
               << (connected ? "connected" : "not reachable yet") << ")";
@@ -987,16 +993,36 @@ NvlinkProxyTransport::CopyOutcome NvlinkProxyTransport::copy(
         if (reply.size() > sizeof(CopyResp)) {
             error += ": " + reply.substr(sizeof(CopyResp));
         }
-        // Right after a daemon (re)start the peer may not have re-registered
-        // its blocks yet: retry shortly instead of falling back.
-        if ((st == ProxyStatus::kUnknownSource ||
-             st == ProxyStatus::kUnknownDestination) &&
-            nowNs() - epoch_since_ns_.load() <
-                int64_t(reconnect_wait_ms_) * 1000000LL)
-            return CopyOutcome::kRetryLater;
-        return CopyOutcome::kFailed;
     }
-    return CopyOutcome::kOk;
+    return copyOutcome(st, nowNs() - epoch_since_ns_.load() <
+                               int64_t(reconnect_wait_ms_) * 1000000LL);
+}
+
+NvlinkProxyTransport::CopyOutcome NvlinkProxyTransport::copyOutcome(
+    ProxyStatus status, bool fresh) {
+    switch (status) {
+        case ProxyStatus::kOk:
+            return CopyOutcome::kOk;
+        case ProxyStatus::kUnknownSource:
+        case ProxyStatus::kUnknownDestination:
+            // Right after a daemon (re)start the peer may not have
+            // re-registered its blocks yet: retry shortly instead of falling
+            // back.
+            return fresh ? CopyOutcome::kRetryLater : CopyOutcome::kFailed;
+        case ProxyStatus::kPairUnderTest:
+            // Refused before anything was issued, until the self-test of the
+            // GPU pair decided (about a second).
+            return CopyOutcome::kPairUnderTest;
+        default:
+            return CopyOutcome::kFailed;
+    }
+}
+
+int64_t NvlinkProxyTransport::pairTestWaitEnd(int64_t start_ns,
+                                              int64_t deadline_ns,
+                                              int pair_test_wait_ms) {
+    return std::min<int64_t>(start_ns + int64_t(pair_test_wait_ms) * 1000000LL,
+                             start_ns + (deadline_ns - start_ns) / 2);
 }
 
 void NvlinkProxyTransport::requestRecheck() {
@@ -1070,7 +1096,7 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
             if (epoch && kv.second.registered_epoch == epoch) ++registered;
     }
     const uint64_t batches = counters_.proxy_batches.load();
-    char line[1024];
+    char line[1280];
     snprintf(
         line, sizeof(line),
         "healthy=%d proxied_requests=%" PRIu64 " proxied_bytes=%" PRIu64
@@ -1078,7 +1104,7 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
         " max_batch_us=%" PRIu64 " held_requests=%" PRIu64
         " max_hold_ms=%" PRIu64 " retried_requests=%" PRIu64
         " fallback_requests=%" PRIu64 " (daemon_unavailable=%" PRIu64
-        " daemon_error=%" PRIu64 " not_servable=%" PRIu64
+        " daemon_error=%" PRIu64 " not_servable=%" PRIu64 " pair_test=%" PRIu64
         ") fallback_retries=%" PRIu64 " failed_requests=%" PRIu64
         " remote_node_requests=%" PRIu64
         " registered_blocks=%zu/%zu register_refusals=%" PRIu64
@@ -1091,9 +1117,9 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
         counters_.fallback_requests.load(), counters_.fallback_unhealthy.load(),
         counters_.fallback_daemon_error.load(),
         counters_.fallback_untranslatable.load(),
-        counters_.fallback_retries.load(), counters_.failed_requests.load(),
-        counters_.remote_node_requests.load(), registered, blocks,
-        counters_.register_refusals.load(),
+        counters_.fallback_pair_test.load(), counters_.fallback_retries.load(),
+        counters_.failed_requests.load(), counters_.remote_node_requests.load(),
+        registered, blocks, counters_.register_refusals.load(),
         counters_.register_refusals_not_visible.load(),
         counters_.reconnects.load());
     if (!force && last_stats_ == line) return;  // nothing changed
@@ -1282,6 +1308,9 @@ void NvlinkProxyTransport::fallback(const std::vector<TransferTask *> &tasks,
         case FallbackReason::kUntranslatable:
             counters_.fallback_untranslatable += tasks.size();
             break;
+        case FallbackReason::kPairTest:
+            counters_.fallback_pair_test += tasks.size();
+            break;
     }
     int64_t now = nowNs();
     int64_t last = last_fallback_log_ns_.load();
@@ -1357,10 +1386,21 @@ Status NvlinkProxyTransport::submitTransferTask(
     const int64_t hold_deadline =
         start + int64_t(reconnect_wait_ms_) * 1000000LL;
     const int64_t deadline = start + int64_t(timeout_ms_) * 1000000LL;
+    // The latest a request may take: its budget, or its batch's deadline
+    // when that is earlier.
+    auto requestDeadline = [deadline](TransferTask *task) {
+        int64_t d = deadline;
+        if (task->batch_id) {
+            const int64_t b =
+                Transport::toBatchDesc(task->batch_id).control.deadlineNs();
+            if (b != 0 && b < d) d = b;
+        }
+        return d;
+    };
 
     std::vector<TransferTask *> pending(task_list.begin(), task_list.end());
-    std::vector<TransferTask *> not_servable, failed, unavailable;
-    std::string error;
+    std::vector<TransferTask *> not_servable, failed, unavailable, pair_late;
+    std::string error, pair_error;
     bool held = false;
     int round = 0;
     while (!pending.empty()) {
@@ -1395,7 +1435,7 @@ Status NvlinkProxyTransport::submitTransferTask(
         }
 
         std::vector<CopyEntry> entries;
-        std::vector<TransferTask *> proxied, retry;
+        std::vector<TransferTask *> proxied, retry, pair_wait;
         bool retry_later = false;
         entries.reserve(pending.size());
         proxied.reserve(pending.size());
@@ -1445,11 +1485,14 @@ Status NvlinkProxyTransport::submitTransferTask(
                 copy(entries, begin, count, err,
                      countersOf(proxied, begin, count), copy_deadline);
             if (outcome != CopyOutcome::kOk) {
-                auto &dst = outcome == CopyOutcome::kFailed ? failed : retry;
+                const bool pair = outcome == CopyOutcome::kPairUnderTest;
+                auto &dst = outcome == CopyOutcome::kFailed ? failed
+                            : pair                          ? pair_wait
+                                                            : retry;
                 dst.insert(dst.end(), proxied.begin() + begin,
                            proxied.begin() + begin + count);
                 retry_later |= outcome == CopyOutcome::kRetryLater;
-                error = err;
+                (pair ? pair_error : error) = err;
                 continue;
             }
             const uint64_t us = static_cast<uint64_t>((nowNs() - t0) / 1000);
@@ -1467,22 +1510,48 @@ Status NvlinkProxyTransport::submitTransferTask(
                    !counters_.proxy_us_max.compare_exchange_weak(cur, us)) {
             }
         }
-        pending.swap(retry);
-        if (pending.empty()) break;
         // Daemon restarted or a peer not re-registered yet: retry through
         // the proxy while the reconnect window lasts.
         const int64_t now = nowNs();
-        if (now >= hold_deadline) {
-            failed.insert(failed.end(), pending.begin(), pending.end());
-            pending.clear();
-            break;
+        if (!retry.empty() && now >= hold_deadline) {
+            failed.insert(failed.end(), retry.begin(), retry.end());
+            retry.clear();
         }
+        int64_t wake = retry.empty() ? INT64_MAX : hold_deadline;
+        // The GPU pair is under the daemon's self-test (nothing of the copy
+        // was issued): send it again until the test decided, while the
+        // request's pair-test wait lasts; then the base transport.
+        size_t pair_waiting = 0;
+        for (auto *task : pair_wait) {
+            const int64_t end = pairTestWaitEnd(start, requestDeadline(task),
+                                                pair_test_wait_ms_);
+            if (now >= end) {
+                pair_late.push_back(task);
+                continue;
+            }
+            retry.push_back(task);
+            ++pair_waiting;
+            wake = std::min(wake, end);
+        }
+        if (pair_waiting && !held) {
+            held = true;
+            counters_.held_requests += pair_waiting;
+        }
+        pending.swap(retry);
+        if (pending.empty()) break;
         counters_.retried_requests += pending.size();
-        if (retry_later) {
+        if (retry_later || pair_waiting) {
+            // A self-test decides within about a second: look again soon.
+            const int64_t cap_ms = pair_waiting ? 50 : 200;
             const int64_t backoff_ns =
-                std::min<int64_t>(200, 10LL << std::min(round, 5)) * 1000000LL;
+                std::min<int64_t>(cap_ms, 10LL << std::min(round, 5)) *
+                1000000LL;
+            // Wake up for the earliest batch deadline too: its requests
+            // fail there, nothing of them is sent any more.
+            for (auto *task : pending)
+                wake = std::min(wake, requestDeadline(task));
             std::this_thread::sleep_for(std::chrono::nanoseconds(
-                std::min<int64_t>(backoff_ns, hold_deadline - now)));
+                std::max<int64_t>(0, std::min(backoff_ns, wake - now))));
         }
         ++round;
     }
@@ -1499,6 +1568,8 @@ Status NvlinkProxyTransport::submitTransferTask(
              deadline);
     fallback(not_servable, FallbackReason::kUntranslatable,
              "target or source not registered with the proxy", deadline);
+    fallback(pair_late, FallbackReason::kPairTest,
+             pair_error + "; not decided within the pair-test wait", deadline);
     fallback(failed, FallbackReason::kDaemonError, error, deadline);
     return Status::OK();
 }

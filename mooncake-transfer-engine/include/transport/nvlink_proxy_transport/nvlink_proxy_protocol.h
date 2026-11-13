@@ -76,6 +76,16 @@ enum class ProxyStatus : uint32_t {
     kCudaError = 8,
     kDeadlineExceeded = 9,
     kNotControlConnection = 10,
+    // COPY not served yet: its GPU pair has not passed the daemon's P2P
+    // self-test, and a test of the pair is queued or running. Nothing of the
+    // copy was issued; the engine may send it again, and once the test
+    // decided the daemon serves it or refuses it (NO_PEER_ACCESS). A pair
+    // that is refused for any other reason, or untested with no test coming,
+    // gets NO_PEER_ACCESS. Status values only grow, so no version bump: an
+    // engine that does not know this one takes it as a failed copy and uses
+    // its base transport, as it did for NO_PEER_ACCESS; a daemon that does
+    // not know it never sends it.
+    kPairUnderTest = 11,
 };
 
 inline const char *proxyStatusName(ProxyStatus s) {
@@ -102,6 +112,8 @@ inline const char *proxyStatusName(ProxyStatus s) {
             return "DEADLINE_EXCEEDED";
         case ProxyStatus::kNotControlConnection:
             return "NOT_CONTROL_CONNECTION";
+        case ProxyStatus::kPairUnderTest:
+            return "PAIR_UNDER_TEST";
     }
     return "UNKNOWN_STATUS";
 }
