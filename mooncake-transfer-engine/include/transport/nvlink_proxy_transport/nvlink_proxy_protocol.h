@@ -62,6 +62,7 @@ enum class MsgType : uint16_t {
     kStats = 6,
     kRelease = 7,
     kRegisterFd = 8,
+    kPairWait = 9,
 };
 
 enum class ProxyStatus : uint32_t {
@@ -232,6 +233,33 @@ struct ReleaseResp {
     // mappings and imports the daemon failed to release.
     uint64_t mappings;
 };
+
+// PAIR_WAIT, on a control connection: answered once no P2P self-test of a
+// GPU pair is queued or running whose GPUs are one this connection
+// registered blocks on and one any engine registered on -- every such pair
+// is decided: allowed, or refused (OK) -- or when |wait_ms| passed with
+// such a test still queued or running (DEADLINE_EXCEEDED; until it decided,
+// copies between the pair's GPUs are answered PAIR_UNDER_TEST). The daemon
+// queues a pair's test while it handles the REGISTER that completes the
+// pair (an engine's first block on the second GPU), before it replies, so
+// a PAIR_WAIT sent after that reply waits for it. An engine sends it after
+// registering, so that its registration returns -- and the engine reports
+// ready -- only once its pairs are decided, and its first copies are not
+// held. Daemons that do not know it reply BAD_REQUEST: the engine does not
+// wait.
+struct PairWaitReq {
+    uint32_t wait_ms;
+    uint32_t reserved;
+};
+
+struct PairWaitResp {
+    uint64_t waited_us;  // 0: no such test was queued or running
+    uint32_t pending;    // such tests still queued or running
+    // Such pairs refused for P2P (failed, untested, denied on the command
+    // line): their copies are host-staged where verified, else use the
+    // engines' base transport.
+    uint32_t refused;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(MsgHeader) == 24, "MsgHeader layout");
@@ -240,6 +268,8 @@ static_assert(sizeof(RegisterReq) == 96, "RegisterReq layout");
 static_assert(sizeof(CopyEntry) == 56, "CopyEntry layout");
 static_assert(sizeof(ReleaseReq) == 8, "ReleaseReq layout");
 static_assert(sizeof(ReleaseResp) == 16, "ReleaseResp layout");
+static_assert(sizeof(PairWaitReq) == 8, "PairWaitReq layout");
+static_assert(sizeof(PairWaitResp) == 16, "PairWaitResp layout");
 
 // ---------------------------------------------------------------------------
 // Segment metadata. A device buffer registered under nvlink_proxy is

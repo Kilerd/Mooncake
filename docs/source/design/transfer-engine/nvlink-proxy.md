@@ -81,6 +81,7 @@ the wheel with the console entry point `mooncake_nvlink_proxy`. The workflow
    | `MC_NVLINK_PROXY_TIMEOUT_MS` | Request budget (default 30000): upper bound for one daemon round trip and for completing a request on the base transport after a fallback. The daemon refuses to start a copy after half of it. |
    | `MC_NVLINK_PROXY_RECONNECT_WAIT_MS` | How long same-node requests wait for an unavailable daemon before they use the base transport (default: half of the request budget). |
    | `MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS` | How long a request is sent again while the daemon's P2P self-test of its GPU pair is queued or running (`PAIR_UNDER_TEST`) before it uses the base transport (default 3000; never more than half of the time the request has, see [Routing and fallback](#routing-and-fallback); 0: at once, as before). |
+   | `MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS` | How long a registration that sent a block to the daemon waits for the daemon's P2P self-test of the engine's GPU pairs while it is queued or running (`PAIR_WAIT`), so that the engine reports ready with its pairs decided (default 3000, at most 60000; 0: no wait, as before; see [Routing and fallback](#routing-and-fallback)). |
    | `MC_NVLINK_PROXY_FALLBACK_INFLIGHT` | Maximum requests the proxy has in flight on the base transport at a time, across all threads (default 512; with TCP at most half of `MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER`). |
    | `MC_NVLINK_PROXY_STATS_INTERVAL` | Seconds between counter log lines (default 60, 0 = off). |
    | `MC_NVLINK_PROXY_RELEASE_WAIT_MS` | How long `shutdown()` waits for the daemon to close its mappings of the engine's memory (default 10000). |
@@ -157,6 +158,35 @@ together with the exact address range in which that set is unchanged.
   returns after it). Engines that predate `PAIR_UNDER_TEST` take it as a
   failed copy and use the base transport at once; older daemons never send
   it.
+- That hold is a safety net: such a wait belongs to start-up, not to the
+  first requests. A unit is typically reported ready (and given traffic)
+  as soon as its engines' `register_memory` / `batch_register_memory`
+  calls returned, a moment after the second engine registered -- before
+  the test of the pair that registration completed decided. So a
+  registration call that sent a block to the daemon then sends `PAIR_WAIT`
+  on its control connection (once per call, also for a batch) and returns
+  only once no P2P self-test of a pair of the engine's GPUs with the GPUs
+  that engines registered on is queued or running, at most
+  `MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS` (default 3 s; 0: no wait). The
+  daemon queues a pair's test (`kTestPending`) while it handles the
+  `REGISTER` that completes the pair -- an engine's first block on the
+  second GPU -- before it answers it, so the `PAIR_WAIT` that follows
+  finds it: the engine that registers second waits for the test (typically
+  0.5-1 s), the one that registered first does not wait (its pairs had no
+  test yet). The daemon answers on the connection's own thread, as for
+  `RELEASE`; every other connection is served meanwhile. A test still
+  running after the wait: the registration logs a warning and succeeds
+  anyway, and the copies are held as above until it decided. Nothing to
+  wait for -- no pair under test, a pair denied on the command line or
+  whose test could not run, `--p2p-selftest=warn` or `off`, host memory, a
+  block registered already -- costs one round trip or none. A daemon that
+  predates `PAIR_WAIT` answers `BAD_REQUEST`: the engine logs it once per
+  daemon start and does not wait; older engines never send it. The wait
+  only delays readiness when the daemon is reachable at registration: an
+  engine that registers while its daemon is not up yet registers later
+  from its health thread, without waiting. Logged by the engine
+  (`registration waited N ms ...`) and the daemon, counted under
+  `register_pair_waits` on both sides (see [Counters](#counters)).
 - Requests that still need the base transport (daemon away for longer than the
   window, or a non-retryable error such as a CUDA error) are moved there with
   backpressure: at most `MC_NVLINK_PROXY_FALLBACK_INFLIGHT` requests in flight,
@@ -271,7 +301,9 @@ pair before it serves copies between them.
 - `--p2p-selftest=enforce` (default): a pair is refused from the moment it is
   requested until its test passes, for good if it failed; while it is
   untested it stays refused. While its test is queued or running its copies
-  are answered `PAIR_UNDER_TEST` (engines send them again, see
+  are answered `PAIR_UNDER_TEST` (engines send them again) and a
+  `PAIR_WAIT` of an engine on one of its GPUs is answered once it decided
+  (engines send it after registering, see
   [Routing and fallback](#routing-and-fallback)); after a test that could
   not run, until the next one starts, `NO_PEER_ACCESS`. `warn` only logs;
   `off` skips the test.
@@ -510,7 +542,8 @@ nvlink_proxy stats: healthy=1 proxied_requests=... proxied_bytes=... proxied_bat
   avg_batch_us=... max_batch_us=... held_requests=... max_hold_ms=... retried_requests=...
   fallback_requests=... (daemon_unavailable=... daemon_error=... not_servable=... pair_test=...)
   fallback_retries=... failed_requests=... remote_node_requests=...
-  registered_blocks=N/M register_refusals=... (not_visible=...) connects=...
+  registered_blocks=N/M register_refusals=... (not_visible=...)
+  register_pair_waits=... (wait_ms=... timeouts=...) connects=...
 ```
 
 - `proxied_*`: requests, bytes and daemon round trips served by the proxy;
@@ -530,6 +563,10 @@ nvlink_proxy stats: healthy=1 proxied_requests=... proxied_bytes=... proxied_bat
 - `register_refusals`: blocks the daemon refused to register (their
   transfers use the base transport), `not_visible` of them because the
   daemon does not see the GPU; also logged at error level.
+- `register_pair_waits`: registrations that waited for the daemon's P2P
+  self-test of the engine's GPU pairs (`PAIR_WAIT`), `wait_ms` their total
+  wait, `timeouts` those that went on after
+  `MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS` with a test still running.
 
 Daemon side, logged every `--stats-interval` seconds when they changed, or on
 demand with `mooncake_nvlink_proxy --socket <path> --stats`: active clients,
@@ -542,7 +579,11 @@ GPU pair counts twice -- followed by their bus ids) and
 `denied_copy_requests` (copies refused because their pair is denied; not
 counted as failures), `pair_test_waits` (copies answered `PAIR_UNDER_TEST`
 because their pair's self-test was queued or running; neither failures nor
-denials), `untested_pairs` / `untested_host_paths` /
+denials), `register_pair_waits` / `register_pair_wait_ms` /
+`register_pair_wait_timeouts` (`PAIR_WAIT` requests that found a self-test
+of the engine's pairs queued or running and waited, their total wait, and
+those answered after the wait with the test still running),
+`untested_pairs` / `untested_host_paths` /
 `untested_staged_pairs` (GPU pairs, per-GPU host paths and pairs' host-staged
 copies whose last test could not run, waiting for a retry; worth an alert
 when they stay above 0),
@@ -569,7 +610,13 @@ registrations; replied once none of them is alive -- a copy in flight may
 still map one it resolved -- or with `DEADLINE_EXCEEDED` and the count of
 those still in use after the wait it names), `REGISTER_FD` (`REGISTER` of a virtual memory management block whose
 handle field carries the allocation's buffer id; the allocation's POSIX file
-descriptor comes with the message header as `SCM_RIGHTS`).
+descriptor comes with the message header as `SCM_RIGHTS`), `PAIR_WAIT`
+(control connection: replied once no P2P self-test of a pair of the GPUs
+this connection registered on is queued or running, or with
+`DEADLINE_EXCEEDED` after the wait it names; the reply carries how long it
+waited and how many of those pairs are still under test or refused).
+Message types and status values only grow, so the protocol version stays
+1: a daemon answers a message type it does not know with `BAD_REQUEST`.
 
 ## Testing
 
@@ -586,7 +633,11 @@ still drain), new client id and process token for the next engine, and a
 `PAIR_UNDER_TEST`: requests sent again until the test passed, the base
 transport once it failed or after the pair-test wait (at once with a wait of
 0), at most half of a batch's time spent waiting, a canceled batch failed
-without sending anything.
+without sending anything; and `PAIR_WAIT` after a registration: answered
+once the test decided, the registration going on after its wait, a daemon
+that predates it asked once and not waited for, a wait of 0 sending
+nothing, a broken connection closed, host memory not waiting, the control
+connection's receive timeout restored.
 `transfer_engine_shutdown_test.py` checks the same through the
 Python API (calls after `shutdown()` raise, a batch left unfreed, a thread
 still transferring, refused while `get_engine()`'s engine is referenced); with `--gpu` it writes through a running daemon,
@@ -594,7 +645,8 @@ shuts down, finds no mapping left in the daemon, and does it again with new
 engines in the same process (`--gpu --vmm`: with virtual memory management
 pools whose physical memory is released and created again in between);
 `nvlink_proxy_policy_test` the self-test plans, the verifier, bus id parsing,
-the deny matrix and which refusals are `PAIR_UNDER_TEST`;
+the deny matrix, which refusals are `PAIR_UNDER_TEST` and which pairs a
+`PAIR_WAIT` waits for;
 `nvlink_proxy_daemon_test` the paced issue against the
 deadline, the IPC mapping table, the socket and the start-up checks.
 `nvlink_proxy_cpu_test.py` runs the daemon itself without GPUs, linked
@@ -614,5 +666,8 @@ granted access refusing the copy; the stand-in also implements the driver's
 virtual memory management calls),
 `--min-visible-gpus`, `PAIR_UNDER_TEST` while a pair's self-test runs (nothing
 written) and the answers once it passed, failed or could not run, and for a
-pair denied on the command line (CMake target `mooncake_nvlink_proxy_cpu`, CTest
+pair denied on the command line, `PAIR_WAIT` sent right after the
+`REGISTER` that completes a pair answered once the slowed self-test
+decided (and copies served at once then), after its wait while the test
+still runs, and at once with nothing to wait for (CMake target `mooncake_nvlink_proxy_cpu`, CTest
 `nvlink_proxy_cpu_test`).

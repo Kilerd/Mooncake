@@ -30,7 +30,9 @@
 // kNoPeerAccess and the engines move them to their base transport. Copies
 // between the GPUs of a pair whose test is queued or running get
 // kPairUnderTest, and the engines send them again until it decided (see
-// p2p_policy.h).
+// p2p_policy.h). An engine that just registered asks with PAIR_WAIT to be
+// answered once the tests of its GPUs' pairs decided, before it reports
+// ready.
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -664,6 +666,12 @@ struct Stats {
     std::atomic<uint64_t> denied_copies{0};  // refused by the P2P policy
     // Answered PAIR_UNDER_TEST: their pair's self-test was queued or running.
     std::atomic<uint64_t> pair_test_waits{0};
+    // PAIR_WAIT requests that found a self-test of one of the engine's pairs
+    // queued or running and waited, how long in total, and how many of them
+    // were answered before it decided (DEADLINE_EXCEEDED).
+    std::atomic<uint64_t> register_pair_waits{0};
+    std::atomic<uint64_t> register_pair_wait_us{0};
+    std::atomic<uint64_t> register_pair_wait_timeouts{0};
     std::atomic<uint64_t> staged_copies{0};  // served through host memory
     std::atomic<uint64_t> staged_bytes{0};
     std::atomic<uint64_t> staged_failures{0};  // then refused (base transport)
@@ -720,6 +728,12 @@ std::string statsText() {
     out +=
         " denied_copy_requests=" + std::to_string(g_stats.denied_copies.load());
     out += " pair_test_waits=" + std::to_string(g_stats.pair_test_waits.load());
+    out += " register_pair_waits=" +
+           std::to_string(g_stats.register_pair_waits.load()) +
+           " register_pair_wait_ms=" +
+           std::to_string(g_stats.register_pair_wait_us.load() / 1000) +
+           " register_pair_wait_timeouts=" +
+           std::to_string(g_stats.register_pair_wait_timeouts.load());
     out +=
         " untested_pairs=" + std::to_string(g_untested_pairs.load()) +
         " untested_host_paths=" + std::to_string(g_untested_host_paths.load()) +
@@ -1981,6 +1995,26 @@ size_t dropOwned(Connection &c, const char *what = "disconnected") {
     return dropped;
 }
 
+// PAIR_WAIT: the GPU pairs of |devices| (where a connection registered
+// blocks) with the GPUs the daemon set up for engines (countPairs).
+PairCounts pairsOfDevices(const std::set<int> &devices) {
+    const size_t n = g_devices.size();
+    std::vector<bool> mine(n, false), used(n, false);
+    for (int d : devices)
+        if (d >= 0 && size_t(d) < n) mine[d] = true;
+    for (size_t i = 0; i < n; ++i) used[i] = g_dev_ready[i].load();
+    return countPairs(g_policy, mine, used);
+}
+
+std::string deviceList(const std::set<int> &devices) {
+    std::string out;
+    for (int d : devices) {
+        if (!out.empty()) out += ',';
+        out += std::to_string(d);
+    }
+    return out;
+}
+
 void handleConnection(int fd) {
     g_stats.connections++;
     g_stats.active_connections++;
@@ -2150,7 +2184,9 @@ void handleConnection(int fd) {
                 // An engine's first block on this GPU: test the GPU's pairs
                 // that have not passed yet (in the background; until then,
                 // in enforce mode, copies between them are refused), before
-                // the block is visible to any copy.
+                // the block is visible to any copy. Queued (kTestPending)
+                // before this REGISTER is answered, so that a PAIR_WAIT the
+                // engine sends after the answer waits for those tests.
                 if (c.devices.insert(dev).second) requestSelfTestForDevice(dev);
                 bool replaced = false, same = false;
                 {
@@ -2399,6 +2435,70 @@ void handleConnection(int fd) {
                 ok = sendMsg(fd, type, h.seq,
                              held == 0 ? ProxyStatus::kOk
                                        : ProxyStatus::kDeadlineExceeded,
+                             &resp, sizeof(resp));
+                break;
+            }
+            case MsgType::kPairWait: {
+                if (!c.control) {
+                    replyError(fd, type, h.seq,
+                               ProxyStatus::kNotControlConnection,
+                               "PAIR_WAIT requires a control connection");
+                    break;
+                }
+                if (payload.size() != sizeof(PairWaitReq)) {
+                    replyError(fd, type, h.seq, ProxyStatus::kBadRequest,
+                               "bad PAIR_WAIT");
+                    break;
+                }
+                PairWaitReq req;
+                memcpy(&req, payload.data(), sizeof(req));
+                // Waits on this connection's thread, as RELEASE does: the
+                // engine sends nothing else on it meanwhile, every other
+                // connection is served, and the self-test thread decides
+                // the pairs. A test queued by a REGISTER on this or another
+                // connection was queued before that REGISTER's reply.
+                const uint64_t t0 = nowUs();
+                const uint64_t until =
+                    t0 +
+                    uint64_t(std::min<uint32_t>(req.wait_ms, 60000)) * 1000;
+                PairCounts pairs = pairsOfDevices(c.devices);
+                const size_t asked = pairs.pending;
+                while (pairs.pending > 0 && !g_stop && nowUs() < until) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    pairs = pairsOfDevices(c.devices);
+                }
+                PairWaitResp resp{};
+                resp.waited_us = asked ? nowUs() - t0 : 0;
+                resp.pending = static_cast<uint32_t>(pairs.pending);
+                resp.refused = static_cast<uint32_t>(pairs.refused);
+                if (asked) {
+                    // Once per engine registration that found a test of its
+                    // pairs queued or running: not rate-limited.
+                    g_stats.register_pair_waits++;
+                    g_stats.register_pair_wait_us += resp.waited_us;
+                    const std::string gpus = deviceList(c.devices);
+                    if (pairs.pending) {
+                        g_stats.register_pair_wait_timeouts++;
+                        LOGW("client %016" PRIx64
+                             " waited %.0f ms at registration for the P2P "
+                             "self-test of %zu GPU pair(s) with gpu(s) %s: "
+                             "%zu still queued or running; until they "
+                             "decided their copies are answered "
+                             "PAIR_UNDER_TEST",
+                             c.client_id, resp.waited_us / 1000.0, asked,
+                             gpus.c_str(), pairs.pending);
+                    } else {
+                        LOGI("client %016" PRIx64
+                             " waited %.0f ms at registration for the P2P "
+                             "self-test of %zu GPU pair(s) with gpu(s) %s: "
+                             "decided, %zu of its pairs refused for P2P",
+                             c.client_id, resp.waited_us / 1000.0, asked,
+                             gpus.c_str(), pairs.refused);
+                    }
+                }
+                ok = sendMsg(fd, type, h.seq,
+                             pairs.pending ? ProxyStatus::kDeadlineExceeded
+                                           : ProxyStatus::kOk,
                              &resp, sizeof(resp));
                 break;
             }
@@ -3218,9 +3318,9 @@ bool ensureDevice(int dev) {
 // testing when it died (an unrecoverable CUDA error, a crash) or hung is
 // failed. In enforce mode a pair is refused for P2P from the moment it is
 // requested until a test passes: kTestPending while its test is queued or
-// running (copies get PAIR_UNDER_TEST and are sent again), kUntested after a
-// test that could not run. Such a test is repeated with a backoff and at the
-// next registration on either GPU.
+// running (copies get PAIR_UNDER_TEST and are sent again, PAIR_WAIT waits),
+// kUntested after a test that could not run. Such a test is repeated with a
+// backoff and at the next registration on either GPU.
 //
 // Tester items: (a, a) the host path of GPU a; (a, b) with a < b the pair's
 // P2P paths (and, with --p2p-fallback=host, its host-staged copies); (b, a)
@@ -4004,7 +4104,8 @@ void usage(const char *argv0) {
         "                          registration on either GPU. While a pair's\n"
         "                          test is queued or running its copies get\n"
         "                          PAIR_UNDER_TEST, and engines send them\n"
-        "                          again until it decided.\n"
+        "                          again until it decided; an engine that\n"
+        "                          registered waits for it (PAIR_WAIT).\n"
         "                          warn: log only; off: no test\n"
         "  --no-startup-selftest   test a pair only when engines first\n"
         "                          register on both of its GPUs (recommended\n"
@@ -4052,7 +4153,11 @@ void usage(const char *argv0) {
         "denied_pairs (denied ordered src>dst directions: count and bus\n"
         "ids), denied_copy_requests, pair_test_waits (copies answered\n"
         "PAIR_UNDER_TEST while their pair's self-test was queued or\n"
-        "running), untested_pairs and\n"
+        "running), register_pair_waits, register_pair_wait_ms and\n"
+        "register_pair_wait_timeouts (PAIR_WAIT requests of engines that\n"
+        "registered and waited for the self-test of their GPUs' pairs, their\n"
+        "total wait, and those answered before it decided), untested_pairs "
+        "and\n"
         "untested_host_paths (tests that could not run, waiting for a\n"
         "retry), staged_copies, staged_bytes, staged_failures (host-staged\n"
         "copies), deadline_aborts (copies stopped at their deadline),\n"

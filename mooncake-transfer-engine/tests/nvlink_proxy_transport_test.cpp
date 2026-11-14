@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -654,6 +655,46 @@ struct NvlinkProxyTransportTestAccess {
                 c.fallback_pair_test.load(), c.fallback_daemon_error.load(),
                 c.failed_requests.load()};
     }
+
+    // As if installed (client 0xA) against the daemon at |socket| with
+    // MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS=|wait_ms|, and connected: HELLO
+    // on a control connection, no block registered yet.
+    static bool connectControl(NvlinkProxyTransport &t,
+                               const std::string &socket, int wait_ms) {
+        t.socket_path_ = socket;
+        t.client_id_ = 0xA;
+        t.register_pair_wait_ms_ = wait_ms;
+        t.stats_interval_s_ = 0;
+        std::lock_guard<std::mutex> lock(t.control_mu_);
+        return t.ensureControlLocked();
+    }
+
+    // The wait at the end of a registration that sent a block.
+    using PairWaitOutcome = NvlinkProxyTransport::PairWaitOutcome;
+    static PairWaitOutcome waitForPairTests(NvlinkProxyTransport &t) {
+        std::lock_guard<std::mutex> lock(t.control_mu_);
+        return t.waitForPairTestsLocked();
+    }
+
+    // The control connection's receive timeout in ms (-1: not connected).
+    static int controlReceiveTimeoutMs(NvlinkProxyTransport &t) {
+        std::lock_guard<std::mutex> lock(t.control_mu_);
+        if (t.control_fd_ < 0) return -1;
+        timeval tv{};
+        socklen_t len = sizeof(tv);
+        if (getsockopt(t.control_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, &len))
+            return -2;
+        return static_cast<int>(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+    }
+
+    struct PairWaitCounts {
+        uint64_t waits, wait_ms, timeouts;
+    };
+    static PairWaitCounts pairWaitCounts(NvlinkProxyTransport &t) {
+        const auto &c = t.counters_;
+        return {c.register_pair_waits.load(), c.register_pair_wait_ms.load(),
+                c.register_pair_wait_timeouts.load()};
+    }
 };
 }  // namespace mooncake
 
@@ -808,15 +849,22 @@ TEST(NvlinkProxyTransport, RegisterFdPassesTheDescriptor) {
 namespace {
 
 // A stand-in for mooncake_nvlink_proxy that answers HELLO, PING, REGISTER,
-// COPY (OK, or PAIR_UNDER_TEST while pairUnderTestFor lasts) and RELEASE
-// (with |release_status| after |release_delay_ms|) and records what the
-// engines sent.
+// COPY (OK, or PAIR_UNDER_TEST while pairUnderTestFor lasts), PAIR_WAIT
+// (once pairUnderTestFor is over, at the latest after the wait asked for;
+// see pairWaitAnswer) and RELEASE (with |release_status| after
+// |release_delay_ms|) and records what the engines sent.
 class FakeDaemon {
    public:
     struct Hello {
         uint64_t client = 0;
         uint64_t token = 0;
         bool control = false;
+    };
+
+    enum class PairWaitAnswer {
+        kAnswer,   // as the daemon
+        kUnknown,  // as a daemon that predates PAIR_WAIT (BAD_REQUEST)
+        kHangUp,   // closes the connection instead
     };
 
     explicit FakeDaemon(ProxyStatus release_status = ProxyStatus::kOk,
@@ -861,6 +909,14 @@ class FakeDaemon {
     }
 
     int copies() const { return copies_.load(); }
+
+    void pairWaitAnswer(PairWaitAnswer a) { pair_wait_answer_ = a; }
+
+    // The wait_ms of every PAIR_WAIT received.
+    std::vector<uint32_t> pairWaits() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return pair_waits_;
+    }
 
     std::vector<Hello> hellos() {
         std::lock_guard<std::mutex> lock(mu_);
@@ -986,6 +1042,48 @@ class FakeDaemon {
                           body.data(), body.size());
                     break;
                 }
+                case MsgType::kPairWait: {
+                    PairWaitReq req{};
+                    if (payload.size() == sizeof(req))
+                        memcpy(&req, payload.data(), sizeof(req));
+                    {
+                        std::lock_guard<std::mutex> lock(mu_);
+                        pair_waits_.push_back(req.wait_ms);
+                    }
+                    const PairWaitAnswer a = pair_wait_answer_;
+                    if (a == PairWaitAnswer::kHangUp) {
+                        ::shutdown(fd, SHUT_RDWR);
+                        break;
+                    }
+                    if (a == PairWaitAnswer::kUnknown) {
+                        const std::string msg = "unknown message type";
+                        reply(fd, h, ProxyStatus::kBadRequest, msg.data(),
+                              msg.size());
+                        break;
+                    }
+                    const int64_t t0 = steadyNowNs();
+                    const int64_t until = t0 + int64_t(req.wait_ms) * 1000000;
+                    const bool waited = t0 < under_test_until_ns_;
+                    while (steadyNowNs() < under_test_until_ns_ &&
+                           steadyNowNs() < until && !stopping_)
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(1));
+                    const bool pending = steadyNowNs() < under_test_until_ns_;
+                    PairWaitResp resp{};
+                    resp.waited_us =
+                        waited ? uint64_t(steadyNowNs() - t0) / 1000 : 0;
+                    resp.pending = pending ? 1 : 0;
+                    resp.refused =
+                        !pending && static_cast<ProxyStatus>(then_.load()) !=
+                                        ProxyStatus::kOk
+                            ? 1
+                            : 0;
+                    reply(fd, h,
+                          pending ? ProxyStatus::kDeadlineExceeded
+                                  : ProxyStatus::kOk,
+                          &resp, sizeof(resp));
+                    break;
+                }
                 case MsgType::kRelease: {
                     {
                         std::lock_guard<std::mutex> lock(mu_);
@@ -1021,6 +1119,8 @@ class FakeDaemon {
     std::atomic<int64_t> under_test_until_ns_{0};
     std::atomic<uint32_t> then_{0};
     std::atomic<int> copies_{0};
+    std::atomic<PairWaitAnswer> pair_wait_answer_{PairWaitAnswer::kAnswer};
+    std::vector<uint32_t> pair_waits_;
     std::string path_;
     int listen_fd_ = -1;
     std::atomic<bool> stopping_{false};
@@ -1513,5 +1613,121 @@ TEST(NvlinkProxyPairTest, CanceledWhileWaiting) {
     const auto n = Access::counts(c.proxy);
     EXPECT_EQ(n.fallback, 0u);
     EXPECT_EQ(n.failed, 2u);
+}
+
+// A registration that sent a block waits (PAIR_WAIT) until the daemon's
+// self-test of the engine's GPU pairs decided, so that the engine reports
+// ready only then; the control connection keeps its usual receive timeout
+// afterwards. With nothing under test it does not wait, and is not counted.
+TEST(NvlinkProxyPairWait, WaitsUntilTheSelfTestDecided) {
+    using Access = NvlinkProxyTransportTestAccess;
+    using O = Access::PairWaitOutcome;
+    for (ProxyStatus verdict : {ProxyStatus::kOk, ProxyStatus::kNoPeerAccess}) {
+        SCOPED_TRACE(proxyStatusName(verdict));
+        FakeDaemon daemon;
+        NvlinkProxyTransport t;
+        ASSERT_TRUE(Access::connectControl(t, daemon.path(), 3000));
+        const int64_t t0 = steadyNowNs();
+        daemon.pairUnderTestFor(300, verdict);
+        EXPECT_EQ(Access::waitForPairTests(t), O::kDecided);
+        const int64_t took_ms = (steadyNowNs() - t0) / 1000000;
+        EXPECT_GE(took_ms, 290);
+        EXPECT_LT(took_ms, 1500);
+        EXPECT_EQ(daemon.pairWaits(), std::vector<uint32_t>{3000});
+        auto n = Access::pairWaitCounts(t);
+        EXPECT_EQ(n.waits, 1u);
+        EXPECT_GE(n.wait_ms, 250u);
+        EXPECT_EQ(n.timeouts, 0u);
+        EXPECT_NEAR(Access::controlReceiveTimeoutMs(t), 2000, 10);
+
+        // Decided: the next registration does not wait.
+        const int64_t t1 = steadyNowNs();
+        EXPECT_EQ(Access::waitForPairTests(t), O::kNothingPending);
+        EXPECT_LT((steadyNowNs() - t1) / 1000000, 200);
+        EXPECT_EQ(daemon.pairWaits().size(), 2u);
+        n = Access::pairWaitCounts(t);
+        EXPECT_EQ(n.waits, 1u);
+        EXPECT_EQ(n.timeouts, 0u);
+    }
+}
+
+// A self-test that takes longer than MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS:
+// the registration goes on after the wait (counted as a timeout), on the
+// same control connection; the copies' hold remains the safety net.
+TEST(NvlinkProxyPairWait, GoesOnAfterTheWait) {
+    using Access = NvlinkProxyTransportTestAccess;
+    FakeDaemon daemon;
+    NvlinkProxyTransport t;
+    ASSERT_TRUE(Access::connectControl(t, daemon.path(), 200));
+    daemon.pairUnderTestFor(-1);
+    const int64_t t0 = steadyNowNs();
+    EXPECT_EQ(Access::waitForPairTests(t), Access::PairWaitOutcome::kTimedOut);
+    const int64_t took_ms = (steadyNowNs() - t0) / 1000000;
+    EXPECT_GE(took_ms, 200);
+    EXPECT_LT(took_ms, 1500);
+    EXPECT_EQ(daemon.pairWaits(), std::vector<uint32_t>{200});
+    const auto n = Access::pairWaitCounts(t);
+    EXPECT_EQ(n.waits, 1u);
+    EXPECT_EQ(n.timeouts, 1u);
+    EXPECT_NEAR(Access::controlReceiveTimeoutMs(t), 2000, 10);
+}
+
+// A daemon that predates PAIR_WAIT answers BAD_REQUEST: no wait, no
+// failure, and it is not asked again; a wait of 0 sends nothing.
+TEST(NvlinkProxyPairWait, OlderDaemonOrNoWait) {
+    using Access = NvlinkProxyTransportTestAccess;
+    using O = Access::PairWaitOutcome;
+    {
+        FakeDaemon daemon;
+        daemon.pairWaitAnswer(FakeDaemon::PairWaitAnswer::kUnknown);
+        daemon.pairUnderTestFor(-1);
+        NvlinkProxyTransport t;
+        ASSERT_TRUE(Access::connectControl(t, daemon.path(), 3000));
+        const int64_t t0 = steadyNowNs();
+        EXPECT_EQ(Access::waitForPairTests(t), O::kUnsupported);
+        EXPECT_EQ(Access::waitForPairTests(t), O::kUnsupported);
+        EXPECT_LT((steadyNowNs() - t0) / 1000000, 500);
+        EXPECT_EQ(daemon.pairWaits().size(), 1u);
+        const auto n = Access::pairWaitCounts(t);
+        EXPECT_EQ(n.waits, 0u);
+        EXPECT_EQ(n.timeouts, 0u);
+        EXPECT_NEAR(Access::controlReceiveTimeoutMs(t), 2000, 10);
+    }
+    {
+        FakeDaemon daemon;
+        daemon.pairUnderTestFor(-1);
+        NvlinkProxyTransport t;
+        ASSERT_TRUE(Access::connectControl(t, daemon.path(), 0));
+        EXPECT_EQ(Access::waitForPairTests(t), O::kSkipped);
+        EXPECT_TRUE(daemon.pairWaits().empty());
+    }
+}
+
+// The connection breaks while waiting: closed like after any lost answer on
+// it (the health thread reconnects and registers again); the registration
+// still succeeds.
+TEST(NvlinkProxyPairWait, LostConnection) {
+    using Access = NvlinkProxyTransportTestAccess;
+    FakeDaemon daemon;
+    daemon.pairWaitAnswer(FakeDaemon::PairWaitAnswer::kHangUp);
+    NvlinkProxyTransport t;
+    ASSERT_TRUE(Access::connectControl(t, daemon.path(), 3000));
+    EXPECT_EQ(Access::waitForPairTests(t), Access::PairWaitOutcome::kLost);
+    EXPECT_EQ(Access::controlReceiveTimeoutMs(t), -1);
+    EXPECT_EQ(Access::pairWaitCounts(t).waits, 0u);
+}
+
+// Host memory is never registered with the daemon: its registration sends
+// no PAIR_WAIT.
+TEST(NvlinkProxyPairWait, HostMemoryDoesNotWait) {
+    FakeDaemon daemon;
+    daemon.pairUnderTestFor(-1);
+    NvlinkProxyTransport *proxy = nullptr;
+    auto engine = busyEngine(daemon, &proxy);
+    ASSERT_NE(proxy, nullptr);
+    EXPECT_TRUE(daemon.pairWaits().empty());
+    EXPECT_EQ(engine->shutdown(), 0);
+    engine.reset();
+    clearEnv();
 }
 #endif

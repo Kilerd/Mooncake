@@ -161,6 +161,24 @@ class NvlinkProxyTransport : public Transport {
     bool ensureControlLocked();
     void closeControlLocked();
     bool registerBlockLocked(Block &block);
+    // registerLocalMemory without the pair wait; *sent: a block was
+    // registered with the daemon by this call.
+    int registerBuffer(void *addr, size_t length, const std::string &location,
+                       bool update_metadata, bool *sent);
+    // After a registration: PAIR_WAIT, so that registration returns only
+    // once the daemon decided the pairs of this engine's GPUs whose P2P
+    // self-test is queued or running (at most
+    // MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS). Never fails the registration.
+    enum class PairWaitOutcome {
+        kSkipped,         // wait of 0, or no daemon connection
+        kNothingPending,  // no such test was queued or running
+        kDecided,         // waited until the tests decided
+        kTimedOut,        // a test still ran after the wait
+        // The daemon predates PAIR_WAIT (asked once per daemon epoch).
+        kUnsupported,
+        kLost,  // the connection broke (closed; the health thread reconnects)
+    };
+    PairWaitOutcome waitForPairTestsLocked();
     // Teardown (shutdown(), destructor); with |release|, RELEASE first
     // (releaseLocked). True when shutdown() may report success.
     bool stop(bool release);
@@ -282,6 +300,10 @@ class NvlinkProxyTransport : public Transport {
     // daemon's P2P self-test (PAIR_UNDER_TEST) before it uses the base
     // transport (MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS; pairTestWaitEnd).
     int pair_test_wait_ms_ = 3000;
+    // How long a registration waits for the daemon's P2P self-test of this
+    // engine's GPU pairs (PAIR_WAIT) once it registered a block
+    // (MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS; 0: not at all).
+    int register_pair_wait_ms_ = 3000;
     int stats_interval_s_ = 60;
     Transport *fallback_ = nullptr;
     std::unique_ptr<BoundedSubmitter> fallback_submitter_;
@@ -301,6 +323,8 @@ class NvlinkProxyTransport : public Transport {
     int control_fd_ = -1;
     // A block of this engine was sent to a daemon (it may map its memory).
     bool ever_registered_ = false;
+    // The daemon epoch that answered PAIR_WAIT as unknown (0: none).
+    uint64_t pair_wait_unsupported_epoch_ = 0;
     // The last daemon this engine lost (epoch and when) after registering:
     // until its copies in flight drained, it may still map that memory.
     uint64_t lost_epoch_ = 0;
@@ -360,6 +384,12 @@ class NvlinkProxyTransport : public Transport {
         // base transport. not_visible: the daemon does not see the GPU.
         std::atomic<uint64_t> register_refusals{0};
         std::atomic<uint64_t> register_refusals_not_visible{0};
+        // Registrations that waited for the daemon's P2P self-test of this
+        // engine's GPU pairs (PAIR_WAIT), their total wait, and those that
+        // went on before it decided.
+        std::atomic<uint64_t> register_pair_waits{0};
+        std::atomic<uint64_t> register_pair_wait_ms{0};
+        std::atomic<uint64_t> register_pair_wait_timeouts{0};
     } counters_;
     std::atomic<int64_t> last_refusal_log_ns_{0};
     std::atomic<uint64_t> suppressed_refusal_logs_{0};

@@ -50,6 +50,12 @@ are worker threads) and plays engines over its socket:
                      test passed or refused (NO_PEER_ACCESS) once it failed;
                      a pair whose test could not run, or that is denied on
                      the command line, gets NO_PEER_ACCESS
+  pair_wait          PAIR_WAIT right after the REGISTER that completes a
+                     pair is answered once the pair's self-test decided
+                     (passed or failed; copies then served at once), or
+                     after its wait with DEADLINE_EXCEEDED; at once with
+                     nothing to wait for (no pair yet, a pair denied on the
+                     command line or whose test could not run, warn mode)
 
 Usage: nvlink_proxy_cpu_test.py <daemon binary> [scenario ...]
 Linux only (POSIX shared memory, /proc/<pid>/maps).
@@ -68,7 +74,7 @@ import time
 
 MAGIC, VERSION = 0x504E434D, 1
 HELLO, REGISTER, UNREGISTER, COPY, PING, STATS, RELEASE = 1, 2, 3, 4, 5, 6, 7
-REGISTER_FD = 8
+REGISTER_FD, PAIR_WAIT = 8, 9
 OK, BAD_REQUEST, UNKNOWN_DEVICE, UNKNOWN_SOURCE = 0, 1, 3, 4
 NO_PEER_ACCESS, CUDA_ERROR, DEADLINE_EXCEEDED = 7, 8, 9
 NOT_CONTROL_CONNECTION, PAIR_UNDER_TEST = 10, 11
@@ -210,6 +216,18 @@ def release(conn, wait_ms):
         dropped, left = struct.unpack("<QQ", body)
         return st, dropped, left, t
     return st, None, None, t
+
+
+def pair_wait(conn, wait_ms, size=8):
+    """PAIR_WAIT: (status, ms waited per the daemon, pairs still under
+    test, pairs refused, seconds)."""
+    t0 = time.monotonic()
+    st, body = conn.rpc(PAIR_WAIT, struct.pack("<II", wait_ms, 0)[:size])
+    t = time.monotonic() - t0
+    if len(body) == 16:
+        waited_us, pending, refused = struct.unpack("<QII", body)
+        return st, waited_us / 1000, pending, refused, t
+    return st, None, None, None, t
 
 
 def copy(path, entries, budget_ms=0, client=0xC0):
@@ -1252,6 +1270,158 @@ def pair_test():
         unlink_segments("nvlp-src", "nvlp-dst")
 
 
+def pair_wait_scenario():
+    print("== pair_wait: registration waits for the self-test of its pairs")
+    d = Daemon([], {"MOCK_SELFTEST_DELAY_MS": "1500"})
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 31)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca = Conn(d.sock, 0xA, True)
+        cb = Conn(d.sock, 0xB, True)
+        assert register(ca, 0x10000000, src, 0)[0] == OK
+        st, waited, pending, refused, t = pair_wait(ca, 3000)
+        check(
+            st == OK and waited == 0 and pending == 0 and t < 0.5,
+            f"first engine (no pair yet): OK at once ({t * 1000:.0f} ms)",
+        )
+        assert register(cb, 0x20000000, dst, 1)[0] == OK
+        # Sent right after the REGISTER that completes the pair was
+        # answered: its test is queued already, so this waits for it (with
+        # --p2p-fallback host after the host-path test of gpu 0, which the
+        # first REGISTER started: two slowed children).
+        st, waited, pending, refused, t = pair_wait(cb, 10000)
+        check(
+            st == OK and pending == 0 and refused == 0 and 1.0 <= t < 8.0,
+            f"second engine: OK once the test passed ({t * 1000:.0f} ms, "
+            f"daemon: {waited:.0f} ms)",
+        )
+        check(
+            d.wait_log("passed -> allowed", 2) and d.wait_log("waited", 2),
+            "the test passed; logged",
+        )
+        st, _, _, _ = copy(d.sock, runs(2, MiB))
+        check(
+            st == OK and dst.m[: 2 * MiB] == src.m[: 2 * MiB],
+            "the first copy after it: OK, byte-exact (no PAIR_UNDER_TEST)",
+        )
+        st, waited, _, _, t = pair_wait(ca, 3000)
+        check(st == OK and waited == 0 and t < 0.5, "decided: OK at once")
+        s = stats(d.sock)
+        check(
+            s["register_pair_waits"] == "1"
+            and int(s["register_pair_wait_ms"]) >= 900
+            and s["register_pair_wait_timeouts"] == "0"
+            and s["pair_test_waits"] == "0",
+            "register_pair_waits=1 register_pair_wait_timeouts=0, no copy held",
+        )
+        st, _, _, _, _ = pair_wait(Conn(d.sock, 0xA, False), 3000)
+        check(st == NOT_CONTROL_CONNECTION, "not on a control connection")
+        st, _, _, _, _ = pair_wait(ca, 3000, size=4)
+        check(st == BAD_REQUEST, "bad PAIR_WAIT size: BAD_REQUEST")
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+    print("== pair_wait: the self-test takes longer than the wait")
+    d = Daemon(["--p2p-fallback", "tcp"], {"MOCK_SELFTEST_DELAY_MS": "1500"})
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 32)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca, cb = pair(d, src, dst)
+        st, waited, pending, _, t = pair_wait(cb, 200)
+        check(
+            st == DEADLINE_EXCEEDED and pending == 1 and 0.18 <= t < 1.0,
+            f"DEADLINE_EXCEEDED after the wait ({t * 1000:.0f} ms), 1 pending",
+        )
+        check(
+            d.wait_log("still queued or running", 2),
+            "logged: still queued or running",
+        )
+        # The first engine's GPU is in the pair too: it waits as well.
+        st, waited, pending, _, t = pair_wait(ca, 3000)
+        check(
+            st == OK and pending == 0 and 0.5 <= t < 3.0,
+            f"the other engine waits until it decided ({t * 1000:.0f} ms)",
+        )
+        s = stats(d.sock)
+        check(
+            s["register_pair_waits"] == "2" and s["register_pair_wait_timeouts"] == "1",
+            "register_pair_waits=2 register_pair_wait_timeouts=1",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+    print("== pair_wait: the self-test fails (--p2p-fallback tcp)")
+    d = Daemon(
+        ["--p2p-fallback", "tcp"],
+        {"MOCK_SELFTEST_DELAY_MS": "1000", "MOCK_P2P": "corrupt"},
+    )
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 33)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca, cb = pair(d, src, dst)
+        st, _, pending, refused, t = pair_wait(cb, 3000)
+        check(
+            st == OK and pending == 0 and refused == 1 and t >= 0.5,
+            f"OK once it failed, 1 pair refused ({t * 1000:.0f} ms)",
+        )
+        st, msg, _, _ = copy(d.sock, runs(1, MiB))
+        check(
+            st == NO_PEER_ACCESS and "self-test failed" in msg,
+            "then NO_PEER_ACCESS at once",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+    print("== pair_wait: nothing to wait for")
+    for args, env, what in (
+        (
+            ["--p2p-fallback", "tcp", "--deny-pair", "10:00,20:00"],
+            {"MOCK_SELFTEST_DELAY_MS": "1500"},
+            "a pair denied on the command line",
+        ),
+        (
+            ["--p2p-selftest", "warn"],
+            {"MOCK_SELFTEST_DELAY_MS": "1500"},
+            "warn mode (copies served meanwhile)",
+        ),
+        (
+            ["--p2p-fallback", "tcp"],
+            {"MOCK_OOM_GPU": "1"},
+            "a test that could not run",
+        ),
+    ):
+        d = Daemon(args, env)
+        try:
+            src = Segment("nvlp-src", 4 * MiB, 34)
+            dst = Segment("nvlp-dst", 4 * MiB)
+            ca, cb = pair(d, src, dst)
+            if "MOCK_OOM_GPU" in env:
+                d.wait_log("tested again in")
+            st, waited, pending, refused, t = pair_wait(cb, 3000)
+            check(
+                st == OK and pending == 0 and waited == 0 and t < 0.5,
+                f"{what}: OK at once ({t * 1000:.0f} ms, refused={refused})",
+            )
+            check(
+                refused == (0 if "warn" in args else 1),
+                f"{what}: refused={refused}",
+            )
+            ca.close()
+            cb.close()
+        finally:
+            d.stop()
+            unlink_segments("nvlp-src", "nvlp-dst")
+
+
 SCENARIOS = {
     "p2p_deadline": p2p_deadline,
     "slow_link": slow_link,
@@ -1265,6 +1435,7 @@ SCENARIOS = {
     "vmm": vmm,
     "gpus": gpus,
     "pair_test": pair_test,
+    "pair_wait": pair_wait_scenario,
 }
 
 

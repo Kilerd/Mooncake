@@ -47,6 +47,17 @@ namespace {
 constexpr const char *kProtocol = "nvlink_proxy";
 constexpr size_t kMaxEntriesPerCopy = 65536;
 constexpr int64_t kFallbackLogIntervalNs = 5LL * 1000 * 1000 * 1000;
+// Send and receive timeout of the control connection.
+constexpr int kControlTimeoutMs = 2000;
+// Upper bound of MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS (the daemon's too).
+constexpr int kMaxRegisterPairWaitMs = 60000;
+
+void setReceiveTimeout(int fd, int timeout_ms) {
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
 
 int64_t nowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -571,6 +582,9 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
     pair_test_wait_ms_ = std::min(
         timeout_ms_,
         std::max(0, envInt("MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS", 3000)));
+    register_pair_wait_ms_ = std::min(
+        kMaxRegisterPairWaitMs,
+        std::max(0, envInt("MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS", 3000)));
     release_wait_ms_ = std::min(
         600000, std::max(0, envInt("MC_NVLINK_PROXY_RELEASE_WAIT_MS", 10000)));
     require_vmm_ = envInt("MC_NVLINK_PROXY_REQUIRE_VMM", 0) != 0;
@@ -607,6 +621,7 @@ int NvlinkProxyTransport::install(std::string &local_server_name,
               << ", timeout_ms=" << timeout_ms_
               << ", reconnect_wait_ms=" << reconnect_wait_ms_
               << ", pair_test_wait_ms=" << pair_test_wait_ms_
+              << ", register_pair_wait_ms=" << register_pair_wait_ms_
               << ", release_wait_ms=" << release_wait_ms_
               << ", vmm=" << (vmm_enabled_ ? 1 : 0) << ", daemon "
               << (connected ? "connected" : "not reachable yet") << ")";
@@ -763,7 +778,7 @@ bool NvlinkProxyTransport::waitForDaemon(int64_t limit_ns) {
 bool NvlinkProxyTransport::ensureControlLocked() {
     if (control_fd_ >= 0) return true;
     if (shut_down_) return false;
-    int fd = connectSocket(2000);
+    int fd = connectSocket(kControlTimeoutMs);
     uint64_t epoch = 0;
     if (fd >= 0 && !hello(fd, true, epoch)) {
         int saved = errno;
@@ -902,6 +917,81 @@ bool NvlinkProxyTransport::registerBlockLocked(Block &block) {
     block.registered_epoch = epoch_.load();
     ever_registered_ = true;
     return true;
+}
+
+// Requires control_mu_.
+NvlinkProxyTransport::PairWaitOutcome
+NvlinkProxyTransport::waitForPairTestsLocked() {
+    const uint64_t epoch = epoch_.load();
+    if (register_pair_wait_ms_ <= 0 || control_fd_ < 0 || epoch == 0)
+        return PairWaitOutcome::kSkipped;
+    // A daemon that does not know PAIR_WAIT is asked once.
+    if (pair_wait_unsupported_epoch_ == epoch)
+        return PairWaitOutcome::kUnsupported;
+    // The daemon answers once the tests decided, at the latest after the
+    // wait: the control connection waits longer than that for the answer.
+    setReceiveTimeout(control_fd_, register_pair_wait_ms_ + kControlTimeoutMs);
+    PairWaitReq req{};
+    req.wait_ms = static_cast<uint32_t>(register_pair_wait_ms_);
+    ProxyStatus st = ProxyStatus::kOk;
+    std::string reply;
+    const int64_t t0 = nowNs();
+    const bool answered =
+        rpc(control_fd_, MsgType::kPairWait, &req, sizeof(req), st, reply);
+    const int err = errno;
+    const int64_t ms = (nowNs() - t0) / 1000000;
+    if (!answered) {
+        LOG(WARNING) << "nvlink_proxy: lost daemon connection while waiting "
+                        "for the P2P self-test of this engine's GPU pairs: "
+                     << strerror(err);
+        closeControlLocked();
+        return PairWaitOutcome::kLost;
+    }
+    setReceiveTimeout(control_fd_, kControlTimeoutMs);
+    last_answer_ns_ = nowNs();
+    PairWaitResp resp{};
+    const bool sized = reply.size() == sizeof(resp);
+    if (sized) memcpy(&resp, reply.data(), sizeof(resp));
+    if (!sized ||
+        (st != ProxyStatus::kOk && st != ProxyStatus::kDeadlineExceeded)) {
+        // Typically BAD_REQUEST from a daemon that predates PAIR_WAIT: not
+        // an error, the hold of PAIR_UNDER_TEST copies remains.
+        pair_wait_unsupported_epoch_ = epoch;
+        LOG(INFO) << "nvlink_proxy: the daemon does not answer PAIR_WAIT ("
+                  << proxyStatusName(st) << (sized ? "" : " " + reply)
+                  << "; older than this engine): registrations do not wait "
+                     "for its P2P self-tests, copies between GPUs whose pair "
+                     "is still under test are sent again instead "
+                     "(MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS)";
+        return PairWaitOutcome::kUnsupported;
+    }
+    if (st == ProxyStatus::kOk && resp.waited_us == 0)
+        return PairWaitOutcome::kNothingPending;
+    // Once per registration that found a test of its pairs queued or
+    // running (a restored or new unit): not rate-limited.
+    counters_.register_pair_waits++;
+    counters_.register_pair_wait_ms += static_cast<uint64_t>(ms);
+    if (st == ProxyStatus::kOk) {
+        LOG(INFO) << "nvlink_proxy: registration waited " << ms
+                  << " ms for the daemon's P2P self-test of this engine's GPU "
+                     "pairs: decided"
+                  << (resp.refused
+                          ? ", " + std::to_string(resp.refused) +
+                                " pair(s) refused for P2P (host-staged where "
+                                "verified, else the base transport)"
+                          : std::string());
+        return PairWaitOutcome::kDecided;
+    }
+    counters_.register_pair_wait_timeouts++;
+    LOG(WARNING) << "nvlink_proxy: the daemon's P2P self-test of "
+                 << resp.pending
+                 << " GPU pair(s) of this engine did not decide within "
+                    "MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS="
+                 << register_pair_wait_ms_ << " (" << ms
+                 << " ms); registration goes on, copies between those GPUs "
+                    "are sent again until it decided "
+                    "(MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS)";
+    return PairWaitOutcome::kTimedOut;
 }
 
 bool NvlinkProxyTransport::acquireCopyConnection(Connection &conn) {
@@ -1096,7 +1186,7 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
             if (epoch && kv.second.registered_epoch == epoch) ++registered;
     }
     const uint64_t batches = counters_.proxy_batches.load();
-    char line[1280];
+    char line[1536];
     snprintf(
         line, sizeof(line),
         "healthy=%d proxied_requests=%" PRIu64 " proxied_bytes=%" PRIu64
@@ -1108,7 +1198,8 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
         ") fallback_retries=%" PRIu64 " failed_requests=%" PRIu64
         " remote_node_requests=%" PRIu64
         " registered_blocks=%zu/%zu register_refusals=%" PRIu64
-        " (not_visible=%" PRIu64 ") connects=%" PRIu64,
+        " (not_visible=%" PRIu64 ") register_pair_waits=%" PRIu64
+        " (wait_ms=%" PRIu64 " timeouts=%" PRIu64 ") connects=%" PRIu64,
         healthy_.load() ? 1 : 0, counters_.proxy_requests.load(),
         counters_.proxy_bytes.load(), batches,
         batches ? counters_.proxy_us_total.load() / batches : 0,
@@ -1121,6 +1212,9 @@ void NvlinkProxyTransport::maybeLogStats(bool force) {
         counters_.failed_requests.load(), counters_.remote_node_requests.load(),
         registered, blocks, counters_.register_refusals.load(),
         counters_.register_refusals_not_visible.load(),
+        counters_.register_pair_waits.load(),
+        counters_.register_pair_wait_ms.load(),
+        counters_.register_pair_wait_timeouts.load(),
         counters_.reconnects.load());
     if (!force && last_stats_ == line) return;  // nothing changed
     last_stats_ = line;
@@ -1708,11 +1802,33 @@ Status NvlinkProxyTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 // ----------------------------------------------------------- registration
 
+// A restored or new unit is reported ready once its engines' registrations
+// returned, and gets traffic right away. The registration that completes a
+// GPU pair -- an engine's first block on the second GPU -- makes the daemon
+// queue the pair's P2P self-test (about a second) before it answers; until
+// the test decided, in enforce mode, copies between the pair's GPUs are
+// answered PAIR_UNDER_TEST and wait in the request path. So a registration
+// that sent a block waits for those tests (waitForPairTestsLocked) and the
+// first requests find the pair decided.
 int NvlinkProxyTransport::registerLocalMemory(void *addr, size_t length,
                                               const std::string &location,
                                               bool remote_accessible,
                                               bool update_metadata) {
     (void)remote_accessible;
+    bool sent = false;
+    const int rc =
+        registerBuffer(addr, length, location, update_metadata, &sent);
+    if (rc == 0 && sent) {
+        std::lock_guard<std::mutex> lock(control_mu_);
+        waitForPairTestsLocked();
+    }
+    return rc;
+}
+
+int NvlinkProxyTransport::registerBuffer(void *addr, size_t length,
+                                         const std::string &location,
+                                         bool update_metadata, bool *sent) {
+    *sent = false;
     // Host memory stays on the base transport only; that is not an error.
     cudaPointerAttributes attr;
     cudaError_t err = cudaPointerGetAttributes(&attr, addr);
@@ -1776,10 +1892,10 @@ int NvlinkProxyTransport::registerLocalMemory(void *addr, size_t length,
         it->second.users++;
         buffers_[desc.addr] = fresh.base;
         if (need_register && control_fd_ >= 0) {
-            registerBlockLocked(it->second);
+            *sent = registerBlockLocked(it->second);
         }
     }
-    if (control_fd_ < 0) ensureControlLocked();  // registers all blocks
+    if (control_fd_ < 0) *sent = ensureControlLocked();  // registers all blocks
     return 0;
 }
 
@@ -1815,10 +1931,18 @@ int NvlinkProxyTransport::unregisterLocalMemory(void *addr,
 
 int NvlinkProxyTransport::registerLocalMemoryBatch(
     const std::vector<BufferEntry> &buffer_list, const std::string &location) {
+    bool any_sent = false;
     for (auto &buffer : buffer_list) {
-        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
-                                      true, false);
+        bool sent = false;
+        int ret =
+            registerBuffer(buffer.addr, buffer.length, location, false, &sent);
         if (ret) return ret;
+        any_sent |= sent;
+    }
+    // Once for the whole batch (see registerLocalMemory).
+    if (any_sent) {
+        std::lock_guard<std::mutex> lock(control_mu_);
+        waitForPairTestsLocked();
     }
     return metadata_->updateLocalSegmentDesc();
 }

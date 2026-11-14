@@ -24,6 +24,8 @@
 // moving the request to their base transport (RDMA / TCP); one between the
 // GPUs of a pair whose self-test is queued or running gets kPairUnderTest,
 // and the engines send it again until the test decided (refusalStatus).
+// An engine that just registered waits for those tests of its GPUs' pairs
+// with PAIR_WAIT (countPairs) before it reports ready.
 //
 // Everything in this header is host-only, without CUDA, so that it can be
 // unit-tested without GPUs.
@@ -286,6 +288,38 @@ class PeerPolicy {
 inline ProxyStatus refusalStatus(PeerPolicy::Reason reason) {
     return reason == PeerPolicy::kTestPending ? ProxyStatus::kPairUnderTest
                                               : ProxyStatus::kNoPeerAccess;
+}
+
+// The GPU pairs a PAIR_WAIT answers for: one GPU among |mine| (where the
+// asking engine registered blocks) and the other among |used| (where any
+// engine did), each pair counted once; vectors indexed by ordinal.
+struct PairCounts {
+    size_t pending = 0;  // self-test queued or running: waited for
+    size_t refused = 0;  // refused for P2P for any other reason
+};
+
+inline PairCounts countPairs(const PeerPolicy &policy,
+                             const std::vector<bool> &mine,
+                             const std::vector<bool> &used) {
+    auto in = [](const std::vector<bool> &v, int i) {
+        return i < static_cast<int>(v.size()) && v[i];
+    };
+    PairCounts n;
+    const int devices = policy.numDevices();
+    for (int a = 0; a < devices; ++a) {
+        for (int b = a + 1; b < devices; ++b) {
+            if (!(in(mine, a) && in(used, b)) && !(in(mine, b) && in(used, a)))
+                continue;
+            const PeerPolicy::Reason ab = policy.reason(a, b),
+                                     ba = policy.reason(b, a);
+            if (ab == PeerPolicy::kTestPending ||
+                ba == PeerPolicy::kTestPending)
+                ++n.pending;
+            else if (ab != PeerPolicy::kAllowed || ba != PeerPolicy::kAllowed)
+                ++n.refused;
+        }
+    }
+    return n;
 }
 
 // --------------------------------------------------------- self-test plan
