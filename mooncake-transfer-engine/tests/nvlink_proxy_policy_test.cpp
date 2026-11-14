@@ -103,6 +103,105 @@ TEST(NvlinkProxyPolicy, DenyMatrix) {
     EXPECT_EQ(q.numDevices(), 3);
 }
 
+// What a copy between the GPUs of a refused pair is told: PAIR_UNDER_TEST
+// only while the pair's self-test is queued or running, NO_PEER_ACCESS for
+// every other refusal (also an untested pair with no test coming).
+TEST(NvlinkProxyPolicy, RefusalStatus) {
+    EXPECT_EQ(refusalStatus(PeerPolicy::kTestPending),
+              ProxyStatus::kPairUnderTest);
+    for (PeerPolicy::Reason r :
+         {PeerPolicy::kUntested, PeerPolicy::kSelfTestFailed,
+          PeerPolicy::kStatic}) {
+        EXPECT_EQ(refusalStatus(r), ProxyStatus::kNoPeerAccess) << int(r);
+    }
+    EXPECT_STREQ(proxyStatusName(ProxyStatus::kPairUnderTest),
+                 "PAIR_UNDER_TEST");
+    EXPECT_EQ(static_cast<uint32_t>(ProxyStatus::kPairUnderTest), 11u);
+
+    // The states a pair goes through in enforce mode (SelfTester).
+    PeerPolicy p(3);
+    p.setPair(0, 1, PeerPolicy::kTestPending);  // queued
+    EXPECT_TRUE(p.denied(0, 1));
+    EXPECT_TRUE(p.denied(1, 0));
+    EXPECT_EQ(refusalStatus(p.reason(1, 0)), ProxyStatus::kPairUnderTest);
+    EXPECT_STRNE(PeerPolicy::reasonName(p.reason(0, 1)), "?");
+    EXPECT_EQ(p.deniedCount(), 2u);
+    // The test could not run: no test is coming until a retry is queued.
+    p.setPair(0, 1, PeerPolicy::kUntested);
+    EXPECT_EQ(refusalStatus(p.reason(0, 1)), ProxyStatus::kNoPeerAccess);
+    p.setPair(0, 1, PeerPolicy::kTestPending);  // the retry
+    EXPECT_EQ(refusalStatus(p.reason(0, 1)), ProxyStatus::kPairUnderTest);
+    p.setPair(0, 1, PeerPolicy::kAllowed);  // passed
+    EXPECT_FALSE(p.denied(0, 1));
+    EXPECT_FALSE(p.denied(1, 0));
+    p.setPair(0, 2, PeerPolicy::kTestPending);
+    p.setPair(0, 2, PeerPolicy::kSelfTestFailed);  // failed
+    EXPECT_EQ(refusalStatus(p.reason(2, 0)), ProxyStatus::kNoPeerAccess);
+    // A pair denied on the command line is never "under test".
+    p.denyPair(1, 2, PeerPolicy::kStatic);
+    p.setPair(1, 2, PeerPolicy::kTestPending);
+    EXPECT_EQ(p.reason(1, 2), PeerPolicy::kStatic);
+    EXPECT_EQ(refusalStatus(p.reason(2, 1)), ProxyStatus::kNoPeerAccess);
+}
+
+// What PAIR_WAIT waits for: the pairs of the asking engine's GPUs with the
+// GPUs engines use whose self-test is queued or running; every other
+// refused pair of them is counted as refused, each pair once.
+TEST(NvlinkProxyPolicy, PairWaitCounts) {
+    PeerPolicy p(4);
+    const std::vector<bool> none(4, false), all(4, true);
+    std::vector<bool> gpu0 = none, gpu1 = none, gpus01 = none;
+    gpu0[0] = true;
+    gpu1[1] = true;
+    gpus01[0] = gpus01[1] = true;
+    // Nothing tested, nothing refused (the state before any registration).
+    PairCounts n = countPairs(p, gpu0, all);
+    EXPECT_EQ(n.pending, 0u);
+    EXPECT_EQ(n.refused, 0u);
+    EXPECT_EQ(static_cast<uint16_t>(MsgType::kPairWait), 9u);
+
+    // The second engine registered: the test of pair (0, 1) is queued.
+    p.setPair(0, 1, PeerPolicy::kTestPending);
+    for (const auto *mine : {&gpu0, &gpu1, &gpus01}) {
+        n = countPairs(p, *mine, gpus01);
+        EXPECT_EQ(n.pending, 1u);  // once, not per direction or GPU
+        EXPECT_EQ(n.refused, 0u);
+    }
+    // An engine on GPU 2 does not wait for it; an engine that registered
+    // nothing neither.
+    std::vector<bool> gpu2 = none;
+    gpu2[2] = true;
+    EXPECT_EQ(countPairs(p, gpu2, all).pending, 0u);
+    EXPECT_EQ(countPairs(p, none, all).pending, 0u);
+    // Only pairs with GPUs engines use count: GPU 3 has none.
+    p.setPair(0, 3, PeerPolicy::kTestPending);
+    EXPECT_EQ(countPairs(p, gpu0, gpus01).pending, 1u);
+    EXPECT_EQ(countPairs(p, gpu0, all).pending, 2u);
+    p.setPair(0, 3, PeerPolicy::kAllowed);
+
+    // Decided: passed, failed, or not run (no test coming).
+    p.setPair(0, 1, PeerPolicy::kAllowed);
+    n = countPairs(p, gpu1, all);
+    EXPECT_EQ(n.pending, 0u);
+    EXPECT_EQ(n.refused, 0u);
+    for (PeerPolicy::Reason r :
+         {PeerPolicy::kSelfTestFailed, PeerPolicy::kUntested}) {
+        p.setPair(0, 1, r);
+        n = countPairs(p, gpu1, all);
+        EXPECT_EQ(n.pending, 0u) << int(r);
+        EXPECT_EQ(n.refused, 1u) << int(r);
+    }
+    // A pair denied on the command line is refused, never waited for.
+    p.denyPair(1, 2, PeerPolicy::kStatic);
+    p.setPair(1, 2, PeerPolicy::kTestPending);
+    n = countPairs(p, gpu1, all);
+    EXPECT_EQ(n.pending, 0u);
+    EXPECT_EQ(n.refused, 2u);
+    // Short or empty vectors: GPUs beyond them are not the engine's / used.
+    EXPECT_EQ(countPairs(p, {}, all).refused, 0u);
+    EXPECT_EQ(countPairs(p, gpu1, {}).refused, 0u);
+}
+
 namespace {
 void checkPlan(const std::vector<TestCopy> &plan, uint64_t buf, bool large,
                uint64_t threshold) {

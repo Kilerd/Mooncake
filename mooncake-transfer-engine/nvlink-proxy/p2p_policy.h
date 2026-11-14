@@ -21,7 +21,11 @@
 // both GPUs of a pair before it serves copies between them (the P2P
 // self-test) and denies a pair that fails. A copy between the GPUs of a
 // denied pair is refused with kNoPeerAccess, which the engines answer by
-// moving the request to their base transport (RDMA / TCP).
+// moving the request to their base transport (RDMA / TCP); one between the
+// GPUs of a pair whose self-test is queued or running gets kPairUnderTest,
+// and the engines send it again until the test decided (refusalStatus).
+// An engine that just registered waits for those tests of its GPUs' pairs
+// with PAIR_WAIT (countPairs) before it reports ready.
 //
 // Everything in this header is host-only, without CUDA, so that it can be
 // unit-tested without GPUs.
@@ -39,6 +43,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "transport/nvlink_proxy_transport/nvlink_proxy_protocol.h"
 
 namespace mooncake {
 namespace nvlink_proxy {
@@ -166,6 +172,9 @@ class PeerPolicy {
         kStatic = 1,          // --deny-peer / --deny-pair
         kSelfTestFailed = 2,  // the self-test read back corrupt data
         kUntested = 3,        // not (yet) verified by a self-test (enforce)
+        // Not verified yet, and a self-test of the pair is queued or running
+        // (enforce): it decides the pair soon.
+        kTestPending = 4,
     };
 
     explicit PeerPolicy(int num_devices = 0) { reset(num_devices); }
@@ -253,6 +262,9 @@ class PeerPolicy {
                 return "P2P self-test failed";
             case kUntested:
                 return "not verified by the P2P self-test (yet)";
+            case kTestPending:
+                return "not verified yet, its P2P self-test is queued or "
+                       "running";
         }
         return "?";
     }
@@ -266,6 +278,49 @@ class PeerPolicy {
     int n_ = 0;
     std::unique_ptr<std::atomic<uint8_t>[]> m_;
 };
+
+// The answer to a copy between the GPUs of a pair refused for |reason| that
+// the daemon does not host-stage. Only a pair whose self-test is queued or
+// running is decided soon: its copies are worth sending again
+// (kPairUnderTest). Any other refusal stays until a later test or a daemon
+// restart, and the engine moves the copy to its base transport
+// (kNoPeerAccess).
+inline ProxyStatus refusalStatus(PeerPolicy::Reason reason) {
+    return reason == PeerPolicy::kTestPending ? ProxyStatus::kPairUnderTest
+                                              : ProxyStatus::kNoPeerAccess;
+}
+
+// The GPU pairs a PAIR_WAIT answers for: one GPU among |mine| (where the
+// asking engine registered blocks) and the other among |used| (where any
+// engine did), each pair counted once; vectors indexed by ordinal.
+struct PairCounts {
+    size_t pending = 0;  // self-test queued or running: waited for
+    size_t refused = 0;  // refused for P2P for any other reason
+};
+
+inline PairCounts countPairs(const PeerPolicy &policy,
+                             const std::vector<bool> &mine,
+                             const std::vector<bool> &used) {
+    auto in = [](const std::vector<bool> &v, int i) {
+        return i < static_cast<int>(v.size()) && v[i];
+    };
+    PairCounts n;
+    const int devices = policy.numDevices();
+    for (int a = 0; a < devices; ++a) {
+        for (int b = a + 1; b < devices; ++b) {
+            if (!(in(mine, a) && in(used, b)) && !(in(mine, b) && in(used, a)))
+                continue;
+            const PeerPolicy::Reason ab = policy.reason(a, b),
+                                     ba = policy.reason(b, a);
+            if (ab == PeerPolicy::kTestPending ||
+                ba == PeerPolicy::kTestPending)
+                ++n.pending;
+            else if (ab != PeerPolicy::kAllowed || ba != PeerPolicy::kAllowed)
+                ++n.refused;
+        }
+    }
+    return n;
+}
 
 // --------------------------------------------------------- self-test plan
 constexpr uint64_t kSelfTestRowBytes = 2048;  // a typical KV page row

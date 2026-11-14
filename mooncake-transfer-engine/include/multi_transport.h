@@ -88,6 +88,11 @@ class MultiTransport {
 
     Transport *getTransport(const std::string &proto);
 
+    // Shuts every transport down (Transport::shutdown) and destroys it,
+    // nvlink_proxy first. 0, or -1 when a transport could not confirm its
+    // shutdown.
+    int shutdown();
+
     /**
      * @brief Check if TCP is the only installed transport.
      *

@@ -95,6 +95,45 @@ Initializes the transfer engine with extended configuration including metadata t
 **Returns:**
 - `int`: 0 on success, negative value on failure
 
+#### shutdown()
+
+```python
+shutdown()
+```
+
+Tears the engine down for a process that keeps running, for example one that
+is checkpointed next and restored elsewhere (see
+[NVLink Proxy Transport](../../design/transfer-engine/nvlink-proxy.md#shutdown-and-process-snapshots)):
+
+1. waits for the calls of other threads that are in flight; every later call,
+   `initialize()` included, raises `RuntimeError`;
+2. cancels the batches the engine still knows (not freed yet, or kept by
+   failed synchronous calls) and waits for them to quiesce, at most
+   `MC_TRANSFER_QUIESCE_WAIT_MS`, freeing them;
+3. shuts every transport down: the `nvlink_proxy` transport first asks the
+   copy daemon to drop this engine's registrations and waits until the daemon
+   holds no IPC mapping of its memory, then every connection, listener,
+   thread and epoll / eventfd descriptor of the engine is closed.
+
+Transfers queued on CUDA streams (`*_on_cuda`) must have run: `shutdown()`
+waits for them as long as `MC_TRANSFER_QUIESCE_WAIT_MS` and raises
+`RuntimeError` (without shutting down) if some have not. It also raises,
+changing nothing, while an engine returned by `get_engine()` is still
+referenced (e.g. by a Store); a pointer from `get_engine_ptr()` is invalid
+afterwards. Managed buffers stay allocated until the object is destroyed.
+
+To transfer again, create a new `TransferEngine` and initialize it. The new
+engine reads `MC_NODE_ID` / `NODE_NAME` and its transports' variables again,
+queries the GPU of the memory it registers and draws new identities (client
+id, request ids); see the design document for what stays per process.
+
+`shutdown()` is idempotent: later calls return the result of the first one.
+
+**Returns:**
+- `int`: 0 when everything was confirmed; -1 when the engine is shut down but
+  a batch did not quiesce (its writes may still land) or the copy daemon did
+  not confirm that it closed its mappings of this engine's memory (logged)
+
 ### Engine Information
 
 #### get_engine()

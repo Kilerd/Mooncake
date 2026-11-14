@@ -381,6 +381,21 @@ int freeEngine();
 
 Releases resources early without waiting for destruction.
 
+#### TransferEngine::shutdown
+
+```cpp
+int shutdown();
+```
+
+Tears the engine down now, for a process that keeps running (e.g. one that is
+checkpointed next): every transport closes its connections, listeners and
+threads -- `nvlink_proxy` first, once the copy daemon confirmed that it holds
+no IPC mapping of this engine's memory -- then the metadata service stops.
+Transfers must be finished. The engine is unusable afterwards, as after
+`freeEngine()`; create a new one to transfer again. Idempotent. Returns 0, or
+-1 when a part of that could not be confirmed (logged). The Python binding's
+`TransferEngine.shutdown()` also settles the batches it still knows first.
+
 ## Advanced APIs
 These APIs are optional; use them when you need manual transport control, coordination notifications, metadata/cache refresh, topology discovery, or debugging. They are not required for the basic data path.
 

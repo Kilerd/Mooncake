@@ -80,10 +80,16 @@ the wheel with the console entry point `mooncake_nvlink_proxy`. The workflow
    | `MC_NODE_ID` | Locality key, published in the segment metadata. Default: `NODE_NAME`, else the hostname. In Kubernetes set `NODE_NAME` from `spec.nodeName`; pod hostnames differ, so without it the proxy is never used. |
    | `MC_NVLINK_PROXY_TIMEOUT_MS` | Request budget (default 30000): upper bound for one daemon round trip and for completing a request on the base transport after a fallback. The daemon refuses to start a copy after half of it. |
    | `MC_NVLINK_PROXY_RECONNECT_WAIT_MS` | How long same-node requests wait for an unavailable daemon before they use the base transport (default: half of the request budget). |
+   | `MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS` | How long a request is sent again while the daemon's P2P self-test of its GPU pair is queued or running (`PAIR_UNDER_TEST`) before it uses the base transport (default 3000; never more than half of the time the request has, see [Routing and fallback](#routing-and-fallback); 0: at once, as before). |
+   | `MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS` | How long a registration that sent a block to the daemon waits for the daemon's P2P self-test of the engine's GPU pairs while it is queued or running (`PAIR_WAIT`), so that the engine reports ready with its pairs decided (default 3000, at most 60000; 0: no wait, as before; see [Routing and fallback](#routing-and-fallback)). |
    | `MC_NVLINK_PROXY_FALLBACK_INFLIGHT` | Maximum requests the proxy has in flight on the base transport at a time, across all threads (default 512; with TCP at most half of `MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER`). |
    | `MC_NVLINK_PROXY_STATS_INTERVAL` | Seconds between counter log lines (default 60, 0 = off). |
+   | `MC_NVLINK_PROXY_RELEASE_WAIT_MS` | How long `shutdown()` waits for the daemon to close its mappings of the engine's memory (default 10000). |
+   | `MC_NVLINK_PROXY_VMM` | `1`: also register virtual memory management memory, exported as POSIX file descriptors (default 0, see [Virtual memory management memory](#virtual-memory-management-memory)). |
+   | `MC_NVLINK_PROXY_REQUIRE_VMM` | `1`: device memory must be virtual memory management memory the daemon can import; registering other device memory (`cudaMalloc` blocks, allocations without the POSIX file descriptor handle type) fails, and nothing is exported with `cudaIpcGetMemHandle`. Implies `MC_NVLINK_PROXY_VMM=1`. For processes that are checkpointed (see [Shutdown and process snapshots](#shutdown-and-process-snapshots)). Default 0. |
 
-   The Python API is unchanged.
+   The Python API is unchanged, apart from `TransferEngine.shutdown()` (see
+   [Shutdown and process snapshots](#shutdown-and-process-snapshots)).
 
 ## Batches of many small copies
 
@@ -113,9 +119,18 @@ together with the exact address range in which that set is unchanged.
 
 - Device memory is published under both `nvlink_proxy` and the base transport;
   host memory only under the base transport (`register_memory` returns 0).
-  Device memory that cannot be exported with `cudaIpcGetMemHandle` (for
-  example virtual-memory-management allocations) also stays on the base
-  transport.
+  Virtual memory management allocations are recognized first
+  (`cuMemRetainAllocationHandle`) and never exported with
+  `cudaIpcGetMemHandle`: they are registered by file descriptor
+  (`MC_NVLINK_PROXY_VMM=1`, see
+  [Virtual memory management memory](#virtual-memory-management-memory)) or
+  stay on the base transport. Other device memory that cannot be exported
+  with `cudaIpcGetMemHandle` stays on the base transport too; the engine
+  logs why. With `MC_NVLINK_PROXY_REQUIRE_VMM=1` such memory, and
+  `cudaMalloc` memory, is refused instead (`register_memory` fails).
+- A buffer is looked up and exported with its GPU's primary context
+  current (then the caller's context is current again), so one thread may
+  register buffers of several GPUs whatever device it has selected.
 - A request uses `nvlink_proxy` when the target buffer was published with the
   same `MC_NODE_ID`, the local buffer is registered with the daemon and the
   daemon is healthy. Otherwise it uses the base transport.
@@ -128,6 +143,50 @@ together with the exact address range in which that set is unchanged.
 - Right after a daemon (re)start the peer may not have re-registered yet: a
   COPY that names a block unknown to a daemon this engine connected to within
   the reconnect window is retried with backoff instead of falling back.
+- A COPY between two GPUs whose P2P self-test is queued or running (enforce
+  mode; typically the first second after both engines registered, e.g. a
+  unit restored from a snapshot) is answered `PAIR_UNDER_TEST` before
+  anything of it is issued. The engine sends it again every 10-50 ms until
+  the test decided -- then it is served, or refused with `NO_PEER_ACCESS`
+  and moved to the base transport -- for at most
+  `MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS` (default 3 s) and at most half of the
+  time the request has (its budget, or its batch deadline when that is
+  earlier), so the other half remains for the base transport if the test
+  takes longer. Such requests count as held and retried; those that still
+  use the base transport count under `fallback_requests` / `pair_test`. A
+  request waits only while its submitting thread does (`submitTransfer`
+  returns after it). Engines that predate `PAIR_UNDER_TEST` take it as a
+  failed copy and use the base transport at once; older daemons never send
+  it.
+- That hold is a safety net: such a wait belongs to start-up, not to the
+  first requests. A unit is typically reported ready (and given traffic)
+  as soon as its engines' `register_memory` / `batch_register_memory`
+  calls returned, a moment after the second engine registered -- before
+  the test of the pair that registration completed decided. So a
+  registration call that sent a block to the daemon then sends `PAIR_WAIT`
+  on its control connection (once per call, also for a batch) and returns
+  only once no P2P self-test of a pair of the engine's GPUs with the GPUs
+  that engines registered on is queued or running, at most
+  `MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS` (default 3 s; 0: no wait). The
+  daemon queues a pair's test (`kTestPending`) while it handles the
+  `REGISTER` that completes the pair -- an engine's first block on the
+  second GPU -- before it answers it, so the `PAIR_WAIT` that follows
+  finds it: the engine that registers second waits for the test (typically
+  0.5-1 s), the one that registered first does not wait (its pairs had no
+  test yet). The daemon answers on the connection's own thread, as for
+  `RELEASE`; every other connection is served meanwhile. A test still
+  running after the wait: the registration logs a warning and succeeds
+  anyway, and the copies are held as above until it decided. Nothing to
+  wait for -- no pair under test, a pair denied on the command line or
+  whose test could not run, `--p2p-selftest=warn` or `off`, host memory, a
+  block registered already -- costs one round trip or none. A daemon that
+  predates `PAIR_WAIT` answers `BAD_REQUEST`: the engine logs it once per
+  daemon start and does not wait; older engines never send it. The wait
+  only delays readiness when the daemon is reachable at registration: an
+  engine that registers while its daemon is not up yet registers later
+  from its health thread, without waiting. Logged by the engine
+  (`registration waited N ms ...`) and the daemon, counted under
+  `register_pair_waits` on both sides (see [Counters](#counters)).
 - Requests that still need the base transport (daemon away for longer than the
   window, or a non-retryable error such as a CUDA error) are moved there with
   backpressure: at most `MC_NVLINK_PROXY_FALLBACK_INFLIGHT` requests in flight,
@@ -153,7 +212,8 @@ together with the exact address range in which that set is unchanged.
   both published in the segment metadata, so peers' cached metadata stays
   valid across daemon restarts.
 - The daemon drops an engine's registrations when its control connection
-  closes (the engine exited or its container restarted) and closes every
+  closes (the engine exited or its container restarted), or when the engine
+  sends `RELEASE` (`shutdown()`), and closes every
   IPC mapping it had opened of that engine's memory, in every GPU context:
   at once, or when the last copy in flight that uses one finishes (bounded
   by the copy's deadline). An open mapping would keep the exporting
@@ -240,7 +300,13 @@ pair before it serves copies between them.
   are never touched -- recommended in production.
 - `--p2p-selftest=enforce` (default): a pair is refused from the moment it is
   requested until its test passes, for good if it failed; while it is
-  untested it stays refused. `warn` only logs; `off` skips the test.
+  untested it stays refused. While its test is queued or running its copies
+  are answered `PAIR_UNDER_TEST` (engines send them again) and a
+  `PAIR_WAIT` of an engine on one of its GPUs is answered once it decided
+  (engines send it after registering, see
+  [Routing and fallback](#routing-and-fallback)); after a test that could
+  not run, until the next one starts, `NO_PEER_ACCESS`. `warn` only logs;
+  `off` skips the test.
 - `--deny-peer <bus id>` (repeatable) denies every pair with that GPU and
   `--deny-pair <bus id>,<bus id>` one pair, without testing. Bus ids not
   present on the node are ignored with a warning.
@@ -256,7 +322,9 @@ command line) or of a pair without peer access -- depends on
 - `tcp`, or a pair not (yet) verified for host staging: the copy is refused
   with `kNoPeerAccess` while its entries are resolved, before anything is
   merged or mapped, and the engine moves the request to its base transport
-  (counted under `fallback_requests` / `daemon_error`).
+  (counted under `fallback_requests` / `daemon_error`) -- or, while the
+  pair's self-test is queued or running, with `kPairUnderTest`, and the
+  engine sends it again.
 
 A copy within one GPU is never refused. With `--p2p-selftest=off` nothing is
 verified, so refused pairs and pairs without peer access use TCP.
@@ -361,6 +429,109 @@ P2P self-test gpu 2 (0000:5e:00) <-> gpu 3 (0000:b1:00): FAILED -> P2P denied ->
 followed by a summary per batch and, when every pair tested so far failed,
 `P2P unusable on this node: N/N GPU pairs tested so far failed the self-test`.
 
+## Virtual memory management memory
+
+Memory allocated with `cuMemCreate` and mapped with `cuMemMap` -- for example
+a KV cache whose physical memory an engine releases and creates again at the
+same addresses -- has no legacy IPC handle. With `MC_NVLINK_PROXY_VMM=1` the
+engine registers such a block with `REGISTER_FD` instead: it exports the
+allocation with `cuMemExportToShareableHandle(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)`
+and passes the descriptor over the control connection (`SCM_RIGHTS`); the
+daemon imports it (`cuMemImportFromShareableHandle`), maps it once in its
+address space when a copy first needs it and grants each GPU that copies
+from or to it access (`cuMemSetAccess`). The descriptor is exported again at
+every registration (also after a daemon restart) and closed right after
+sending, so the engine keeps none open. Copies, deadlines, host staging and
+quiescence work as for `cudaMalloc` blocks.
+
+The allocator must:
+
+1. create the allocation with `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR` in
+   `CUmemAllocationProp::requestedHandleTypes` (it may be combined with
+   other types, e.g. `CU_MEM_HANDLE_TYPE_FABRIC`);
+2. map whole allocations: the block of a registered buffer
+   (`cuMemGetAddressRange`) must be one mapping of one allocation, which the
+   daemon maps from offset 0 (`cuMemMap` maps from offset 0 only). A buffer
+   whose range spans two allocations is refused and stays on the base
+   transport, as is memory without the POSIX file descriptor handle type;
+   the engine logs why;
+3. keep the memory mapped while it is registered. To release it, call
+   `TransferEngine.shutdown()` first (the daemon then has released its
+   import, see below), then `cuMemUnmap` / `cuMemRelease`; after creating
+   new memory, register it with a new engine (a new allocation is told apart
+   from the old one by its `CU_POINTER_ATTRIBUTE_BUFFER_ID`).
+
+The daemon must see the allocation's GPU, as for `cudaMalloc` blocks.
+A daemon older than `REGISTER_FD`, or one whose driver lacks virtual memory
+management, refuses the block (`register_refusals`) and its transfers use
+the base transport. The daemon resolves the driver calls through
+`cudaGetDriverEntryPointByVersion` and reports the allocations it holds as
+`vmm_imports`. The option is off by default until it has been validated on
+the target GPUs and drivers.
+
+## Shutdown and process snapshots
+
+An engine process can be checkpointed (CRIU with `cuda-checkpoint`) and
+restored, possibly several times from one snapshot, on another node and
+GPU. Its engine must not be part of the snapshot: connections to the daemon
+and to peers, listeners, threads and the daemon's IPC mappings of its
+memory cannot be carried over. The process shuts its engine down before the
+checkpoint and creates a new one after the restore:
+
+1. `TransferEngine.shutdown()` (C++ `TransferEngine::shutdown()`): the
+   binding waits for calls in flight and settles its batches, then every
+   transport is shut down, `nvlink_proxy` first. It stops its health thread
+   and sends `RELEASE` on its control connection (on one opened for it when
+   that connection was lost): the daemon drops the engine's registrations
+   and answers once none of them is alive any more -- at once, or when the
+   copies in flight that use one (and may still map it) finished, at most
+   `MC_NVLINK_PROXY_RELEASE_WAIT_MS` -- so that no mapping or import of the
+   engine's memory is left. Then every connection to the daemon is
+   closed, and the base transport (TCP) closes its acceptor, lanes, server
+   sessions and io threads; last the metadata service closes its handshake
+   listener (woken at once, not at its next receive timeout). When it
+   returns, the process holds no socket, epoll / eventfd descriptor or
+   thread of the engine, and no other process imports its memory.
+   `shutdown()` returns -1 (and logs why) when that was not confirmed: the
+   daemon kept a mapping past the wait, cannot be reached although it
+   listens, or predates `RELEASE` (it then closes the mappings only after
+   the disconnect, unconfirmed); or a daemon this engine lost less than
+   `MC_NVLINK_PROXY_TIMEOUT_MS` (at least 10 s) ago, which may still be
+   draining copies that use its memory, is not the one answering. An engine
+   that never sent a block to a daemon, or whose daemon no longer listens
+   (and was lost longer ago than that), has nothing to release.
+2. After the restore, a new `TransferEngine` reads the variables its
+   transports read at start (`MC_FORCE_TCP`, `MC_NVLINK_PROXY_*`,
+   `MC_NODE_ID` / `NODE_NAME`, `MC_TCP_*`), queries the GPU UUID of every
+   block it registers, and draws its identities from the kernel
+   (`getrandom`), not from state the snapshot copied:
+   - the client id, new for every engine;
+   - the process token of `HELLO`: shared by the engines of a process while
+     any of them is installed, drawn anew by an engine installed when none
+     is. Processes restored from one snapshot therefore never present the
+     same token to a daemon, and never share a mapping with each other;
+   - the start of the TCP request ids (protocol v3), redrawn whenever a TCP
+     transport is installed: a receiver tells requests apart by id alone,
+     whichever peer sent them.
+
+The process's environment is the snapshot's: set `NODE_NAME` (or
+`MC_NODE_ID`) in `os.environ` to the new node before creating the new engine
+when it moved. Settings of the engine's global configuration (`MC_HANDSHAKE_*`,
+the RPC port range, `MC_SLICE_*`, ...) are read once per process.
+
+`cudaIpcGetMemHandle` has been called on the engine's `cudaMalloc` blocks
+before the checkpoint, and nothing on the exporting side can undo that. On
+RTX 5090 (2026-11) `cuda-checkpoint` then fails
+(`CUDA_ERROR_OPERATING_SYSTEM`) even when no importer is left, while a
+process whose registered memory was virtual memory management memory,
+released after `shutdown()`, is checkpointed and restored. Processes that
+are checkpointed therefore register only virtual memory management memory
+and set `MC_NVLINK_PROXY_REQUIRE_VMM=1`, which turns any other device
+buffer into a registration error instead of a legacy export. Virtual memory
+management blocks have no legacy IPC export: once `shutdown()` returned,
+the engine can release their physical memory itself (see
+[Virtual memory management memory](#virtual-memory-management-memory)).
+
 ## Counters
 
 Engine side, logged by each engine every `MC_NVLINK_PROXY_STATS_INTERVAL`
@@ -369,18 +540,22 @@ seconds when they changed (and at shutdown):
 ```
 nvlink_proxy stats: healthy=1 proxied_requests=... proxied_bytes=... proxied_batches=...
   avg_batch_us=... max_batch_us=... held_requests=... max_hold_ms=... retried_requests=...
-  fallback_requests=... (daemon_unavailable=... daemon_error=... not_servable=...)
+  fallback_requests=... (daemon_unavailable=... daemon_error=... not_servable=... pair_test=...)
   fallback_retries=... failed_requests=... remote_node_requests=...
-  registered_blocks=N/M register_refusals=... (not_visible=...) connects=...
+  registered_blocks=N/M register_refusals=... (not_visible=...)
+  register_pair_waits=... (wait_ms=... timeouts=...) connects=...
 ```
 
 - `proxied_*`: requests, bytes and daemon round trips served by the proxy;
   `avg/max_batch_us` is the round-trip latency of one batch.
-- `held_requests` / `max_hold_ms`: requests that waited for the daemon and the
+- `held_requests` / `max_hold_ms`: requests that waited for the daemon (to
+  come back, or to decide their GPU pair with its self-test) and the
   longest wait of a batch; `retried_requests`: requests re-sent to the daemon
-  (after a restart or while a peer re-registered).
+  (after a restart, while a peer re-registered, or while their GPU pair was
+  under self-test; counted per re-send).
 - `fallback_requests`: same-node GPU requests that used the base transport
-  instead, split by reason; `fallback_retries`: base-transport attempts that
+  instead, split by reason (`pair_test`: the self-test of their GPU pair did
+  not decide within the pair-test wait); `fallback_retries`: base-transport attempts that
   were retried (e.g. full TCP queue); `failed_requests`: requests that failed
   within the request budget.
 - `remote_node_requests`: requests to buffers on another node (normal base
@@ -388,6 +563,10 @@ nvlink_proxy stats: healthy=1 proxied_requests=... proxied_bytes=... proxied_bat
 - `register_refusals`: blocks the daemon refused to register (their
   transfers use the base transport), `not_visible` of them because the
   daemon does not see the GPU; also logged at error level.
+- `register_pair_waits`: registrations that waited for the daemon's P2P
+  self-test of the engine's GPU pairs (`PAIR_WAIT`), `wait_ms` their total
+  wait, `timeouts` those that went on after
+  `MC_NVLINK_PROXY_REGISTER_PAIR_WAIT_MS` with a test still running.
 
 Daemon side, logged every `--stats-interval` seconds when they changed, or on
 demand with `mooncake_nvlink_proxy --socket <path> --stats`: active clients,
@@ -398,7 +577,13 @@ copy latency split into `avg_plan_us` (validation, merging, mapping) and
 `denied_pairs` (the number of denied ordered `src>dst` directions -- a denied
 GPU pair counts twice -- followed by their bus ids) and
 `denied_copy_requests` (copies refused because their pair is denied; not
-counted as failures), `untested_pairs` / `untested_host_paths` /
+counted as failures), `pair_test_waits` (copies answered `PAIR_UNDER_TEST`
+because their pair's self-test was queued or running; neither failures nor
+denials), `register_pair_waits` / `register_pair_wait_ms` /
+`register_pair_wait_timeouts` (`PAIR_WAIT` requests that found a self-test
+of the engine's pairs queued or running and waited, their total wait, and
+those answered after the wait with the test still running),
+`untested_pairs` / `untested_host_paths` /
 `untested_staged_pairs` (GPU pairs, per-GPU host paths and pairs' host-staged
 copies whose last test could not run, waiting for a retry; worth an alert
 when they stay above 0),
@@ -408,7 +593,8 @@ measured rates the deadline predictions use: `<gpu>.ce`, `<gpu>.kernel`,
 `<src>><dst>.staged`), `register_refusals`,
 `ipc_mappings` (IPC handles open now; falls back when engines exit),
 `ipc_closes` and `ipc_conflicts` (copies refused because a handle was mapped
-for another process or a disconnected engine).
+for another process or a disconnected engine), `vmm_imports` (virtual memory
+management allocations imported from engines' file descriptors now).
 
 ## Wire protocol
 
@@ -419,7 +605,18 @@ reply carries the daemon epoch),
 `REGISTER` (block base, size, GPU UUID, IPC handle), `UNREGISTER`, `COPY`
 (list of `(src client, src base, src offset, dst client, dst base,
 dst offset, length)` plus a start budget; replied after the copies completed),
-`PING`, `STATS`.
+`PING`, `STATS`, `RELEASE` (control connection: drop the client's
+registrations; replied once none of them is alive -- a copy in flight may
+still map one it resolved -- or with `DEADLINE_EXCEEDED` and the count of
+those still in use after the wait it names), `REGISTER_FD` (`REGISTER` of a virtual memory management block whose
+handle field carries the allocation's buffer id; the allocation's POSIX file
+descriptor comes with the message header as `SCM_RIGHTS`), `PAIR_WAIT`
+(control connection: replied once no P2P self-test of a pair of the GPUs
+this connection registered on is queued or running, or with
+`DEADLINE_EXCEEDED` after the wait it names; the reply carries how long it
+waited and how many of those pairs are still under test or refused).
+Message types and status values only grow, so the protocol version stays
+1: a daemon answers a message type it does not know with `BAD_REQUEST`.
 
 ## Testing
 
@@ -427,9 +624,30 @@ dst offset, length)` plus a start budget; replied after the copies completed),
 initiator process (e.g. two one-GPU containers on one node plus the daemon) and
 verifies large and paged writes, reads, sub-allocated buffers, guard regions
 and host memory byte by byte. `nvlink_proxy_transport_test` covers the
-protocol helpers and the no-daemon path without GPUs;
-`nvlink_proxy_policy_test` the self-test plans, the verifier, bus id parsing
-and the deny matrix; `nvlink_proxy_daemon_test` the paced issue against the
+protocol helpers and the no-daemon path without GPUs, and `shutdown()`
+against a stand-in daemon: no socket, epoll / eventfd descriptor, pipe or
+thread of the engine left, `RELEASE` waited for (and reported unconfirmed
+by an older or slow daemon, and while a daemon lost a moment ago may
+still drain), new client id and process token for the next engine, and a
+`REGISTER_FD` that carries its descriptor; and the answers to
+`PAIR_UNDER_TEST`: requests sent again until the test passed, the base
+transport once it failed or after the pair-test wait (at once with a wait of
+0), at most half of a batch's time spent waiting, a canceled batch failed
+without sending anything; and `PAIR_WAIT` after a registration: answered
+once the test decided, the registration going on after its wait, a daemon
+that predates it asked once and not waited for, a wait of 0 sending
+nothing, a broken connection closed, host memory not waiting, the control
+connection's receive timeout restored.
+`transfer_engine_shutdown_test.py` checks the same through the
+Python API (calls after `shutdown()` raise, a batch left unfreed, a thread
+still transferring, refused while `get_engine()`'s engine is referenced); with `--gpu` it writes through a running daemon,
+shuts down, finds no mapping left in the daemon, and does it again with new
+engines in the same process (`--gpu --vmm`: with virtual memory management
+pools whose physical memory is released and created again in between);
+`nvlink_proxy_policy_test` the self-test plans, the verifier, bus id parsing,
+the deny matrix, which refusals are `PAIR_UNDER_TEST` and which pairs a
+`PAIR_WAIT` waits for;
+`nvlink_proxy_daemon_test` the paced issue against the
 deadline, the IPC mapping table, the socket and the start-up checks.
 `nvlink_proxy_cpu_test.py` runs the daemon itself without GPUs, linked
 against a CPU stand-in for the CUDA runtime
@@ -439,6 +657,17 @@ configurable link rate), and plays engines over its socket: copies stopped
 before their deadline with no write after the refusal, a slow link at the
 default chunk size, chunked copies byte-exact, host staging, socket
 permissions, mappings closed when an engine disconnects or restarts,
-mappings shared within a process and refused to another,
-`--min-visible-gpus` (CMake target `mooncake_nvlink_proxy_cpu`, CTest
+mappings shared within a process and refused to another, `RELEASE`
+answered only once no mapping is left (also while a copy holds one, while a
+copy has resolved a block it has not mapped yet, and over a connection
+opened for it), `REGISTER_FD` (imported once, copied from
+and to, released by `RELEASE` and by a disconnect, a GPU that cannot be
+granted access refusing the copy; the stand-in also implements the driver's
+virtual memory management calls),
+`--min-visible-gpus`, `PAIR_UNDER_TEST` while a pair's self-test runs (nothing
+written) and the answers once it passed, failed or could not run, and for a
+pair denied on the command line, `PAIR_WAIT` sent right after the
+`REGISTER` that completes a pair answered once the slowed self-test
+decided (and copies served at once then), after its wait while the test
+still runs, and at once with nothing to wait for (CMake target `mooncake_nvlink_proxy_cpu`, CTest
 `nvlink_proxy_cpu_test`).
