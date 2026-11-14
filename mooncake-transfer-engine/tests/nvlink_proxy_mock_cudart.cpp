@@ -40,7 +40,18 @@
 // - MOCK_GPUS (default 8), MOCK_OOM_GPU=k, MOCK_NO_CONTEXT_GPU=k,
 //   MOCK_NOKERNEL=1 (the gather kernel has no image), MOCK_POOL_BAD=1
 //   (copies from/to the registered staging pool are dropped).
+// - Virtual memory management (driver calls handed out by
+//   cudaGetDriverEntryPointByVersion): a POSIX-fd handle is a descriptor of
+//   a shared memory file; importing duplicates it (on the current GPU),
+//   cuMemMap maps the file over a reserved range, cuMemUnmap gives the range
+//   back to the reservation. MOCK_VMM_ACCESS_FAIL=k: cuMemSetAccess for
+//   gpu k fails.
+// - MOCK_IPC_OPEN_DELAY_MS with MOCK_IPC_OPEN_DELAY_SEGMENT=/<name>: opening
+//   that segment's handle takes this long.
+// - MOCK_SELFTEST_DELAY_MS: the P2P self-test child sleeps this long before
+//   it begins.
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -81,6 +92,23 @@ int envInt(const char *n, int d) {
     return v && *v ? atoi(v) : d;
 }
 int ngpus() { return envInt("MOCK_GPUS", 8); }
+
+// MOCK_SELFTEST_DELAY_MS: the P2P self-test child (a process started with
+// --p2p-selftest-child) sleeps this long before it begins, as a slow test.
+__attribute__((constructor)) void delaySelfTestChild() {
+    const int ms = envInt("MOCK_SELFTEST_DELAY_MS", 0);
+    if (ms <= 0) return;
+    FILE *f = fopen("/proc/self/cmdline", "r");
+    if (!f) return;
+    char buf[4096];
+    const size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    // NUL-separated arguments: look for the flag as a whole argument.
+    const std::string args(buf, n);
+    if (args.find(std::string("--p2p-selftest-child") + '\0') !=
+        std::string::npos)
+        usleep(ms * 1000);
+}
 
 bool inRanges(const std::map<uintptr_t, size_t> &m, const void *p) {
     std::lock_guard<std::mutex> l(mu);
@@ -232,6 +260,89 @@ void submit(cudaStream_t s, std::function<void()> op) {
         st->push(std::move(op));
     else
         op();
+}
+
+// ------------------------------------------------- virtual memory management
+struct VmmImport {
+    int fd = -1;
+    int dev = 0;
+};
+std::map<CUmemGenericAllocationHandle, VmmImport> vmm_imports;
+CUmemGenericAllocationHandle vmm_next = 1;
+
+CUresult mockImport(CUmemGenericAllocationHandle *h, void *os,
+                    CUmemAllocationHandleType type) {
+    if (type != CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)
+        return CUDA_ERROR_INVALID_VALUE;
+    const int fd = dup(static_cast<int>(reinterpret_cast<intptr_t>(os)));
+    if (fd < 0) return CUDA_ERROR_INVALID_VALUE;
+    std::lock_guard<std::mutex> l(mu);
+    *h = vmm_next++;
+    vmm_imports[*h] = {fd, cur};
+    return CUDA_SUCCESS;
+}
+
+CUresult mockReserve(CUdeviceptr *p, size_t size, size_t, CUdeviceptr,
+                     unsigned long long) {
+    void *m = mmap(nullptr, size, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) return CUDA_ERROR_OUT_OF_MEMORY;
+    *p = reinterpret_cast<CUdeviceptr>(m);
+    return CUDA_SUCCESS;
+}
+
+CUresult mockMap(CUdeviceptr p, size_t size, size_t offset,
+                 CUmemGenericAllocationHandle h, unsigned long long) {
+    std::lock_guard<std::mutex> l(mu);
+    auto it = vmm_imports.find(h);
+    if (it == vmm_imports.end() || offset != 0) return CUDA_ERROR_INVALID_VALUE;
+    void *m = mmap(reinterpret_cast<void *>(p), size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_FIXED, it->second.fd, 0);
+    if (m == MAP_FAILED) return CUDA_ERROR_INVALID_VALUE;
+    // The shared memory file's name, for the write log ("/<name>").
+    char link[256] = {};
+    const std::string path = "/proc/self/fd/" + std::to_string(it->second.fd);
+    std::string name = "/vmm";
+    if (readlink(path.c_str(), link, sizeof(link) - 1) > 0) {
+        name = link;
+        if (name.rfind("/dev/shm", 0) == 0) name = name.substr(8);
+    }
+    allocs[p] = {size, it->second.dev};
+    imported[p] = name;
+    return CUDA_SUCCESS;
+}
+
+CUresult mockSetAccess(CUdeviceptr, size_t, const CUmemAccessDesc *desc,
+                       size_t count) {
+    for (size_t i = 0; i < count; ++i)
+        if (envInt("MOCK_VMM_ACCESS_FAIL", -1) == desc[i].location.id)
+            return CUDA_ERROR_INVALID_DEVICE;
+    return CUDA_SUCCESS;
+}
+
+CUresult mockUnmap(CUdeviceptr p, size_t size) {
+    std::lock_guard<std::mutex> l(mu);
+    allocs.erase(p);
+    imported.erase(p);
+    void *m =
+        mmap(reinterpret_cast<void *>(p), size, PROT_NONE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+    return m == MAP_FAILED ? CUDA_ERROR_INVALID_VALUE : CUDA_SUCCESS;
+}
+
+CUresult mockAddressFree(CUdeviceptr p, size_t size) {
+    return munmap(reinterpret_cast<void *>(p), size) == 0
+               ? CUDA_SUCCESS
+               : CUDA_ERROR_INVALID_VALUE;
+}
+
+CUresult mockRelease(CUmemGenericAllocationHandle h) {
+    std::lock_guard<std::mutex> l(mu);
+    auto it = vmm_imports.find(h);
+    if (it == vmm_imports.end()) return CUDA_ERROR_INVALID_VALUE;
+    close(it->second.fd);
+    vmm_imports.erase(it);
+    return CUDA_SUCCESS;
 }
 
 struct Event {
@@ -498,6 +609,9 @@ cudaError_t cudaIpcOpenMemHandle(void **p, cudaIpcMemHandle_t h, unsigned int) {
             return cudaSuccess;
         }
     }
+    const char *slow = getenv("MOCK_IPC_OPEN_DELAY_SEGMENT");
+    if (slow && strcmp(slow, name) == 0)
+        usleep(envInt("MOCK_IPC_OPEN_DELAY_MS", 0) * 1000);
     const int fd = shm_open(name, O_RDWR, 0);
     if (fd < 0) return cudaErrorInvalidResourceHandle;
     struct stat st;
@@ -511,6 +625,27 @@ cudaError_t cudaIpcOpenMemHandle(void **p, cudaIpcMemHandle_t h, unsigned int) {
     imported[reinterpret_cast<uintptr_t>(m)] = name;
     ipc_open[key] = {reinterpret_cast<uintptr_t>(m), 1};
     *p = m;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetDriverEntryPointByVersion(
+    const char *symbol, void **fn, unsigned int, unsigned long long,
+    cudaDriverEntryPointQueryResult *status) {
+    static const std::map<std::string, void *> table = {
+        {"cuMemImportFromShareableHandle",
+         reinterpret_cast<void *>(mockImport)},
+        {"cuMemAddressReserve", reinterpret_cast<void *>(mockReserve)},
+        {"cuMemMap", reinterpret_cast<void *>(mockMap)},
+        {"cuMemSetAccess", reinterpret_cast<void *>(mockSetAccess)},
+        {"cuMemUnmap", reinterpret_cast<void *>(mockUnmap)},
+        {"cuMemAddressFree", reinterpret_cast<void *>(mockAddressFree)},
+        {"cuMemRelease", reinterpret_cast<void *>(mockRelease)},
+    };
+    auto it = table.find(symbol);
+    *fn = it == table.end() ? nullptr : it->second;
+    if (status)
+        *status = *fn ? cudaDriverEntryPointSuccess
+                      : cudaDriverEntryPointSymbolNotFound;
     return cudaSuccess;
 }
 

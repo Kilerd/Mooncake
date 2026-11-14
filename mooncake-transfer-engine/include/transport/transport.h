@@ -568,6 +568,13 @@ class Transport {
     /// fail its work that is still queued in this transport.
     virtual void onBatchCanceled(BatchID batch_id) {}
 
+    /// @brief Tear down for a process that lives on (TransferEngine::shutdown):
+    /// the transport is destroyed right after, which closes its connections,
+    /// listeners and threads. Overridden by transports that have state
+    /// outside the process to settle first. 0, or -1 when that could not be
+    /// confirmed.
+    virtual int shutdown() { return 0; }
+
     /// @brief The control of the batch |slice| belongs to, or nullptr when
     /// the slice's task has no batch.
     static BatchControl *batchControl(const Slice *slice) {

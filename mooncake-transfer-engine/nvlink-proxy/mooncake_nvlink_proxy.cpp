@@ -27,9 +27,13 @@
 // some platforms report working peer access yet drop or corrupt the data. A
 // pair that fails is denied, as are pairs named with --deny-peer /
 // --deny-pair; copies between the GPUs of a denied pair are refused with
-// kNoPeerAccess and the engines move them to their base transport (see
+// kNoPeerAccess and the engines move them to their base transport. Copies
+// between the GPUs of a pair whose test is queued or running get
+// kPairUnderTest, and the engines send them again until it decided (see
 // p2p_policy.h).
 
+#include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -152,6 +156,59 @@ bool readAll(int fd, void *buf, size_t len) {
     return true;
 }
 
+// File descriptors received with a message (SCM_RIGHTS); those not taken
+// are closed with it.
+struct PassedFds {
+    std::vector<int> fds;
+    PassedFds() = default;
+    PassedFds(const PassedFds &) = delete;
+    PassedFds &operator=(const PassedFds &) = delete;
+    ~PassedFds() { closeAll(); }
+    void closeAll() {
+        for (int f : fds)
+            if (f >= 0) close(f);
+        fds.clear();
+    }
+    int take(size_t i) {
+        const int f = fds[i];
+        fds[i] = -1;
+        return f;
+    }
+};
+
+// readAll() that keeps the descriptors arriving with the bytes.
+bool readAllFds(int fd, void *buf, size_t len, PassedFds &passed) {
+    char *p = static_cast<char *>(buf);
+    while (len > 0) {
+        iovec iov{p, len};
+        alignas(cmsghdr) char ctrl[CMSG_SPACE(4 * sizeof(int))];
+        msghdr m{};
+        m.msg_iov = &iov;
+        m.msg_iovlen = 1;
+        m.msg_control = ctrl;
+        m.msg_controllen = sizeof(ctrl);
+        const ssize_t n = recvmsg(fd, &m, MSG_CMSG_CLOEXEC);
+        if (n == 0) return false;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        for (cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
+            if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+                continue;
+            const size_t k = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            for (size_t i = 0; i < k; ++i) {
+                int f;
+                memcpy(&f, CMSG_DATA(c) + i * sizeof(int), sizeof(int));
+                passed.fds.push_back(f);
+            }
+        }
+        p += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
 bool sendMsg(int fd, MsgType type, uint64_t seq, ProxyStatus status,
              const void *payload, size_t len) {
     MsgHeader h{};
@@ -262,6 +319,119 @@ static_assert(kIpcHandleSize == kImportHandleBytes, "IPC handle size");
 using Imports = ImportTable<CudaIpcOpener>;
 Imports g_imports;
 
+// ------------------------------------------------------- VMM imports
+// Virtual-memory-management blocks (REGISTER_FD) arrive as POSIX file
+// descriptors of their allocation; the daemon imports one per
+// registration and maps it once in its address space. The driver calls go
+// through the runtime's entry point lookup: the runtime is linked
+// statically and only the driver is needed at run time (a CPU stand-in
+// supplies them in tests).
+struct VmmApi {
+    PFN_cuMemImportFromShareableHandle import_handle = nullptr;
+    PFN_cuMemAddressReserve reserve = nullptr;
+    PFN_cuMemMap map = nullptr;
+    PFN_cuMemSetAccess set_access = nullptr;
+    PFN_cuMemUnmap unmap = nullptr;
+    PFN_cuMemAddressFree address_free = nullptr;
+    PFN_cuMemRelease release = nullptr;
+    bool ok = false;
+};
+
+template <class F>
+bool driverEntry(const char *name, F &fn) {
+    void *p = nullptr;
+    cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+    const cudaError_t e = cudaGetDriverEntryPointByVersion(
+        name, &p, 12000, cudaEnableDefault, &q);
+    if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || !p) {
+        cudaGetLastError();
+        return false;
+    }
+    fn = reinterpret_cast<F>(p);
+    return true;
+}
+
+const VmmApi &vmmApi() {
+    static const VmmApi api = [] {
+        VmmApi a;
+        a.ok = driverEntry("cuMemImportFromShareableHandle", a.import_handle) &&
+               driverEntry("cuMemAddressReserve", a.reserve) &&
+               driverEntry("cuMemMap", a.map) &&
+               driverEntry("cuMemSetAccess", a.set_access) &&
+               driverEntry("cuMemUnmap", a.unmap) &&
+               driverEntry("cuMemAddressFree", a.address_free) &&
+               driverEntry("cuMemRelease", a.release);
+        if (!a.ok)
+            LOGW(
+                "the driver offers no virtual memory management calls: "
+                "REGISTER_FD is refused");
+        return a;
+    }();
+    return api;
+}
+
+// Per client: Registration objects alive (in g_regs, or still held by a
+// copy in flight that may yet map them), and imported VMM allocations not
+// released yet (held by a registration, or whose release failed).
+std::mutex g_count_mu;
+std::map<uint64_t, size_t> g_live_regs;
+std::map<uint64_t, size_t> g_vmm_imports;
+
+void noteCount(std::map<uint64_t, size_t> &counts, uint64_t client, int delta) {
+    std::lock_guard<std::mutex> lock(g_count_mu);
+    size_t &n = counts[client];
+    n = delta > 0 ? n + 1 : (n ? n - 1 : 0);
+    if (n == 0) counts.erase(client);
+}
+
+size_t countOf(const std::map<uint64_t, size_t> &counts, uint64_t client) {
+    std::lock_guard<std::mutex> lock(g_count_mu);
+    auto it = counts.find(client);
+    return it == counts.end() ? 0 : it->second;
+}
+
+size_t vmmImportsTotal() {
+    std::lock_guard<std::mutex> lock(g_count_mu);
+    size_t n = 0;
+    for (auto &kv : g_vmm_imports) n += kv.second;
+    return n;
+}
+
+// Imports the allocation behind |fd| (exported by an engine with
+// cuMemExportToShareableHandle) in |dev|'s context. Closes |fd|.
+bool vmmImport(int dev, int fd, CUmemGenericAllocationHandle *handle,
+               std::string *error) {
+    const VmmApi &api = vmmApi();
+    bool ok = false;
+    if (!api.ok) {
+        *error = "the daemon's driver has no virtual memory management";
+    } else if (cudaSetDevice(dev) != cudaSuccess) {
+        cudaGetLastError();
+        *error = "cudaSetDevice failed";
+    } else {
+        const CUresult r = api.import_handle(
+            handle, reinterpret_cast<void *>(static_cast<intptr_t>(fd)),
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+        ok = r == CUDA_SUCCESS;
+        if (!ok)
+            *error = "cuMemImportFromShareableHandle failed (CUresult " +
+                     std::to_string(static_cast<int>(r)) + ")";
+    }
+    close(fd);
+    return ok;
+}
+
+// What may still give the daemon access to |client|'s memory: its
+// registrations alive -- a copy in flight resolves them before it maps them,
+// so one dropped but still held may be mapped after this count of open
+// mappings would have read 0 -- and, once none is, imports whose release
+// failed. 0: nothing of that memory is or will be mapped.
+size_t mappingsHeld(uint64_t client) {
+    const size_t regs = countOf(g_live_regs, client);
+    return regs ? regs
+                : countOf(g_vmm_imports, client) + g_imports.mappingsOf(client);
+}
+
 // Clients with an open control connection (client id -> connections): a
 // mapping is shared with another client of the same process only while one
 // of its holders is still connected.
@@ -302,11 +472,60 @@ struct Registration {
     std::mutex mu;
     std::unordered_map<int, char *> mapped;  // pulling device -> mapped base
 
+    // A virtual-memory-management block (REGISTER_FD): its imported
+    // allocation, mapped once (all contexts share the address) and made
+    // accessible to each GPU that copies from or to it.
+    bool vmm = false;
+    CUmemGenericAllocationHandle vmm_handle = 0;
+    char *vmm_ptr = nullptr;
+    std::set<int> vmm_access;
+
+    // Counted in g_live_regs (from its insertion into g_regs).
+    bool counted = false;
+
     // The last reference is gone: the block was unregistered or replaced,
     // or its engine's control connection closed, and no copy in flight uses
     // it any more. Its mappings are closed now unless another registration
     // of the same engine (a re-registration) still uses them.
     ~Registration() {
+        if (vmm) {
+            releaseVmm();
+        } else {
+            closeMappings();
+        }
+        // Last: nothing of the client's memory is mapped through it any more.
+        if (counted) noteCount(g_live_regs, client_id, -1);
+    }
+
+    // The import stays counted (g_vmm_imports) unless every step succeeded:
+    // a failed release may keep the engine's memory allocated.
+    void releaseVmm() {
+        const VmmApi &api = vmmApi();
+        cudaSetDevice(device);
+        CUresult r = CUDA_SUCCESS;
+        if (vmm_ptr) {
+            const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(vmm_ptr);
+            r = api.unmap(va, size);
+            const CUresult f = api.address_free(va, size);
+            if (r == CUDA_SUCCESS) r = f;
+        }
+        const CUresult rel = api.release(vmm_handle);
+        if (r == CUDA_SUCCESS) r = rel;
+        if (r != CUDA_SUCCESS) {
+            LOGE("releasing the imported memory of client=%016" PRIx64
+                 " base=%#" PRIx64
+                 ": CUresult %d; it stays counted (vmm_imports) and RELEASE "
+                 "is not confirmed",
+                 client_id, base, static_cast<int>(r));
+            return;
+        }
+        noteCount(g_vmm_imports, client_id, -1);
+        LOGI("closed client=%016" PRIx64 " base=%#" PRIx64
+             " (gpu %d, imported memory)",
+             client_id, base, device);
+    }
+
+    void closeMappings() {
         for (auto &kv : mapped) {
             int err = 0;
             const bool closed =
@@ -331,6 +550,7 @@ struct Registration {
                        Imports::Acquired *conflict) {
         std::lock_guard<std::mutex> lock(mu);
         *opened = false;
+        if (vmm) return mapVmmLocked(dev, out, opened);
         auto it = mapped.find(dev);
         if (it != mapped.end()) {
             *out = it->second;
@@ -357,6 +577,58 @@ struct Registration {
         mapped[dev] = static_cast<char *>(a.ptr);
         *out = static_cast<char *>(a.ptr);
         *opened = a.opened;
+        return cudaSuccess;
+    }
+
+    // A CUresult of a mapping step as the copy reports it: the sticky
+    // errors keep their code (the daemon exits on them, as for IPC opens);
+    // any other refuses the copy.
+    static cudaError_t vmmError(CUresult r) {
+        const cudaError_t e = static_cast<cudaError_t>(r);
+        return isStickyCudaError(e) ? e : cudaErrorMapBufferObjectFailed;
+    }
+
+    // Maps the imported allocation (once) and grants |dev| access to it.
+    cudaError_t mapVmmLocked(int dev, char **out, bool *opened) {
+        const VmmApi &api = vmmApi();
+        if (!vmm_ptr) {
+            const uint64_t t0 = nowUs();
+            cudaSetDevice(device);
+            CUdeviceptr va = 0;
+            CUresult r = api.reserve(&va, size, 0, 0, 0);
+            if (r == CUDA_SUCCESS) {
+                r = api.map(va, size, 0, vmm_handle, 0);
+                if (r != CUDA_SUCCESS) api.address_free(va, size);
+            }
+            if (r != CUDA_SUCCESS) {
+                LOGW("mapping the imported memory of client=%016" PRIx64
+                     " base=%#" PRIx64 " size=%" PRIu64 ": CUresult %d",
+                     client_id, base, size, static_cast<int>(r));
+                return vmmError(r);
+            }
+            vmm_ptr = reinterpret_cast<char *>(va);
+            *opened = true;
+            LOGI("mapped client=%016" PRIx64 " base=%#" PRIx64 " size=%" PRIu64
+                 " (gpu %d, imported memory) in %.1f ms",
+                 client_id, base, size, device, (nowUs() - t0) / 1000.0);
+        }
+        if (!vmm_access.count(dev)) {
+            CUmemAccessDesc access{};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id = dev;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            const CUresult r = api.set_access(
+                reinterpret_cast<CUdeviceptr>(vmm_ptr), size, &access, 1);
+            if (r != CUDA_SUCCESS) {
+                LOGW(
+                    "granting gpu %d access to the imported memory of "
+                    "client=%016" PRIx64 " base=%#" PRIx64 ": CUresult %d",
+                    dev, client_id, base, static_cast<int>(r));
+                return vmmError(r);
+            }
+            vmm_access.insert(dev);
+        }
+        *out = vmm_ptr;
         return cudaSuccess;
     }
 };
@@ -390,6 +662,8 @@ struct Stats {
     std::atomic<uint64_t> plan_us_total{0};
     std::atomic<uint64_t> exec_us_total{0};
     std::atomic<uint64_t> denied_copies{0};  // refused by the P2P policy
+    // Answered PAIR_UNDER_TEST: their pair's self-test was queued or running.
+    std::atomic<uint64_t> pair_test_waits{0};
     std::atomic<uint64_t> staged_copies{0};  // served through host memory
     std::atomic<uint64_t> staged_bytes{0};
     std::atomic<uint64_t> staged_failures{0};  // then refused (base transport)
@@ -445,6 +719,7 @@ std::string statsText() {
     if (!denied.empty()) out += "(" + denied + ")";
     out +=
         " denied_copy_requests=" + std::to_string(g_stats.denied_copies.load());
+    out += " pair_test_waits=" + std::to_string(g_stats.pair_test_waits.load());
     out +=
         " untested_pairs=" + std::to_string(g_untested_pairs.load()) +
         " untested_host_paths=" + std::to_string(g_untested_host_paths.load()) +
@@ -459,7 +734,8 @@ std::string statsText() {
         std::to_string(g_stats.register_refusals.load());
     out += " ipc_mappings=" + std::to_string(g_imports.mappings()) +
            " ipc_closes=" + std::to_string(g_imports.closes()) +
-           " ipc_conflicts=" + std::to_string(g_imports.conflicts());
+           " ipc_conflicts=" + std::to_string(g_imports.conflicts()) +
+           " vmm_imports=" + std::to_string(vmmImportsTotal());
     // Measured rates of the work served so far (GB/s): gpu.ce, gpu.kernel,
     // and src>dst for host-staged pairs.
     std::string rates;
@@ -1083,6 +1359,8 @@ struct CopyResult {
     uint64_t bytes = 0;
     std::string message;
     bool denied = false;  // refused by the P2P policy, not a failure
+    // PAIR_UNDER_TEST: the pair's self-test decides it soon, not a failure.
+    bool pair_test_wait = false;
 };
 
 std::shared_ptr<Registration> lookupReg(uint64_t client, uint64_t base) {
@@ -1178,6 +1456,11 @@ class MapResolver {
                          ", which has disconnected (copies in flight still "
                          "use the mapping); not served from that mapping",
                          failed_->client_id, failed_->base, c.other);
+        } else if (failed_ && failed_->vmm) {
+            snprintf(m, sizeof(m),
+                     "mapping the imported memory of block client=%016" PRIx64
+                     " base=%#" PRIx64 " failed (see daemon log)",
+                     failed_->client_id, failed_->base);
         } else {
             snprintf(m, sizeof(m), "cudaIpcOpenMemHandle: %s",
                      cudaGetErrorString(e));
@@ -1244,19 +1527,33 @@ CopyResult doCopy(const CopyEntry *entries, uint32_t count, uint32_t budget_ms,
                      e.dst_client, e.dst_base);
             return fail(ProxyStatus::kUnknownDestination, i, m);
         }
-        const bool refused = src->device != dst->device &&
-                             g_policy.denied(src->device, dst->device);
+        // Read once: the self-test may decide the pair meanwhile.
+        const PeerPolicy::Reason why =
+            g_policy.reason(src->device, dst->device);
+        const bool refused = why != PeerPolicy::kAllowed;
         if (refused && !hostStageable(src->device, dst->device)) {
-            // Before any merging or mapping: the engine moves the request
-            // to its base transport.
+            // Before any merging or mapping, so nothing of the copy is
+            // issued: the engine sends it again while the pair's self-test
+            // is queued or running, else moves it to its base transport.
             const int sd = src->device, dd = dst->device;
+            const ProxyStatus st = refusalStatus(why);
             char m[192];
-            snprintf(m, sizeof(m),
-                     "P2P from gpu %d (%s) to gpu %d (%s) is denied: %s", sd,
-                     g_devices[sd].pci.c_str(), dd, g_devices[dd].pci.c_str(),
-                     PeerPolicy::reasonName(g_policy.reason(sd, dd)));
-            r.denied = true;
-            return fail(ProxyStatus::kNoPeerAccess, i, m);
+            if (st == ProxyStatus::kPairUnderTest) {
+                snprintf(m, sizeof(m),
+                         "P2P from gpu %d (%s) to gpu %d (%s) waits for the "
+                         "P2P self-test of the pair (queued or running)",
+                         sd, g_devices[sd].pci.c_str(), dd,
+                         g_devices[dd].pci.c_str());
+                r.pair_test_wait = true;
+            } else {
+                snprintf(m, sizeof(m),
+                         "P2P from gpu %d (%s) to gpu %d (%s) is denied: %s",
+                         sd, g_devices[sd].pci.c_str(), dd,
+                         g_devices[dd].pci.c_str(),
+                         PeerPolicy::reasonName(why));
+                r.denied = true;
+            }
+            return fail(st, i, m);
         }
         if (e.src_offset > src->size || e.length > src->size - e.src_offset ||
             e.dst_offset > dst->size || e.length > dst->size - e.dst_offset) {
@@ -1648,8 +1945,10 @@ void replyError(int fd, MsgType type, uint64_t seq, ProxyStatus st,
     sendMsg(fd, type, seq, st, msg.data(), msg.size());
 }
 
-void dropOwned(Connection &c) {
-    if (c.owned.empty()) return;
+// Drops the registrations this connection owns; |what| says why (for the
+// log). The number dropped.
+size_t dropOwned(Connection &c, const char *what = "disconnected") {
+    if (c.owned.empty()) return 0;
     size_t dropped = 0;
     {
         std::lock_guard<std::mutex> lock(g_reg_mu);
@@ -1670,15 +1969,16 @@ void dropOwned(Connection &c) {
     // open mapping would keep the engine's GPU memory allocated after it
     // exited.
     c.owned.clear();
-    const size_t held = g_imports.mappingsOf(c.client_id);
+    const size_t held = mappingsHeld(c.client_id);
     LOGI("client %016" PRIx64
-         " (pid %u, node %s) disconnected; released %zu registrations, %s",
-         c.client_id, c.pid, c.node.c_str(), dropped,
+         " (pid %u, node %s) %s; released %zu registrations, %s",
+         c.client_id, c.pid, c.node.c_str(), what, dropped,
          held == 0 ? "all of its IPC mappings are closed"
                    : (std::to_string(held) +
-                      " IPC mapping(s) still used by copies in flight, closed "
-                      "when they finish")
+                      " registration(s) or mapping(s) still used by copies in "
+                      "flight, closed when they finish")
                          .c_str());
+    return dropped;
 }
 
 void handleConnection(int fd) {
@@ -1689,7 +1989,10 @@ void handleConnection(int fd) {
     std::vector<char> payload;
     while (true) {
         MsgHeader h;
-        if (!readAll(fd, &h, sizeof(h))) break;
+        // Descriptors come with the header (REGISTER_FD); any other message
+        // closes those it brought.
+        PassedFds passed;
+        if (!readAllFds(fd, &h, sizeof(h), passed)) break;
         if (h.magic != kMagic) {
             LOGW("bad magic on fd %d, closing", fd);
             break;
@@ -1771,16 +2074,21 @@ void handleConnection(int fd) {
                              sizeof(resp));
                 break;
             }
-            case MsgType::kRegister: {
+            case MsgType::kRegister:
+            case MsgType::kRegisterFd: {
+                const bool vmm = type == MsgType::kRegisterFd;
                 if (!c.control) {
                     replyError(fd, type, h.seq,
                                ProxyStatus::kNotControlConnection,
                                "REGISTER requires a control connection");
                     break;
                 }
-                if (payload.size() != sizeof(RegisterReq)) {
+                if (payload.size() != sizeof(RegisterReq) ||
+                    (vmm && passed.fds.size() != 1)) {
                     replyError(fd, type, h.seq, ProxyStatus::kBadRequest,
-                               "bad REGISTER");
+                               vmm ? "bad REGISTER_FD (one RegisterReq and "
+                                     "one file descriptor)"
+                                   : "bad REGISTER");
                     break;
                 }
                 RegisterReq req;
@@ -1822,6 +2130,23 @@ void handleConnection(int fd) {
                                "bad block range");
                     break;
                 }
+                // The allocation behind the descriptor; released again when
+                // an identical registration already holds one.
+                CUmemGenericAllocationHandle imported = 0;
+                if (vmm) {
+                    std::string err;
+                    if (!vmmImport(dev, passed.take(0), &imported, &err)) {
+                        g_stats.register_refusals++;
+                        LOGE("client %016" PRIx64
+                             " registers imported memory at base=%#" PRIx64
+                             ": %s; its transfers use the engine's base "
+                             "transport",
+                             c.client_id, req.base, err.c_str());
+                        replyError(fd, type, h.seq, ProxyStatus::kCudaError,
+                                   err);
+                        break;
+                    }
+                }
                 // An engine's first block on this GPU: test the GPU's pairs
                 // that have not passed yet (in the background; until then,
                 // in enforce mode, copies between them are refused), before
@@ -1834,6 +2159,7 @@ void handleConnection(int fd) {
                     if (it != g_regs.end()) {
                         auto &old = it->second;
                         same = old->size == req.size && old->device == dev &&
+                               old->vmm == vmm &&
                                memcmp(old->handle, req.ipc_handle,
                                       kIpcHandleSize) == 0;
                         replaced = !same;
@@ -1848,6 +2174,14 @@ void handleConnection(int fd) {
                         reg->size = req.size;
                         reg->device = dev;
                         memcpy(reg->handle, req.ipc_handle, kIpcHandleSize);
+                        if (vmm) {
+                            reg->vmm = true;
+                            reg->vmm_handle = imported;
+                            imported = 0;
+                            noteCount(g_vmm_imports, c.client_id, +1);
+                        }
+                        reg->counted = true;
+                        noteCount(g_live_regs, c.client_id, +1);
                         reg->owner_conn = c.conn_id;
                         g_regs[{c.client_id, req.base}] = reg;
                         c.owned[req.base] = reg;
@@ -1857,10 +2191,11 @@ void handleConnection(int fd) {
                         c.owned[req.base] = it->second;
                     }
                 }
+                if (imported) vmmApi().release(imported);
                 LOGI("register client=%016" PRIx64 " base=%#" PRIx64
-                     " size=%" PRIu64 " gpu=%d (%s)%s",
+                     " size=%" PRIu64 " gpu=%d (%s)%s%s",
                      c.client_id, req.base, req.size, dev,
-                     g_devices[dev].pci.c_str(),
+                     g_devices[dev].pci.c_str(), vmm ? " [imported]" : "",
                      same ? " [unchanged]" : (replaced ? " [replaced]" : ""));
                 ok = sendMsg(fd, type, h.seq, ProxyStatus::kOk, nullptr, 0);
                 break;
@@ -1930,6 +2265,29 @@ void handleConnection(int fd) {
                 std::string out(reinterpret_cast<char *>(&resp), sizeof(resp));
                 if (res.status == ProxyStatus::kOk) {
                     g_stats.copy_bytes += res.bytes;
+                } else if (res.pair_test_wait) {
+                    // Expected for the copies between the GPUs of a pair
+                    // until its self-test decided (about a second): counted
+                    // apart from failures and denials, logged rarely.
+                    g_stats.pair_test_waits++;
+                    out += res.message;
+                    static std::atomic<uint64_t> last_wait_log_us{0};
+                    static std::atomic<uint64_t> waits_since_log{0};
+                    const uint64_t now_us = nowUs();
+                    uint64_t last = last_wait_log_us.load();
+                    waits_since_log++;
+                    if ((last == 0 || now_us - last >= 5000000) &&
+                        last_wait_log_us.compare_exchange_strong(last,
+                                                                 now_us)) {
+                        LOGI("held back %" PRIu64
+                             " copy request(s) from client %016" PRIx64
+                             " and others since the last report: %s; the "
+                             "engines send them again until the self-test "
+                             "decided (engines that predate PAIR_UNDER_TEST "
+                             "use their base transport)",
+                             waits_since_log.exchange(0), c.client_id,
+                             res.message.c_str());
+                    }
                 } else if (res.denied) {
                     // Expected for every copy between the GPUs of a denied
                     // pair: counted apart from failures, logged rarely.
@@ -1997,6 +2355,51 @@ void handleConnection(int fd) {
                 std::string s = statsText();
                 ok = sendMsg(fd, type, h.seq, ProxyStatus::kOk, s.data(),
                              s.size());
+                break;
+            }
+            case MsgType::kRelease: {
+                if (!c.control) {
+                    replyError(fd, type, h.seq,
+                               ProxyStatus::kNotControlConnection,
+                               "RELEASE requires a control connection");
+                    break;
+                }
+                if (payload.size() != sizeof(ReleaseReq)) {
+                    replyError(fd, type, h.seq, ProxyStatus::kBadRequest,
+                               "bad RELEASE");
+                    break;
+                }
+                ReleaseReq req;
+                memcpy(&req, payload.data(), sizeof(req));
+                const size_t dropped = dropOwned(c, "releases its memory");
+                // Copies in flight that use a mapping close it when they
+                // finish, bounded by their deadline.
+                const uint64_t t0 = nowUs();
+                const uint64_t until =
+                    t0 +
+                    uint64_t(std::min<uint32_t>(req.wait_ms, 600000)) * 1000;
+                size_t held;
+                while ((held = mappingsHeld(c.client_id)) > 0 &&
+                       nowUs() < until)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                ReleaseResp resp{};
+                resp.dropped = dropped;
+                resp.mappings = held;
+                if (held == 0)
+                    LOGI("client %016" PRIx64
+                         " released its memory: %zu registration(s) dropped, "
+                         "no IPC mapping of it left (%.1f ms)",
+                         c.client_id, dropped, (nowUs() - t0) / 1000.0);
+                else
+                    LOGW("client %016" PRIx64
+                         " releases its memory: %zu registration(s) or "
+                         "mapping(s) of it still used by copies in flight "
+                         "after %u ms",
+                         c.client_id, held, req.wait_ms);
+                ok = sendMsg(fd, type, h.seq,
+                             held == 0 ? ProxyStatus::kOk
+                                       : ProxyStatus::kDeadlineExceeded,
+                             &resp, sizeof(resp));
                 break;
             }
             default:
@@ -2814,8 +3217,10 @@ bool ensureDevice(int dev) {
 // no progress for --p2p-selftest-timeout seconds. An item the child was
 // testing when it died (an unrecoverable CUDA error, a crash) or hung is
 // failed. In enforce mode a pair is refused for P2P from the moment it is
-// requested until a test passes; a test that could not run is repeated with
-// a backoff and at the next registration on either GPU.
+// requested until a test passes: kTestPending while its test is queued or
+// running (copies get PAIR_UNDER_TEST and are sent again), kUntested after a
+// test that could not run. Such a test is repeated with a backoff and at the
+// next registration on either GPU.
 //
 // Tester items: (a, a) the host path of GPU a; (a, b) with a < b the pair's
 // P2P paths (and, with --p2p-fallback=host, its host-staged copies); (b, a)
@@ -3007,6 +3412,8 @@ class SelfTester {
     void start() {
         try {
             std::thread(&SelfTester::loop, this).detach();
+            std::lock_guard<std::mutex> lock(mu_);
+            running_ = true;
         } catch (const std::system_error &e) {
             LOGE(
                 "cannot start the P2P self-test thread (%s): pairs stay "
@@ -3025,10 +3432,11 @@ class SelfTester {
         std::lock_guard<std::mutex> lock(mu_);
         bool added = false;
         auto queue = [&](std::pair<int, int> item) {
-            if (pending_.count(item)) return;
+            if (pending_.count(item)) return false;
             queue_.push_back(item);
             pending_.insert(item);
             added = true;
+            return true;
         };
         for (const auto &p : asked) {
             const int a = std::min(p.first, p.second),
@@ -3042,9 +3450,10 @@ class SelfTester {
                               g_policy.reason(b, a) == PeerPolicy::kStatic;
             if (!stat && g_test_state[a][b] == kNotTested) {
                 if (pending_.count({b, a})) continue;  // stage test queued
-                if (g_selftest == SelfTestMode::kEnforce)
-                    g_policy.setPair(a, b, PeerPolicy::kUntested);
-                queue({a, b});
+                // Only when queued now: a pair already queued or running
+                // keeps its state (kTestPending, or the verdict that its
+                // test has just recorded).
+                if (queue({a, b})) markTestPending(a, b);
             } else if (g_fallback_host && g_stage_state[a][b] == kNotTested &&
                        !pending_.count({a, b})) {
                 queue({b, a});
@@ -3077,6 +3486,16 @@ class SelfTester {
                : attempts == 2 ? 30
                : attempts == 3 ? 60
                                : 300;
+    }
+
+    // Under mu_: the P2P test of pair (a, b) was queued. In enforce mode the
+    // pair is refused until a test passes; while this one is queued or
+    // running its copies are answered PAIR_UNDER_TEST, which needs a test
+    // thread that will run it.
+    void markTestPending(int a, int b) {
+        if (g_selftest != SelfTestMode::kEnforce) return;
+        g_policy.setPair(
+            a, b, running_ ? PeerPolicy::kTestPending : PeerPolicy::kUntested);
     }
 
     static uint8_t itemState(const std::pair<int, int> &p) {
@@ -3129,6 +3548,8 @@ class SelfTester {
                 if (it->second.next_us <= now) {
                     queue_.push_back(p);
                     pending_.insert(p);
+                    if (itemKind(p) == ItemKind::kPair)
+                        markTestPending(p.first, p.second);
                 } else if (!next || it->second.next_us < next) {
                     next = it->second.next_us;
                 }
@@ -3427,6 +3848,7 @@ class SelfTester {
     std::set<std::pair<int, int>> pending_;
     std::map<std::pair<int, int>, Retry> retry_;
     bool stop_ = false;
+    bool running_ = false;  // the test thread was started
 };
 SelfTester g_tester;
 
@@ -3579,7 +4001,10 @@ void usage(const char *argv0) {
         "GPU\n"
         "                          memory for it) is repeated after 10, 30,\n"
         "                          60 s, then every 5 min, and at the next\n"
-        "                          registration on either GPU.\n"
+        "                          registration on either GPU. While a pair's\n"
+        "                          test is queued or running its copies get\n"
+        "                          PAIR_UNDER_TEST, and engines send them\n"
+        "                          again until it decided.\n"
         "                          warn: log only; off: no test\n"
         "  --no-startup-selftest   test a pair only when engines first\n"
         "                          register on both of its GPUs (recommended\n"
@@ -3625,14 +4050,17 @@ void usage(const char *argv0) {
         "avg_exec_us), coalesced_entries, kernel_entries/bytes and\n"
         "ce_entries/bytes (copy engines), handle_opens, p2p_selftest,\n"
         "denied_pairs (denied ordered src>dst directions: count and bus\n"
-        "ids), denied_copy_requests, untested_pairs and\n"
+        "ids), denied_copy_requests, pair_test_waits (copies answered\n"
+        "PAIR_UNDER_TEST while their pair's self-test was queued or\n"
+        "running), untested_pairs and\n"
         "untested_host_paths (tests that could not run, waiting for a\n"
         "retry), staged_copies, staged_bytes, staged_failures (host-staged\n"
         "copies), deadline_aborts (copies stopped at their deadline),\n"
         "rate_gbps (measured rates the deadline predictions use),\n"
         "register_refusals, ipc_mappings (IPC handles open now), ipc_closes\n"
         "and ipc_conflicts (copies refused because a handle was still mapped\n"
-        "for another engine).\n",
+        "for another engine), vmm_imports (virtual memory management\n"
+        "allocations imported from engines' file descriptors now).\n",
         argv0);
 }
 

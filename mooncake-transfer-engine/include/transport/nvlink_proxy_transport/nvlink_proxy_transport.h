@@ -15,6 +15,7 @@
 #ifndef NVLINK_PROXY_TRANSPORT_H_
 #define NVLINK_PROXY_TRANSPORT_H_
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <map>
@@ -64,7 +65,19 @@ class NvlinkProxyTransport : public Transport {
     bool canRoute(const TransferRequest &request,
                   const BufferDesc &target_buffer);
 
+    // TransferEngine::shutdown(): stops the health thread, asks the daemon
+    // to drop this engine's registrations and waits until it holds no IPC
+    // mapping of this engine's memory (RELEASE, at most
+    // MC_NVLINK_PROXY_RELEASE_WAIT_MS), then closes every connection to it.
+    // 0 when the daemon confirmed that, when this engine never registered a
+    // block, or when no daemon listens (one that exited holds nothing); -1
+    // otherwise. Idempotent. The destructor only closes the connections
+    // (the daemon then drops the registrations on its own).
+    int shutdown() override;
+
     const std::string &nodeId() const { return node_id_; }
+    uint64_t clientId() const { return client_id_; }
+    uint64_t processToken() const { return process_token_; }
 
    protected:
     int install(std::string &local_server_name,
@@ -92,7 +105,12 @@ class NvlinkProxyTransport : public Transport {
         uint64_t base = 0;
         uint64_t size = 0;
         uint8_t uuid[nvlink_proxy::kUuidSize] = {};
+        // Legacy IPC handle, or for |vmm| its identity (REGISTER_FD).
         uint8_t handle[nvlink_proxy::kIpcHandleSize] = {};
+        // Virtual memory management memory, exported as a POSIX file
+        // descriptor at each registration (MC_NVLINK_PROXY_VMM).
+        bool vmm = false;
+        int device = -1;                // CUDA device of the memory
         size_t users = 0;               // registered buffers inside the block
         uint64_t registered_epoch = 0;  // daemon epoch it is registered in
     };
@@ -102,27 +120,64 @@ class NvlinkProxyTransport : public Transport {
         uint64_t epoch = 0;
     };
 
-    enum class FallbackReason { kUnhealthy, kDaemonError, kUntranslatable };
+    enum class FallbackReason {
+        kUnhealthy,
+        kDaemonError,
+        kUntranslatable,
+        kPairTest,  // the GPU pair's self-test did not decide in time
+    };
 
     // Outcome of one COPY round trip.
     enum class CopyOutcome {
         kOk,
         kNoDaemon,    // connection lost / daemon gone: wait and retry
         kRetryLater,  // a block is not registered yet under a new daemon
-        kFailed,      // anything else: use the base transport
+        // PAIR_UNDER_TEST: the daemon is self-testing the GPU pair; retry
+        // while the pair-test wait lasts (pairTestWaitEnd).
+        kPairUnderTest,
+        kFailed,  // anything else: use the base transport
     };
+    // What a COPY answered with |status| means for its requests; |fresh|:
+    // this engine connected to the daemon within the reconnect window.
+    static CopyOutcome copyOutcome(nvlink_proxy::ProxyStatus status,
+                                   bool fresh);
+    // Until when a request submitted at |start_ns| that may take until
+    // |deadline_ns| (its request budget, or its batch deadline when that is
+    // earlier) is sent again while its GPU pair is under the daemon's
+    // self-test: MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS, and at most half of the
+    // time it has, so that the other half remains for the base transport.
+    static int64_t pairTestWaitEnd(int64_t start_ns, int64_t deadline_ns,
+                                   int pair_test_wait_ms);
 
     // Daemon I/O.
     int connectSocket(int timeout_ms);
     // |sent| (optional): the request was written in full, so a failure was
-    // in waiting for the reply.
+    // in waiting for the reply. |pass_fd| >= 0: sent with the header
+    // (SCM_RIGHTS).
     bool rpc(int fd, nvlink_proxy::MsgType type, const void *payload,
              size_t len, nvlink_proxy::ProxyStatus &status, std::string &reply,
-             bool *sent = nullptr);
+             bool *sent = nullptr, int pass_fd = -1);
     bool hello(int fd, bool control, uint64_t &epoch);
     bool ensureControlLocked();
     void closeControlLocked();
     bool registerBlockLocked(Block &block);
+    // Teardown (shutdown(), destructor); with |release|, RELEASE first
+    // (releaseLocked). True when shutdown() may report success.
+    bool stop(bool release);
+    bool releaseLocked();
+    // GPU UUID of device |dev|, read once per transport (not per process:
+    // a process restored from a checkpoint may run on another GPU).
+    bool deviceUuid(int dev, uint8_t out[nvlink_proxy::kUuidSize]);
+    // Fills |block|'s identity when [base, base + size) is one allocation
+    // of virtual memory management memory created exportable as a POSIX
+    // file descriptor; |why| otherwise. *is_vmm: it is such memory at all.
+    static bool vmmBlock(Block &block, bool *is_vmm, std::string &why);
+    // Fills |block| (base, size, GPU UUID, identity) for the device memory
+    // at |addr| of GPU |block.device|, with that GPU's context current;
+    // |why| when the daemon cannot import it. Virtual memory management
+    // memory is never asked for a legacy IPC handle, other memory only
+    // without MC_NVLINK_PROXY_REQUIRE_VMM.
+    bool describeBlock(void *addr, Block &block, std::string &why);
     bool acquireCopyConnection(Connection &conn);
     void releaseCopyConnection(Connection &conn, bool reusable);
     using UnconfirmedCounters =
@@ -204,11 +259,29 @@ class NvlinkProxyTransport : public Transport {
 
     std::string socket_path_;
     std::string node_id_;
+    // Drawn from the kernel at install (fresh_random.h).
     uint64_t client_id_ = 0;
+    // HELLO's process token (kHelloFlagProcessToken), held from install to
+    // teardown.
+    uint64_t process_token_ = 0;
     int timeout_ms_ = 30000;
+    // How long shutdown() waits for the daemon to close the mappings of this
+    // engine's memory (MC_NVLINK_PROXY_RELEASE_WAIT_MS).
+    int release_wait_ms_ = 10000;
+    // Register virtual memory management memory too (MC_NVLINK_PROXY_VMM).
+    bool vmm_enabled_ = false;
+    // Device memory must be virtual memory management memory the daemon
+    // imports; registering other device memory fails, and no legacy IPC
+    // handle is ever exported (MC_NVLINK_PROXY_REQUIRE_VMM, implies
+    // MC_NVLINK_PROXY_VMM).
+    bool require_vmm_ = false;
     // How long same-node requests wait for the daemon to come back before
     // they use the base transport (MC_NVLINK_PROXY_RECONNECT_WAIT_MS).
     int reconnect_wait_ms_ = 15000;
+    // How long a request is sent again while its GPU pair is under the
+    // daemon's P2P self-test (PAIR_UNDER_TEST) before it uses the base
+    // transport (MC_NVLINK_PROXY_PAIR_TEST_WAIT_MS; pairTestWaitEnd).
+    int pair_test_wait_ms_ = 3000;
     int stats_interval_s_ = 60;
     Transport *fallback_ = nullptr;
     std::unique_ptr<BoundedSubmitter> fallback_submitter_;
@@ -219,9 +292,20 @@ class NvlinkProxyTransport : public Transport {
     std::map<uint64_t, Block> blocks_;
     std::unordered_map<uint64_t, uint64_t> buffers_;
 
+    std::mutex uuid_mu_;
+    std::unordered_map<int, std::array<uint8_t, nvlink_proxy::kUuidSize>>
+        uuids_;
+
     // Control connection: HELLO(control) + REGISTER/UNREGISTER/PING.
     std::mutex control_mu_;
     int control_fd_ = -1;
+    // A block of this engine was sent to a daemon (it may map its memory).
+    bool ever_registered_ = false;
+    // The last daemon this engine lost (epoch and when) after registering:
+    // until its copies in flight drained, it may still map that memory.
+    uint64_t lost_epoch_ = 0;
+    int64_t lost_ns_ = 0;
+    int64_t last_unreachable_log_ns_ = 0;
     std::atomic<uint64_t> epoch_{0};  // 0 = daemon not reachable
     std::atomic<bool> healthy_{false};
     // Start of the current outage (steady clock ns, 0 while healthy) and
@@ -245,6 +329,12 @@ class NvlinkProxyTransport : public Transport {
     std::condition_variable health_cv_;
     bool stop_ = false;
     bool recheck_ = false;  // a copy failed: re-validate the daemon now
+    // Teardown began (stop()); requests stop waiting for the daemon and no
+    // connection to it is opened any more.
+    std::atomic<bool> shut_down_{false};
+    std::mutex stop_mu_;             // one stop() at a time
+    bool stopped_ = false;           // guarded by stop_mu_
+    bool release_confirmed_ = true;  // stop()'s result, guarded by stop_mu_
 
     struct Counters {
         std::atomic<uint64_t> proxy_requests{0};
@@ -256,9 +346,12 @@ class NvlinkProxyTransport : public Transport {
         std::atomic<uint64_t> fallback_unhealthy{0};
         std::atomic<uint64_t> fallback_daemon_error{0};
         std::atomic<uint64_t> fallback_untranslatable{0};
+        std::atomic<uint64_t> fallback_pair_test{0};
         std::atomic<uint64_t> remote_node_requests{0};
         std::atomic<uint64_t> reconnects{0};
-        std::atomic<uint64_t> held_requests{0};  // waited for the daemon
+        // Waited for the daemon: to come back, or to decide their GPU pair
+        // with its self-test.
+        std::atomic<uint64_t> held_requests{0};
         std::atomic<uint64_t> held_us_max{0};
         std::atomic<uint64_t> retried_requests{0};  // re-sent to the daemon
         std::atomic<uint64_t> fallback_retries{0};  // re-sent to the base

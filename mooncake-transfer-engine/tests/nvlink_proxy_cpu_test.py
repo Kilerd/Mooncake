@@ -35,8 +35,21 @@ are worker threads) and plays engines over its socket:
                      mapping; a re-registering engine shares its mapping
   share              two engines of one process share a mapping while one is
                      connected; another process is refused
+  release            RELEASE (engine shutdown) drops an engine's
+                     registrations and is answered only once no mapping of
+                     its memory is left, also while a copy holds one or
+                     over a connection opened just for it
+  vmm                REGISTER_FD: virtual memory management memory imported
+                     from a file descriptor, copied from and to, mapped
+                     once, released by RELEASE and by a disconnect; a GPU
+                     that cannot be granted access refuses the copy
   gpus               --min-visible-gpus, REGISTER of a GPU the daemon cannot
                      see, a client pid equal to the daemon's
+  pair_test          a copy while its pair's self-test runs is answered
+                     PAIR_UNDER_TEST (nothing written), then served once the
+                     test passed or refused (NO_PEER_ACCESS) once it failed;
+                     a pair whose test could not run, or that is denied on
+                     the command line, gets NO_PEER_ACCESS
 
 Usage: nvlink_proxy_cpu_test.py <daemon binary> [scenario ...]
 Linux only (POSIX shared memory, /proc/<pid>/maps).
@@ -54,9 +67,11 @@ import threading
 import time
 
 MAGIC, VERSION = 0x504E434D, 1
-HELLO, REGISTER, UNREGISTER, COPY, PING, STATS = 1, 2, 3, 4, 5, 6
-OK, UNKNOWN_DEVICE, UNKNOWN_SOURCE = 0, 3, 4
+HELLO, REGISTER, UNREGISTER, COPY, PING, STATS, RELEASE = 1, 2, 3, 4, 5, 6, 7
+REGISTER_FD = 8
+OK, BAD_REQUEST, UNKNOWN_DEVICE, UNKNOWN_SOURCE = 0, 1, 3, 4
 NO_PEER_ACCESS, CUDA_ERROR, DEADLINE_EXCEEDED = 7, 8, 9
+NOT_CONTROL_CONNECTION, PAIR_UNDER_TEST = 10, 11
 MiB = 1 << 20
 
 DAEMON = None
@@ -88,13 +103,18 @@ class Conn:
         )
         assert st == OK, st
 
-    def rpc(self, typ, payload=b""):
+    def rpc(self, typ, payload=b"", fds=()):
         with Conn._lock:
             Conn._seq += 1
             seq = Conn._seq
-        self.s.sendall(
+        msg = (
             struct.pack("<IHHIIQ", MAGIC, VERSION, typ, 0, len(payload), seq) + payload
         )
+        if fds:
+            sent = socket.send_fds(self.s, [msg], list(fds))
+            self.s.sendall(msg[sent:])
+        else:
+            self.s.sendall(msg)
         h = b""
         while len(h) < 24:
             chunk = self.s.recv(24 - len(h))
@@ -154,6 +174,42 @@ def register(conn, base, seg, gpu, pid=0):
         REGISTER, struct.pack("<QQ", base, seg.size) + uuid(gpu) + seg.handle(gpu, pid)
     )
     return st, body.decode(errors="replace")
+
+
+def register_fd(conn, base, seg, gpu, buffer_id, with_fd=True):
+    """REGISTER_FD of |seg| as virtual memory management memory: the
+    descriptor of its shared memory file stands for the exported one."""
+    ident = (b"MCVMMFD1" + struct.pack("<Q", buffer_id)).ljust(64, b"\0")
+    payload = struct.pack("<QQ", base, seg.size) + uuid(gpu) + ident
+    fd = os.open("/dev/shm/" + seg.name, os.O_RDWR) if with_fd else None
+    try:
+        st, body = conn.rpc(REGISTER_FD, payload, [fd] if with_fd else ())
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return st, body.decode(errors="replace")
+
+
+def daemon_fds(d, name):
+    """Descriptors of the daemon that refer to shared memory file |name|."""
+    n = 0
+    for fd in os.listdir(f"/proc/{d.proc.pid}/fd"):
+        try:
+            n += name in os.readlink(f"/proc/{d.proc.pid}/fd/{fd}")
+        except OSError:
+            pass
+    return n
+
+
+def release(conn, wait_ms):
+    """RELEASE: (status, registrations dropped, mappings left, seconds)."""
+    t0 = time.monotonic()
+    st, body = conn.rpc(RELEASE, struct.pack("<II", wait_ms, 0))
+    t = time.monotonic() - t0
+    if len(body) == 16:
+        dropped, left = struct.unpack("<QQ", body)
+        return st, dropped, left, t
+    return st, None, None, t
 
 
 def copy(path, entries, budget_ms=0, client=0xC0):
@@ -815,6 +871,245 @@ def share():
         unlink_segments("nvlp-sh", "nvlp-b")
 
 
+def release_memory():
+    print("== release: an engine shuts down")
+    d = Daemon(["--gather-on", "src"])
+    try:
+        a1 = Segment("nvlp-a1", 16 * MiB, 6)
+        a2 = Segment("nvlp-a2", 16 * MiB, 7)
+        b = Segment("nvlp-b", 32 * MiB)
+        ca = Conn(d.sock, 0xA, True)
+        cb = Conn(d.sock, 0xB, True)
+        assert register(ca, 0x10000000, a1, 0)[0] == OK
+        assert register(ca, 0x18000000, a2, 0)[0] == OK
+        assert register(cb, 0x20000000, b, 1)[0] == OK
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        ents = [
+            (0xA, 0x10000000, 0, 0xB, 0x20000000, 0, 4 * MiB),
+            (0xA, 0x18000000, 0, 0xB, 0x20000000, 4 * MiB, 4 * MiB),
+        ]
+        st, _, _, _ = copy(d.sock, ents)
+        check(
+            st == OK and mapped(d, "nvlp-a1") and mapped(d, "nvlp-a2"),
+            "A's blocks mapped by a copy",
+        )
+        cn = Conn(d.sock, 0xA, False)
+        st, _, _, _ = release(cn, 1000)
+        check(st == NOT_CONTROL_CONNECTION, "RELEASE needs a control connection")
+        cn.close()
+        st, dropped, left, _ = release(ca, 2000)
+        # Nothing of A's memory is mapped any more when the answer arrives.
+        gone = not mapped(d, "nvlp-a1") and not mapped(d, "nvlp-a2")
+        check(
+            st == OK and dropped == 2 and left == 0 and gone,
+            f"answered once A's mappings were closed (status {st}, "
+            f"dropped {dropped}, left {left})",
+        )
+        check(mapped(d, "nvlp-b"), "B's mappings stay")
+        st, msg, _, _ = copy(d.sock, ents)
+        check(st == UNKNOWN_SOURCE, f"A's blocks are unknown afterwards ({msg[:50]})")
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+    print("== release: a copy in flight holds A's mapping")
+    d = Daemon(["--no-coalesce"], {"MOCK_COPY_DELAY_MS": "20"})
+    try:
+        a1 = Segment("nvlp-a1", 16 * MiB, 6)
+        b = Segment("nvlp-b", 32 * MiB)
+        ca, cb = pair(d, a1, b)
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        res = {}
+        th = threading.Thread(
+            target=lambda: res.update(r=copy(d.sock, runs(40, 256 * 1024)))
+        )
+        th.start()
+        time.sleep(0.3)
+        st, _, left, _ = release(ca, 50)
+        check(
+            st == DEADLINE_EXCEEDED and left and mapped(d, "nvlp-a1"),
+            f"short wait: DEADLINE_EXCEEDED, {left} mapping(s) still used",
+        )
+        st, _, left, t = release(ca, 10000)
+        answered = time.monotonic()
+        th.join(10)
+        last = d.last_write_us("nvlp-b")
+        check(
+            st == OK and left == 0 and not mapped(d, "nvlp-a1"),
+            f"then answered OK after {t * 1000:.0f} ms, A's mapping closed",
+        )
+        check(
+            res["r"][0] == OK and last is not None and last / 1e6 <= answered,
+            "the copy finished, no write of it after the answer",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+    print("== release: a copy resolved the block but has not mapped it yet")
+    d = Daemon(
+        ["--no-coalesce"],
+        {"MOCK_IPC_OPEN_DELAY_MS": "600", "MOCK_IPC_OPEN_DELAY_SEGMENT": "/nvlp-x"},
+    )
+    try:
+        x = Segment("nvlp-x", 4 * MiB, 61)  # another engine's block, slow to map
+        a1 = Segment("nvlp-a1", 4 * MiB, 62)
+        b = Segment("nvlp-b", 8 * MiB)
+        cx = Conn(d.sock, 0xD, True)
+        ca = Conn(d.sock, 0xA, True)
+        cb = Conn(d.sock, 0xB, True)
+        assert register(cx, 0x30000000, x, 0)[0] == OK
+        assert register(ca, 0x10000000, a1, 0)[0] == OK
+        assert register(cb, 0x20000000, b, 1)[0] == OK
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        res = {}
+        ents = [
+            (0xD, 0x30000000, 0, 0xB, 0x20000000, 0, MiB),  # mapped first, slowly
+            (0xA, 0x10000000, 0, 0xB, 0x20000000, 2 * MiB, MiB),
+        ]
+        th = threading.Thread(target=lambda: res.update(r=copy(d.sock, ents)))
+        th.start()
+        time.sleep(0.2)  # resolved both blocks, opening X's handle
+        check(not mapped(d, "nvlp-a1"), "A's block not mapped yet")
+        st, _, left, t = release(ca, 5000)
+        answered = time.monotonic()
+        th.join(10)
+        writes = []
+        with open(d.writes) as f:
+            for line in f:
+                us, seg, off, _ = line.split()
+                if seg.endswith("nvlp-b") and int(off) == 2 * MiB:
+                    writes.append(int(us))
+        check(
+            st == OK and left == 0 and res["r"][0] == OK,
+            f"answered OK after {t * 1000:.0f} ms, the copy finished",
+        )
+        check(
+            writes and max(writes) / 1e6 <= answered and not mapped(d, "nvlp-a1"),
+            "A's data landed before the answer, nothing of A mapped after it",
+        )
+        cx.close()
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-x")
+    print("== release: over a connection opened for it")
+    d = Daemon(["--no-coalesce"], {"MOCK_COPY_DELAY_MS": "20"})
+    try:
+        a1 = Segment("nvlp-a1", 16 * MiB, 6)
+        b = Segment("nvlp-b", 32 * MiB)
+        ca, cb = pair(d, a1, b)
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        res = {}
+        th = threading.Thread(
+            target=lambda: res.update(r=copy(d.sock, runs(40, 256 * 1024)))
+        )
+        th.start()
+        time.sleep(0.3)
+        ca.close()  # the engine lost its control connection
+        cr = Conn(d.sock, 0xA, True)
+        st, dropped, left, t = release(cr, 10000)
+        answered = time.monotonic()
+        th.join(10)
+        last = d.last_write_us("nvlp-b")
+        check(
+            st == OK and dropped == 0 and left == 0 and not mapped(d, "nvlp-a1"),
+            f"answered OK after {t * 1000:.0f} ms, the old mapping closed",
+        )
+        check(
+            res["r"][0] == OK and last is not None and last / 1e6 <= answered,
+            "no write of the copy after the answer",
+        )
+        cr.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-a1", "nvlp-a2", "nvlp-b")
+
+
+def vmm():
+    print("== vmm: a block registered by file descriptor (REGISTER_FD)")
+    d = Daemon()
+    try:
+        v = Segment("nvlp-v1", 16 * MiB, 51)  # A's VMM block, gpu 0
+        b = Segment("nvlp-b", 16 * MiB, 52)  # B's cudaMalloc block, gpu 1
+        ca = Conn(d.sock, 0xA, True)
+        cb = Conn(d.sock, 0xB, True)
+        st, msg = register_fd(ca, 0x10000000, v, 0, 7, with_fd=False)
+        check(st == BAD_REQUEST, f"refused without a descriptor ({msg[:50]})")
+        st, _ = register_fd(ca, 0x10000000, v, 0, 7)
+        check(st == OK and daemon_fds(d, "nvlp-v1") == 1, "registered, one import held")
+        assert register(cb, 0x20000000, b, 1)[0] == OK
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        want = v.m[: 4 * MiB]
+        st, _, _, _ = copy(d.sock, runs(1, 4 * MiB))
+        check(st == OK and b.m[: 4 * MiB] == want, "copy from imported memory")
+        st, _, _, _ = copy(
+            d.sock, [(0xB, 0x20000000, 0, 0xA, 0x10000000, 8 * MiB, 2 * MiB)]
+        )
+        check(
+            st == OK and v.m[8 * MiB : 10 * MiB] == b.m[: 2 * MiB],
+            "copy into imported memory",
+        )
+        s = stats(d.sock)
+        check(
+            s["vmm_imports"] == "1" and d.maps().count("nvlp-v1") == 1,
+            "mapped once (vmm_imports=1, one mapping)",
+        )
+        st, _ = register_fd(ca, 0x10000000, v, 0, 7)  # a reconnect re-registers
+        check(
+            st == OK
+            and d.wait_log("[imported] [unchanged]", 2)
+            and daemon_fds(d, "nvlp-v1") == 1
+            and stats(d.sock)["vmm_imports"] == "1",
+            "the same allocation again: unchanged, the new import released",
+        )
+        st, _, left, _ = release(ca, 2000)
+        check(
+            st == OK
+            and left == 0
+            and not mapped(d, "nvlp-v1")
+            and daemon_fds(d, "nvlp-v1") == 0
+            and stats(d.sock)["vmm_imports"] == "0",
+            "RELEASE: unmapped and released before the answer",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+    print("== vmm: a GPU that cannot be granted access, then a disconnect")
+    d = Daemon([], {"MOCK_VMM_ACCESS_FAIL": "1"})
+    try:
+        v = Segment("nvlp-v1", 16 * MiB, 53)
+        b = Segment("nvlp-b", 16 * MiB)
+        ca = Conn(d.sock, 0xA, True)
+        cb = Conn(d.sock, 0xB, True)
+        assert register_fd(ca, 0x10000000, v, 0, 9)[0] == OK
+        assert register(cb, 0x20000000, b, 1)[0] == OK
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        st, msg, _, _ = copy(d.sock, runs(1, 4 * MiB))  # gpu 1's copy engines
+        check(
+            st == CUDA_ERROR
+            and "imported memory" in msg
+            and b.m[: 4 * MiB] == bytes(4 * MiB)
+            and d.proc.poll() is None,
+            f"copy refused, nothing written, daemon up ({msg[:60]})",
+        )
+        ca.close()
+        end = time.time() + 2
+        while time.time() < end and (mapped(d, "nvlp-v1") or daemon_fds(d, "nvlp-v1")):
+            time.sleep(0.02)
+        check(
+            not mapped(d, "nvlp-v1") and daemon_fds(d, "nvlp-v1") == 0,
+            "the disconnect released the import",
+        )
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-v1", "nvlp-b")
+
+
 def gpus():
     print("== gpus: --min-visible-gpus")
     for n, need, expect in ((1, 2, 78), (0, 1, 78)):
@@ -851,6 +1146,112 @@ def gpus():
         unlink_segments("nvlp-x")
 
 
+def pair_test():
+    print("== pair_test: a copy while the pair's self-test runs, then after it")
+    d = Daemon([], {"MOCK_SELFTEST_DELAY_MS": "1500"})
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 21)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca, cb = pair(d, src, dst)
+        st, msg, _, t = copy(d.sock, runs(2, MiB))
+        check(
+            st == PAIR_UNDER_TEST
+            and "self-test" in msg
+            and dst.m[: 2 * MiB] == bytes(2 * MiB),
+            f"while the test runs: PAIR_UNDER_TEST at once ({t * 1000:.0f} ms),"
+            f" nothing written ({msg[:90]})",
+        )
+        s = stats(d.sock)
+        check(
+            s["pair_test_waits"] == "1"
+            and s["denied_copy_requests"] == "0"
+            and s["copy_failures"] == "0",
+            "counted in pair_test_waits only",
+        )
+        check(
+            d.wait_log("held back 1 copy request(s)", 2),
+            "logged: held back, waiting for the self-test",
+        )
+        check(d.wait_log("passed -> allowed"), "P2P self-test passed")
+        st, _, _, _ = copy(d.sock, runs(2, MiB))
+        check(
+            st == OK and dst.m[: 2 * MiB] == src.m[: 2 * MiB],
+            "after it passed: OK, byte-exact",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+    print("== pair_test: the self-test fails (--p2p-fallback tcp)")
+    d = Daemon(
+        ["--p2p-fallback", "tcp"],
+        {"MOCK_SELFTEST_DELAY_MS": "1000", "MOCK_P2P": "corrupt"},
+    )
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 22)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca, cb = pair(d, src, dst)
+        st, _, _, _ = copy(d.sock, runs(1, MiB))
+        check(st == PAIR_UNDER_TEST, "while the test runs: PAIR_UNDER_TEST")
+        check(d.wait_log("FAILED"), "P2P self-test failed")
+        st, msg, _, _ = copy(d.sock, runs(1, MiB))
+        check(
+            st == NO_PEER_ACCESS and "self-test failed" in msg,
+            f"after it failed: NO_PEER_ACCESS ({msg[:90]})",
+        )
+        s = stats(d.sock)
+        check(
+            s["pair_test_waits"] == "1" and s["denied_copy_requests"] == "1",
+            "pair_test_waits=1 denied_copy_requests=1",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+    print("== pair_test: the self-test cannot run (no GPU memory for it)")
+    d = Daemon(["--p2p-fallback", "tcp"], {"MOCK_OOM_GPU": "1"})
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 23)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca, cb = pair(d, src, dst)
+        check(d.wait_log("tested again in"), "pair untested, retried later")
+        st, msg, _, _ = copy(d.sock, runs(1, MiB))
+        check(
+            st == NO_PEER_ACCESS and "not verified" in msg,
+            f"no test coming: NO_PEER_ACCESS ({msg[:90]})",
+        )
+        check(stats(d.sock)["pair_test_waits"] == "0", "pair_test_waits=0")
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+    print("== pair_test: a pair denied on the command line")
+    d = Daemon(
+        ["--p2p-fallback", "tcp", "--deny-pair", "10:00,20:00"],
+        {"MOCK_SELFTEST_DELAY_MS": "1500"},
+    )
+    try:
+        src = Segment("nvlp-src", 4 * MiB, 24)
+        dst = Segment("nvlp-dst", 4 * MiB)
+        ca, cb = pair(d, src, dst)
+        st, msg, _, _ = copy(d.sock, runs(1, MiB))
+        check(
+            st == NO_PEER_ACCESS and "command line" in msg,
+            f"NO_PEER_ACCESS at once ({msg[:90]})",
+        )
+        ca.close()
+        cb.close()
+    finally:
+        d.stop()
+        unlink_segments("nvlp-src", "nvlp-dst")
+
+
 SCENARIOS = {
     "p2p_deadline": p2p_deadline,
     "slow_link": slow_link,
@@ -860,7 +1261,10 @@ SCENARIOS = {
     "disconnect": disconnect,
     "restart": restart,
     "share": share,
+    "release": release_memory,
+    "vmm": vmm,
     "gpus": gpus,
+    "pair_test": pair_test,
 }
 
 

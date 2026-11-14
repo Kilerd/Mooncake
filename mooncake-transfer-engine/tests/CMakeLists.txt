@@ -428,11 +428,20 @@ if(USE_NVLINK_PROXY)
                                                            gtest_main)
   add_test(NAME nvlink_proxy_transport_test COMMAND nvlink_proxy_transport_test)
 
+  # Device memory registration against a CPU stand-in for the CUDA runtime and
+  # driver calls it makes (defined in the test, no GPU needed)
+  add_executable(nvlink_proxy_register_test
+                 ${WORKSPACE}/nvlink_proxy_register_test.cpp)
+  target_link_libraries(nvlink_proxy_register_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+  add_test(NAME nvlink_proxy_register_test COMMAND nvlink_proxy_register_test)
+
   # mooncake_nvlink_proxy's P2P policy and self-test verifier (host only)
   add_executable(nvlink_proxy_policy_test
                  ${WORKSPACE}/nvlink_proxy_policy_test.cpp)
-  target_include_directories(nvlink_proxy_policy_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../nvlink-proxy)
+  target_include_directories(
+    nvlink_proxy_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../nvlink-proxy
+                                     ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   target_link_libraries(nvlink_proxy_policy_test PUBLIC gtest gtest_main)
   add_test(NAME nvlink_proxy_policy_test COMMAND nvlink_proxy_policy_test)
 

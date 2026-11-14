@@ -505,6 +505,36 @@ int TransferEngineImpl::freeEngine() {
     return 0;
 }
 
+int TransferEngineImpl::shutdown() {
+#ifdef WITH_METRICS
+    StopMetricsReportingThread();
+#endif
+    int rc = 0;
+    std::weak_ptr<TransferMetadata> metadata = metadata_;
+    if (multi_transports_) {
+        rc = multi_transports_->shutdown();
+        multi_transports_.reset();
+    }
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
+    p2p_transport_.reset();
+    rdma_transport_.reset();
+#endif
+#ifdef USE_NCCL_DEVICE
+    nccl_transport_.reset();
+#endif
+    freeEngine();
+    // The handshake listener and the metadata refresh thread end with the
+    // metadata, which the transports referenced too.
+    if (!metadata.expired()) {
+        LOG(WARNING) << "TransferEngine shutdown: the metadata service is "
+                        "still referenced and keeps its handshake listener "
+                        "until that reference is gone";
+        rc = -1;
+    }
+    return rc;
+}
+
 // Only for testing
 Transport* TransferEngineImpl::installTransport(const std::string& proto,
                                                 void** args) {

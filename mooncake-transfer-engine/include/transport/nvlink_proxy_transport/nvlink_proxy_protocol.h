@@ -60,6 +60,8 @@ enum class MsgType : uint16_t {
     kCopy = 4,
     kPing = 5,
     kStats = 6,
+    kRelease = 7,
+    kRegisterFd = 8,
 };
 
 enum class ProxyStatus : uint32_t {
@@ -74,6 +76,16 @@ enum class ProxyStatus : uint32_t {
     kCudaError = 8,
     kDeadlineExceeded = 9,
     kNotControlConnection = 10,
+    // COPY not served yet: its GPU pair has not passed the daemon's P2P
+    // self-test, and a test of the pair is queued or running. Nothing of the
+    // copy was issued; the engine may send it again, and once the test
+    // decided the daemon serves it or refuses it (NO_PEER_ACCESS). A pair
+    // that is refused for any other reason, or untested with no test coming,
+    // gets NO_PEER_ACCESS. Status values only grow, so no version bump: an
+    // engine that does not know this one takes it as a failed copy and uses
+    // its base transport, as it did for NO_PEER_ACCESS; a daemon that does
+    // not know it never sends it.
+    kPairUnderTest = 11,
 };
 
 inline const char *proxyStatusName(ProxyStatus s) {
@@ -100,6 +112,8 @@ inline const char *proxyStatusName(ProxyStatus s) {
             return "DEADLINE_EXCEEDED";
         case ProxyStatus::kNotControlConnection:
             return "NOT_CONTROL_CONNECTION";
+        case ProxyStatus::kPairUnderTest:
+            return "PAIR_UNDER_TEST";
     }
     return "UNKNOWN_STATUS";
 }
@@ -111,7 +125,9 @@ constexpr uint32_t kHelloFlagControl = 1u << 0;
 // kHelloTokenOffset - 1 bytes) and, at kHelloTokenOffset, a random 64-bit
 // token of the engine's process. The daemon tells processes apart by it:
 // pid and node alone repeat across PID namespaces (containers of a pod).
-// Daemons that do not know the flag read only the text.
+// Engines of one process share it while any of them lives; one created when
+// none is left draws a new one, so processes restored from one snapshot
+// differ. Daemons that do not know the flag read only the text.
 constexpr uint32_t kHelloFlagProcessToken = 1u << 1;
 constexpr size_t kHelloTokenOffset = 56;
 
@@ -147,6 +163,19 @@ struct RegisterReq {
     uint8_t ipc_handle[kIpcHandleSize];
 };
 
+// REGISTER_FD, on a control connection: REGISTER for a block of virtual
+// memory management memory (cuMemCreate + cuMemMap), which has no legacy
+// IPC handle. The message carries one file descriptor (SCM_RIGHTS, sent
+// with the header) exported with cuMemExportToShareableHandle(
+// CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR); the daemon imports it and maps
+// [0, size) of the allocation (cuMemMap always maps from offset 0). The
+// payload is a RegisterReq whose ipc_handle holds kVmmHandleTag and the
+// allocation's CU_POINTER_ATTRIBUTE_BUFFER_ID: it tells a re-registration
+// of the same allocation from a new one at the same address. Daemons that
+// do not know the message reply BAD_REQUEST (the kernel discards the
+// descriptor they do not receive).
+constexpr char kVmmHandleTag[8] = {'M', 'C', 'V', 'M', 'M', 'F', 'D', '1'};
+
 struct UnregisterReq {
     uint64_t base;
 };
@@ -181,12 +210,36 @@ struct PingResp {
     uint64_t daemon_epoch;
     uint64_t uptime_ms;
 };
+
+// RELEASE, on a control connection: the daemon drops every registration of
+// that connection, then answers once none of the client's registrations is
+// alive any more -- a copy in flight that resolved one may still map it --
+// and so no mapping or import of its memory is left (OK), or when |wait_ms|
+// passed (DEADLINE_EXCEEDED). An engine sends it before it disconnects for
+// good (TransferEngine::shutdown), so that no other process imports the
+// memory it exported once shutdown returned, e.g. before it is checkpointed.
+// Any control connection of the client id may ask: one opened only for this
+// drops nothing and waits for the registrations of an earlier connection.
+// Daemons that do not know it reply BAD_REQUEST.
+struct ReleaseReq {
+    uint32_t wait_ms;
+    uint32_t reserved;
+};
+
+struct ReleaseResp {
+    uint64_t dropped;  // registrations dropped
+    // Still held: registrations used by copies in flight, or (none left)
+    // mappings and imports the daemon failed to release.
+    uint64_t mappings;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(MsgHeader) == 24, "MsgHeader layout");
 static_assert(sizeof(HelloReq) == 80, "HelloReq layout");
 static_assert(sizeof(RegisterReq) == 96, "RegisterReq layout");
 static_assert(sizeof(CopyEntry) == 56, "CopyEntry layout");
+static_assert(sizeof(ReleaseReq) == 8, "ReleaseReq layout");
+static_assert(sizeof(ReleaseResp) == 16, "ReleaseResp layout");
 
 // ---------------------------------------------------------------------------
 // Segment metadata. A device buffer registered under nvlink_proxy is

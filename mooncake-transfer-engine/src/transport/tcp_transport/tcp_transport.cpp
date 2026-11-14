@@ -45,6 +45,7 @@
 #include <unordered_set>
 
 #include "common.h"
+#include "fresh_random.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transfer_metadata_plugin.h"
@@ -380,6 +381,7 @@ int TcpTransport::install(std::string& local_server_name,
                           std::shared_ptr<Topology> topo) {
     metadata_ = meta;
     local_server_name_ = local_server_name;
+    reseedTcpRequestIds();
     int sockfd = -1;
     int tcp_port = findAvailableTcpPort(sockfd);
     if (tcp_port == 0) {
